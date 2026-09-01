@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Xcode user-specific data
+xcuserdata/
+*.xcuserstate
+
+# Build output
+build/
+DerivedData/
+
+# Swift Package Manager build artifacts
+.build/
+
+# Older/generated Xcode source-control metadata
+*.xccheckout
+*.xcscmblueprint
+
+# Environment / local secret files
+.env
+.env.*
+!.env.example
+
+# Private keys and signing exports
+*.p12
+*.p8
+*.pem
+*.key
+
+# Provisioning profiles
+*.mobileprovision
+*.provisionprofile
+
+# Explicit local-secret configuration files
+Secrets.xcconfig
+LocalSecrets.xcconfig
+secrets.json
+secrets.plist
