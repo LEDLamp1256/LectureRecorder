@@ -19,6 +19,7 @@
 /* Begin PBXFileReference section */
 		CB7D0A2630447E7A008522B4 /* LectureRecorder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LectureRecorder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CB7D0A7E304480AA008522B4 /* LectureRecorderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LectureRecorderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		CB7D0A9230472C34008522B4 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -55,6 +56,7 @@
 		CB7D0A1D30447E7A008522B4 = {
 			isa = PBXGroup;
 			children = (
+				CB7D0A9230472C34008522B4 /* README.md */,
 				CB7D0A2830447E7A008522B4 /* LectureRecorder */,
 				CB7D0A7F304480AA008522B4 /* LectureRecorderTests */,
 				CB7D0A2730447E7A008522B4 /* Products */,
