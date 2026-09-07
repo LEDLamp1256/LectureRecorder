@@ -1,6 +1,6 @@
 import Foundation
 
-enum FileSystemError: LocalizedError, Sendable {
+nonisolated enum FileSystemError: LocalizedError, Sendable {
     case unableToResolveApplicationSupportDirectory
     case pathExistsButIsNotADirectory(URL)
     case unableToCreateDirectory(URL, underlyingDescription: String)
@@ -18,7 +18,7 @@ enum FileSystemError: LocalizedError, Sendable {
 }
 
 /// The resolved on-disk locations for a single session.
-struct SessionPaths: Sendable, Equatable {
+nonisolated struct SessionPaths: Sendable, Equatable {
     let sessionDirectory: URL
     let chunksDirectory: URL
     let logsDirectory: URL
@@ -29,9 +29,9 @@ struct SessionPaths: Sendable, Equatable {
 /// Abstraction over where session data lives on disk. The only purpose of
 /// this protocol is to let tests substitute a temporary directory instead
 /// of the real Application Support folder.
-protocol FileSystemLocating: Sendable {
-    func sessionsRootDirectory() throws -> URL
-    func paths(for sessionID: UUID) throws -> SessionPaths
+nonisolated protocol FileSystemLocating: Sendable {
+    nonisolated func sessionsRootDirectory() throws -> URL
+    nonisolated func paths(for sessionID: UUID) throws -> SessionPaths
 }
 
 /// Resolves session storage under:
@@ -56,7 +56,7 @@ protocol FileSystemLocating: Sendable {
 /// in the app (wired to `SessionManager.revealSessionsFolderInFinder()`),
 /// which asks the running process for the real resolved URL instead of
 /// guessing it.
-struct DefaultFileSystemLocator: FileSystemLocating {
+nonisolated struct DefaultFileSystemLocator: FileSystemLocating {
     private static let sessionsDirectoryName = "Sessions"
 
     func applicationSupportDirectory() throws -> URL {

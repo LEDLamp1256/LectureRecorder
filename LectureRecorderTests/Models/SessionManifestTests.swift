@@ -32,6 +32,7 @@ final class SessionManifestTests: XCTestCase {
                 fileName: "chunk_000001.caf",
                 startOffsetSeconds: 0,
                 durationSeconds: 30,
+                frameCount: 1_323_000, // 30s @ 44,100 Hz
                 state: .completed
             )
         )
@@ -49,6 +50,7 @@ final class SessionManifestTests: XCTestCase {
         XCTAssertEqual(decoded.audioFormat, manifest.audioFormat)
         XCTAssertEqual(decoded.targetChunkDurationSeconds, manifest.targetChunkDurationSeconds)
         XCTAssertEqual(decoded.chunks, manifest.chunks)
+        XCTAssertEqual(decoded.chunks.first?.frameCount, 1_323_000)
         XCTAssertEqual(decoded.endReason, manifest.endReason)
         XCTAssertEqual(decoded.endedCleanly, manifest.endedCleanly)
         XCTAssertEqual(decoded.failureDescription, manifest.failureDescription)

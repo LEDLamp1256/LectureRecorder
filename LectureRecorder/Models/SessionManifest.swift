@@ -10,7 +10,12 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
     /// that isn't purely additive-and-optional. Older manifests can be
     /// migrated by switching on this value when read. Adding
     /// `failureDescription` did NOT require a bump: it is optional, and
-    /// Codable synthesis treats a missing optional key as `nil`.
+    /// Codable synthesis treats a missing optional key as `nil`. Adding
+    /// `ChunkMetadata.frameCount` also did NOT require a bump: every
+    /// manifest Phase 1 ever persisted has an empty `chunks` array (real
+    /// chunk metadata didn't exist until Phase 2A), so there is no
+    /// existing on-disk `ChunkMetadata` payload for the new required
+    /// field to break decoding on.
     static let currentSchemaVersion = 1
 
     var schemaVersion: Int
@@ -63,14 +68,19 @@ nonisolated enum SessionEndReason: String, Codable, Equatable, Sendable {
     case unknown
 }
 
-/// Metadata for a single ~30-second audio chunk within a session.
-/// Not populated until the microphone-capture step lands; included now so
-/// the manifest schema and its tests are stable up front.
+/// Metadata for a single ~30-second audio chunk within a session,
+/// produced by `AudioChunkWriter` at finalization time.
 nonisolated struct ChunkMetadata: Codable, Equatable, Sendable {
     var sequenceNumber: Int
     var fileName: String
     var startOffsetSeconds: Double
     var durationSeconds: Double
+    /// The exact frame count written to this chunk, as counted by
+    /// `AudioChunkWriter`. This is the source-of-truth integer value —
+    /// `durationSeconds` is derived from it for display/readability only
+    /// and must never be used to reconstruct an exact frame count
+    /// (floating-point division/rounding makes that lossy).
+    var frameCount: Int
     var state: ChunkState
 }
 
