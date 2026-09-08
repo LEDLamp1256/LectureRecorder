@@ -79,6 +79,8 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
 
     private var cycleState: CycleState = .idle
     private var inProgressStopTask: Task<Void, Never>?
+    private var inProgressStopOutcome: Error?
+    private var lastCompletedOutcome: Error?
 
     init() {}
 
@@ -99,6 +101,7 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                 engine: engine,
                 format: format
             )
+            lastCompletedOutcome = nil
 
             Log.audio.info(
                 "AudioCaptureService prepared: \(format.sampleRate, privacy: .public)Hz \(format.channelCount, privacy: .public)ch"
@@ -166,10 +169,13 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                 object: engine,
                 queue: nil
             ) { [gate, coordinator] _ in
-                gate.close()
-                coordinator.reportAsyncFailure(
+                // Gate closure happens only as the first-acceptance side
+                // effect of reportFailure — never independently.
+                coordinator.reportFailure(
                     AudioCaptureServiceError.configurationChangedDuringRecording
-                )
+                ) {
+                    gate.close()
+                }
             }
 
             cycleState = .running(resources)
@@ -190,19 +196,23 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
         }
     }
 
-    func stop() async {
-        let taskToAwait: Task<Void, Never>? = controlQueue.sync {
+    @discardableResult
+    func stop() async -> Error? {
+        let taskToAwait: Task<Void, Never>?
+        let outcome: Error?
+
+        (taskToAwait, outcome) = controlQueue.sync {
             switch cycleState {
             case .idle:
-                return nil
+                return (nil, lastCompletedOutcome)
 
             case .stopping:
-                return inProgressStopTask
+                return (inProgressStopTask, inProgressStopOutcome)
 
             case .prepared(let engine, _):
                 engine.stop()
                 cycleState = .idle
-                return nil
+                return (nil, lastCompletedOutcome)
 
             case .running(let resources):
                 cycleState = .stopping
@@ -211,15 +221,29 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                     NotificationCenter.default.removeObserver(token)
                 }
 
-                resources.coordinator.invalidate()
+                // Close failure admission before tearing anything else
+                // down, so the returned outcome for this cycle is fixed
+                // the moment it's known — any failure reported after
+                // this point is rejected by the coordinator.
+                let closedOutcome = resources.coordinator.closeAdmission()
                 resources.gate.close()
                 resources.engine.inputNode.removeTap(onBus: 0)
                 resources.engine.stop()
 
-                let gate = resources.gate
+                inProgressStopOutcome = closedOutcome
 
+                let gate = resources.gate
+                let coordinator = resources.coordinator
+
+                // weak self is safe here: closedOutcome is already
+                // captured locally and returned to this stop() call
+                // regardless of whether self survives to run the
+                // continuation below. If self is gone, no one can
+                // observe cycleState again anyway.
                 let task = Task { [weak self] in
-                    await gate.drain()
+                    async let bufferDrain: Void = gate.drain()
+                    async let deliveryDrain: Void = coordinator.drainDelivery()
+                    _ = await (bufferDrain, deliveryDrain)
 
                     guard let self else {
                         return
@@ -228,18 +252,21 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                     self.controlQueue.sync {
                         if case .stopping = self.cycleState {
                             self.cycleState = .idle
+                            self.lastCompletedOutcome = closedOutcome
                         }
 
                         self.inProgressStopTask = nil
+                        self.inProgressStopOutcome = nil
                     }
                 }
 
                 inProgressStopTask = task
-                return task
+                return (task, closedOutcome)
             }
         }
 
         await taskToAwait?.value
+        return outcome
     }
 
     private static func negotiateAndValidateFormat(
@@ -301,69 +328,203 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
     }
 }
 
+/// Serializes admission of at most one asynchronous capture failure per
+/// recording cycle and hands it to the committed `onFailure` handler
+/// exactly once.
+///
+/// A cycle has two independent things racing against each other: failure
+/// admission (`reportFailure` / `closeAdmission`) and commitment of the
+/// external failure handler (`markCommitted`, called once `start()` has
+/// successfully committed to running). Whichever happens first is
+/// remembered; delivery happens exactly once, as soon as both a retained
+/// failure and a committed handler exist.
+///
+/// Delivery of the claimed handler is tracked, not fire-and-forget: the
+/// moment a call claims the single allowed delivery, it enters
+/// `deliveryGroup` inside the same synchronized state transition that
+/// claims it, and only leaves after the handler invocation — run on a
+/// dedicated `deliveryQueue`, never the state queue above — returns.
+/// `drainDelivery()` lets a caller (e.g. `stop()`) await that completion
+/// without a blocking wait, so admission can never be observed closed
+/// while a claimed delivery is still unaccounted for.
 nonisolated final class FailureCoordinator: @unchecked Sendable {
+    /// Identifies which of the coordinator's two queues is currently
+    /// executing. Exposed only so tests can deterministically prove
+    /// delivery lands on `deliveryQueue`, never `queue`.
+    enum QueueRole: Sendable {
+        case state
+        case delivery
+    }
+
+    private static let queueRoleKey = DispatchSpecificKey<QueueRole>()
+
+    static func currentQueueRole() -> QueueRole? {
+        DispatchQueue.getSpecific(key: queueRoleKey)
+    }
+
     private let queue: DispatchQueue
+    private let deliveryQueue: DispatchQueue
+    private let deliveryGroup = DispatchGroup()
+
+    private var isAdmitting = true
+    private var retainedFailure: Error?
     private var hasCommitted = false
-    private var hasReportedFailure = false
-    private var pendingFailure: Error?
-    private var onFailureHandler: (@Sendable (Error) -> Void)?
+    private var committedHandler: (@Sendable (Error) -> Void)?
+    private var hasDelivered = false
 
     init() {
         self.queue = DispatchQueue(
             label: "com.lecturerecorder.failurecoordinator"
         )
+        self.deliveryQueue = DispatchQueue(
+            label: "com.lecturerecorder.failurecoordinator.delivery"
+        )
+        Self.tagQueues(state: queue, delivery: deliveryQueue)
     }
 
     init(queue: DispatchQueue) {
         self.queue = queue
+        self.deliveryQueue = DispatchQueue(
+            label: "com.lecturerecorder.failurecoordinator.delivery"
+        )
+        Self.tagQueues(state: self.queue, delivery: self.deliveryQueue)
     }
 
-    func markCommitted(
-        onFailure: @escaping @Sendable (Error) -> Void
+    private static func tagQueues(
+        state: DispatchQueue,
+        delivery: DispatchQueue
     ) {
+        state.setSpecific(key: queueRoleKey, value: .state)
+        delivery.setSpecific(key: queueRoleKey, value: .delivery)
+    }
+
+    /// Reports an asynchronous capture failure for this cycle.
+    ///
+    /// Only the first accepted failure has any effect: it closes
+    /// admission, retains the error for the lifetime of the cycle, and
+    /// runs `onFirstAcceptance` exactly once, inside this call's
+    /// synchronization. Every later call is rejected and cannot overwrite
+    /// the retained error.
+    ///
+    /// `onFirstAcceptance` must be a small, synchronous, non-blocking
+    /// state transition (e.g. closing a callback gate) — it runs inside
+    /// the coordinator's critical section, so it must never perform
+    /// logging, I/O, awaits, UI work, or call back into this coordinator.
+    ///
+    /// If this call also claims the cycle's single allowed delivery, it
+    /// enters `deliveryGroup` before leaving the critical section, so a
+    /// concurrent `drainDelivery()` can never observe delivery as
+    /// unclaimed once this call returns.
+    func reportFailure(
+        _ error: Error,
+        onFirstAcceptance: () -> Void
+    ) {
+        var handlerToInvoke: (@Sendable (Error) -> Void)?
+        var errorToDeliver: Error?
+
         queue.sync {
-            hasCommitted = true
-            onFailureHandler = onFailure
-
-            if
-                !hasReportedFailure,
-                let pending = pendingFailure
-            {
-                hasReportedFailure = true
-                pendingFailure = nil
-
-                queue.async {
-                    onFailure(pending)
-                }
-            }
-        }
-    }
-
-    func reportAsyncFailure(
-        _ error: Error
-    ) {
-        queue.async { [self] in
-            guard !hasReportedFailure else {
+            guard isAdmitting else {
                 return
             }
 
+            isAdmitting = false
+            retainedFailure = error
+            onFirstAcceptance()
+
             if
                 hasCommitted,
-                let handler = onFailureHandler
+                !hasDelivered,
+                let handler = committedHandler
             {
-                hasReportedFailure = true
-                handler(error)
-            } else {
-                pendingFailure = error
+                hasDelivered = true
+                deliveryGroup.enter()
+                handlerToInvoke = handler
+                errorToDeliver = error
+            }
+        }
+
+        deliver(handlerToInvoke, errorToDeliver)
+    }
+
+    /// Commits the external failure handler for this cycle. If a failure
+    /// was already retained and not yet delivered, it is delivered
+    /// exactly once as a result of this call.
+    ///
+    /// If this call claims the cycle's single allowed delivery, it enters
+    /// `deliveryGroup` before leaving the critical section — see
+    /// `reportFailure(_:onFirstAcceptance:)`.
+    func markCommitted(
+        onFailure: @escaping @Sendable (Error) -> Void
+    ) {
+        var handlerToInvoke: (@Sendable (Error) -> Void)?
+        var errorToDeliver: Error?
+
+        queue.sync {
+            hasCommitted = true
+            committedHandler = onFailure
+
+            if
+                !hasDelivered,
+                let failure = retainedFailure
+            {
+                hasDelivered = true
+                deliveryGroup.enter()
+                handlerToInvoke = onFailure
+                errorToDeliver = failure
+            }
+        }
+
+        deliver(handlerToInvoke, errorToDeliver)
+    }
+
+    /// Idempotently closes failure admission and returns whatever error
+    /// is retained for this cycle, without consuming or clearing it —
+    /// callers may call this repeatedly (e.g. from repeated `stop()`
+    /// calls) and keep getting the same answer.
+    @discardableResult
+    func closeAdmission() -> Error? {
+        queue.sync {
+            isAdmitting = false
+            return retainedFailure
+        }
+    }
+
+    /// Waits until this cycle's claimed delivery — if any was ever
+    /// claimed — has finished invoking the handler. Returns immediately
+    /// if no failure was ever claimed for delivery.
+    ///
+    /// Bridges `DispatchGroup.notify` through a checked continuation, so
+    /// callers can `await` it without a blocking wait such as
+    /// `DispatchGroup.wait()` or a semaphore.
+    func drainDelivery() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            deliveryGroup.notify(queue: deliveryQueue) {
+                continuation.resume()
             }
         }
     }
 
-    func invalidate() {
-        queue.sync {
-            hasReportedFailure = true
-            onFailureHandler = nil
-            pendingFailure = nil
+    /// Invokes a claimed handler strictly after leaving the coordinator's
+    /// state queue and the calling thread's synchronous call stack, on a
+    /// dedicated delivery queue distinct from the state queue — so a
+    /// reentrant call from inside the handler back into this coordinator,
+    /// or into a caller that serializes through its own control queue,
+    /// can never deadlock. `deliveryGroup.leave()` runs only after the
+    /// handler invocation returns, which is what lets `drainDelivery()`
+    /// observe completion.
+    private func deliver(
+        _ handler: (@Sendable (Error) -> Void)?,
+        _ error: Error?
+    ) {
+        guard let handler, let error else {
+            return
+        }
+
+        deliveryQueue.async { [deliveryGroup] in
+            defer {
+                deliveryGroup.leave()
+            }
+            handler(error)
         }
     }
 }

@@ -47,9 +47,18 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
 
     private var cycleState: CycleState = .idle
     private var inProgressStopTask: Task<Void, Never>?
+    private var inProgressStopOutcome: Error?
+    private var lastCompletedOutcome: Error?
 
     private let formatToPrepare: AVAudioFormat
     private var shouldFailNextStartStorage = false
+
+    // Test-only observation seams (below), so tests can prove ordering
+    // deterministically instead of relying on a fixed delay before
+    // releasing a held callback. Never used outside this DEBUG-only
+    // mock, and never influence production control flow.
+    private var didEnterStoppingHook: (@Sendable () -> Void)?
+    private var didJoinInProgressStopHook: (@Sendable () -> Void)?
 
     init(formatToPrepare: AVAudioFormat) {
         self.formatToPrepare = formatToPrepare
@@ -61,6 +70,32 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         }
     }
 
+    /// Test-only seam: fires once this cycle's `stop()` call has
+    /// synchronously transitioned `cycleState` to `.stopping` — i.e. once
+    /// it has entered its draining path. This confirms the transition
+    /// happened; it does not guarantee the fire happens before the
+    /// asynchronous draining task itself begins running, since that task
+    /// is started concurrently and may already be executing by the time
+    /// this hook is invoked.
+    func setDidEnterStoppingHookForTesting(
+        _ hook: @escaping @Sendable () -> Void
+    ) {
+        controlQueue.sync {
+            didEnterStoppingHook = hook
+        }
+    }
+
+    /// Test-only seam: fires exactly once a `stop()` call observes an
+    /// already-`.stopping` cycle and joins its in-progress drain, rather
+    /// than starting a new one.
+    func setDidJoinInProgressStopHookForTesting(
+        _ hook: @escaping @Sendable () -> Void
+    ) {
+        controlQueue.sync {
+            didJoinInProgressStopHook = hook
+        }
+    }
+
     func prepare() throws -> AVAudioFormat {
         try controlQueue.sync {
             guard case .idle = cycleState else {
@@ -68,6 +103,7 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
             }
 
             cycleState = .prepared(format: formatToPrepare)
+            lastCompletedOutcome = nil
             return formatToPrepare
         }
     }
@@ -103,28 +139,39 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         }
     }
 
-    func stop() async {
-        let taskToAwait: Task<Void, Never>? = controlQueue.sync {
+    @discardableResult
+    func stop() async -> Error? {
+        let taskToAwait: Task<Void, Never>?
+        let outcome: Error?
+        let hookToFire: (@Sendable () -> Void)?
+
+        (taskToAwait, outcome, hookToFire) = controlQueue.sync {
             switch cycleState {
             case .idle:
-                return nil
+                return (nil, lastCompletedOutcome, nil)
 
             case .stopping:
-                return inProgressStopTask
+                return (inProgressStopTask, inProgressStopOutcome, didJoinInProgressStopHook)
 
             case .prepared:
                 cycleState = .idle
-                return nil
+                return (nil, lastCompletedOutcome, nil)
 
             case .running(let resources):
                 cycleState = .stopping
-                resources.coordinator.invalidate()
+
+                let closedOutcome = resources.coordinator.closeAdmission()
                 resources.gate.close()
 
+                inProgressStopOutcome = closedOutcome
+
                 let gate = resources.gate
+                let coordinator = resources.coordinator
 
                 let task = Task { [weak self] in
-                    await gate.drain()
+                    async let bufferDrain: Void = gate.drain()
+                    async let deliveryDrain: Void = coordinator.drainDelivery()
+                    _ = await (bufferDrain, deliveryDrain)
 
                     guard let self else {
                         return
@@ -133,18 +180,26 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
                     self.controlQueue.sync {
                         if case .stopping = self.cycleState {
                             self.cycleState = .idle
+                            self.lastCompletedOutcome = closedOutcome
                         }
 
                         self.inProgressStopTask = nil
+                        self.inProgressStopOutcome = nil
                     }
                 }
 
                 inProgressStopTask = task
-                return task
+                return (task, closedOutcome, didEnterStoppingHook)
             }
         }
 
+        // Fired only after leaving controlQueue's synchronization, same
+        // discipline as FailureCoordinator's delivery: test observation
+        // must never run inside a lock.
+        hookToFire?()
+
         await taskToAwait?.value
+        return outcome
     }
 
     func injectBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -184,8 +239,11 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
                 return
             }
 
-            resources.gate.close()
-            resources.coordinator.reportAsyncFailure(error)
+            // Gate closure happens only as the first-acceptance side
+            // effect of reportFailure — never independently.
+            resources.coordinator.reportFailure(error) {
+                resources.gate.close()
+            }
         }
     }
 }

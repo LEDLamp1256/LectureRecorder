@@ -187,7 +187,7 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         )
     }
 
-    func testStopWaitsForInFlightInjection() async throws {
+    func testStopWaitsForExplicitlyHeldAdmittedCallback() async throws {
         let format = makeMonoFormat()
         let mock = MockAudioCaptureService(formatToPrepare: format)
         _ = try mock.prepare()
@@ -195,19 +195,34 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let onBufferStarted = XCTestExpectation(
             description: "onBuffer started"
         )
-
-        let onBufferFinished = XCTestExpectation(
-            description: "onBuffer finished"
+        let stopEnteredDraining = XCTestExpectation(
+            description: "stop entered draining"
         )
+        let stopReturnedPrematurely = XCTestExpectation(
+            description: "stop returned prematurely"
+        )
+        stopReturnedPrematurely.isInverted = true
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let eventLog = TestBox<[String]>([])
+
+        // Ensure a held callback is always released, even if an
+        // assertion above fails and unwinds the test early. Signaling a
+        // semaphore more than once is harmless.
+        defer { releaseCallback.signal() }
 
         try mock.start(
             onBuffer: { _ in
+                eventLog.mutate { $0.append("callbackStarted") }
                 onBufferStarted.fulfill()
-                Thread.sleep(forTimeInterval: 0.2)
-                onBufferFinished.fulfill()
+                releaseCallback.wait()
+                eventLog.mutate { $0.append("callbackFinished") }
             },
             onFailure: { _ in }
         )
+
+        mock.setDidEnterStoppingHookForTesting {
+            stopEnteredDraining.fulfill()
+        }
 
         injectOnDetachedThread(
             mock,
@@ -222,19 +237,198 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             timeout: 1.0
         )
 
-        let stopStart = Date()
-        await mock.stop()
-        let stopDuration = Date().timeIntervalSince(stopStart)
+        let stopTask = Task<Error?, Never> {
+            let outcome = await mock.stop()
+            stopReturnedPrematurely.fulfill()
+            return outcome
+        }
 
-        XCTAssertGreaterThanOrEqual(
-            stopDuration,
-            0.15,
-            "stop() should wait for the in-flight onBuffer to finish"
+        // Deterministic: wait for stop() to have actually transitioned
+        // into its draining path — not a fixed delay — before relying on
+        // (and checking) non-completion.
+        await fulfillment(of: [stopEnteredDraining], timeout: 1.0)
+        await fulfillment(of: [stopReturnedPrematurely], timeout: 0.3)
+
+        releaseCallback.signal()
+
+        _ = await stopTask.value
+        eventLog.mutate { $0.append("stopReturned") }
+
+        XCTAssertEqual(
+            eventLog.get(),
+            ["callbackStarted", "callbackFinished", "stopReturned"],
+            "stop() must not return before the explicitly held admitted callback finishes"
+        )
+    }
+
+    func testHeldOnFailureInvocationBlocksStopCompletionAndRejectsNewPrepare() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let handlerStarted = XCTestExpectation(description: "onFailure started")
+        let stopEnteredDraining = XCTestExpectation(
+            description: "stop entered draining"
+        )
+        let stopReturnedPrematurely = XCTestExpectation(
+            description: "stop returned prematurely"
+        )
+        stopReturnedPrematurely.isInverted = true
+        let releaseHandler = DispatchSemaphore(value: 0)
+        let eventLog = TestBox<[String]>([])
+
+        defer { releaseHandler.signal() }
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in
+                eventLog.mutate { $0.append("handlerStarted") }
+                handlerStarted.fulfill()
+                releaseHandler.wait()
+                eventLog.mutate { $0.append("handlerFinished") }
+            }
         )
 
-        await fulfillment(
-            of: [onBufferFinished],
-            timeout: 1.0
+        mock.setDidEnterStoppingHookForTesting {
+            stopEnteredDraining.fulfill()
+        }
+
+        mock.simulateAsyncFailure(TestError.tagged(42))
+
+        await fulfillment(of: [handlerStarted], timeout: 1.0)
+
+        let stopTask = Task<Error?, Never> {
+            let outcome = await mock.stop()
+            stopReturnedPrematurely.fulfill()
+            return outcome
+        }
+
+        // Deterministic: wait for stop() to have actually transitioned
+        // into its draining path before checking prepare-rejection.
+        await fulfillment(of: [stopEnteredDraining], timeout: 1.0)
+
+        XCTAssertThrowsError(
+            try mock.prepare()
+        ) { error in
+            guard case MockAudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail(
+                    "Expected prepareCalledFromInvalidState, got \(error)"
+                )
+            }
+        }
+
+        // Bounded guard against premature completion, checked only after
+        // the draining transition above is already established.
+        await fulfillment(of: [stopReturnedPrematurely], timeout: 0.3)
+        XCTAssertFalse(
+            eventLog.get().contains("handlerFinished"),
+            "the claimed handler must still be executing while stop() drains"
+        )
+
+        releaseHandler.signal()
+
+        let outcome = await stopTask.value
+        eventLog.mutate { $0.append("stopReturned") }
+
+        XCTAssertEqual(outcome as? TestError, .tagged(42))
+        XCTAssertEqual(
+            eventLog.get(),
+            ["handlerStarted", "handlerFinished", "stopReturned"],
+            "stop() must not return, and a new prepare() must be rejected, before the claimed onFailure invocation returns"
+        )
+
+        // After releasing: a fresh prepare/start/stop cycle succeeds
+        // cleanly and no old callback invocation crosses into it.
+        let reprepared = try mock.prepare()
+        assertFormatsEqual(reprepared, format)
+
+        let newCycleFailures = TestBox<[Error]>([])
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { error in
+                newCycleFailures.mutate { $0.append(error) }
+            }
+        )
+
+        let newOutcome = await mock.stop()
+
+        XCTAssertNil(
+            newOutcome,
+            "a fresh cycle must not inherit the previous cycle's retained failure"
+        )
+        XCTAssertTrue(
+            newCycleFailures.get().isEmpty,
+            "no old callback invocation may cross into the new cycle"
+        )
+    }
+
+    func testConcurrentStopCallersRemainPendingDuringHeldFailureHandlerAndReturnSameOutcome() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let handlerStarted = XCTestExpectation(description: "onFailure started")
+        let secondCallerJoined = XCTestExpectation(
+            description: "second stop() joined in-progress drain"
+        )
+        let eitherStopReturnedPrematurely = XCTestExpectation(
+            description: "a stop() call returned prematurely"
+        )
+        eitherStopReturnedPrematurely.isInverted = true
+        let releaseHandler = DispatchSemaphore(value: 0)
+        let eventLog = TestBox<[String]>([])
+
+        defer { releaseHandler.signal() }
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in
+                eventLog.mutate { $0.append("handlerStarted") }
+                handlerStarted.fulfill()
+                releaseHandler.wait()
+                eventLog.mutate { $0.append("handlerFinished") }
+            }
+        )
+
+        mock.setDidJoinInProgressStopHookForTesting {
+            secondCallerJoined.fulfill()
+        }
+
+        mock.simulateAsyncFailure(TestError.tagged(7))
+
+        await fulfillment(of: [handlerStarted], timeout: 1.0)
+
+        let outcome1Box = TestBox<Error?>(nil)
+        let outcome2Box = TestBox<Error?>(nil)
+
+        let firstTask = Task {
+            outcome1Box.set(await mock.stop())
+            eitherStopReturnedPrematurely.fulfill()
+        }
+        let secondTask = Task {
+            outcome2Box.set(await mock.stop())
+            eitherStopReturnedPrematurely.fulfill()
+        }
+
+        // Deterministic: prove the second caller actually observed
+        // .stopping and joined the first caller's in-progress drain
+        // before relying on (and checking) neither having completed.
+        await fulfillment(of: [secondCallerJoined], timeout: 1.0)
+        await fulfillment(of: [eitherStopReturnedPrematurely], timeout: 0.3)
+
+        releaseHandler.signal()
+
+        await firstTask.value
+        await secondTask.value
+        eventLog.mutate { $0.append("stopReturned") }
+
+        XCTAssertEqual(outcome1Box.get() as? TestError, .tagged(7))
+        XCTAssertEqual(outcome2Box.get() as? TestError, .tagged(7))
+        XCTAssertEqual(
+            eventLog.get(),
+            ["handlerStarted", "handlerFinished", "stopReturned"],
+            "concurrent stop() callers must both wait for the claimed onFailure invocation to finish and return the same outcome"
         )
     }
 
@@ -252,7 +446,26 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         await mock.stop()
     }
 
-    func testConcurrentStopCallsAllWaitForFullDrain() async throws {
+    func testStopCalledAgainAfterCompletionReturnsSameOutcome() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+
+        mock.simulateAsyncFailure(TestError.tagged(9))
+
+        let firstOutcome = await mock.stop()
+        let secondOutcome = await mock.stop()
+
+        XCTAssertEqual(firstOutcome as? TestError, .tagged(9))
+        XCTAssertEqual(secondOutcome as? TestError, .tagged(9))
+    }
+
+    func testConcurrentStopCallersJoinSameDrainAndReceiveSameOutcome() async throws {
         let format = makeMonoFormat()
         let mock = MockAudioCaptureService(formatToPrepare: format)
         _ = try mock.prepare()
@@ -260,19 +473,31 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let onBufferStarted = XCTestExpectation(
             description: "onBuffer started"
         )
-
-        let onBufferFinished = XCTestExpectation(
-            description: "onBuffer finished"
+        let secondCallerJoined = XCTestExpectation(
+            description: "second stop() joined in-progress drain"
         )
+        let eitherStopReturnedPrematurely = XCTestExpectation(
+            description: "a stop() call returned prematurely"
+        )
+        eitherStopReturnedPrematurely.isInverted = true
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let eventLog = TestBox<[String]>([])
+
+        defer { releaseCallback.signal() }
 
         try mock.start(
             onBuffer: { _ in
+                eventLog.mutate { $0.append("callbackStarted") }
                 onBufferStarted.fulfill()
-                Thread.sleep(forTimeInterval: 0.15)
-                onBufferFinished.fulfill()
+                releaseCallback.wait()
+                eventLog.mutate { $0.append("callbackFinished") }
             },
             onFailure: { _ in }
         )
+
+        mock.setDidJoinInProgressStopHookForTesting {
+            secondCallerJoined.fulfill()
+        }
 
         injectOnDetachedThread(
             mock,
@@ -288,14 +513,96 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             timeout: 1.0
         )
 
-        async let firstStop: Void = mock.stop()
-        async let secondStop: Void = mock.stop()
+        // Report the failure only once the buffer is already admitted and
+        // blocked, so injection isn't rejected by the resulting gate
+        // closure.
+        mock.simulateAsyncFailure(TestError.tagged(8))
 
-        _ = await (firstStop, secondStop)
+        let outcome1Box = TestBox<Error?>(nil)
+        let outcome2Box = TestBox<Error?>(nil)
 
-        await fulfillment(
-            of: [onBufferFinished],
-            timeout: 1.0
+        let firstTask = Task {
+            outcome1Box.set(await mock.stop())
+            eitherStopReturnedPrematurely.fulfill()
+        }
+        let secondTask = Task {
+            outcome2Box.set(await mock.stop())
+            eitherStopReturnedPrematurely.fulfill()
+        }
+
+        // Deterministic: prove the second caller actually observed
+        // .stopping and joined the first caller's in-progress drain
+        // before relying on (and checking) neither having completed.
+        await fulfillment(of: [secondCallerJoined], timeout: 1.0)
+        await fulfillment(of: [eitherStopReturnedPrematurely], timeout: 0.3)
+
+        releaseCallback.signal()
+
+        await firstTask.value
+        await secondTask.value
+        eventLog.mutate { $0.append("stopReturned") }
+
+        XCTAssertEqual(outcome1Box.get() as? TestError, .tagged(8))
+        XCTAssertEqual(outcome2Box.get() as? TestError, .tagged(8))
+        XCTAssertEqual(
+            eventLog.get(),
+            ["callbackStarted", "callbackFinished", "stopReturned"],
+            "concurrent stop() callers must join the same drain and only return after it completes"
+        )
+    }
+
+    func testSuccessfulPrepareResetsPreviousOutcome() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+
+        mock.simulateAsyncFailure(TestError.tagged(10))
+
+        let firstOutcome = await mock.stop()
+        XCTAssertEqual(firstOutcome as? TestError, .tagged(10))
+
+        _ = try mock.prepare()
+
+        let secondOutcome = await mock.stop()
+        XCTAssertNil(
+            secondOutcome,
+            "a successful prepare() must reset the previous cycle's outcome"
+        )
+    }
+
+    func testFailedPrepareWhileRunningLeavesActiveCycleAndOutcomeUnchanged() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+
+        mock.simulateAsyncFailure(TestError.tagged(11))
+
+        XCTAssertThrowsError(
+            try mock.prepare()
+        ) { error in
+            guard case MockAudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail(
+                    "Expected prepareCalledFromInvalidState, got \(error)"
+                )
+            }
+        }
+
+        let outcome = await mock.stop()
+
+        XCTAssertEqual(
+            outcome as? TestError,
+            .tagged(11),
+            "a failed prepare() attempt must not disturb the active cycle's retained outcome"
         )
     }
 
@@ -435,7 +742,7 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         assertFormatsEqual(reprepared, format)
     }
 
-    func testOnFailureNeverDeliveredForACycleWhoseStartThrew() async throws {
+    func testThrowingStartRequiresStopBeforeNextPrepareAndNeverDeliversFailure() async throws {
         let format = makeMonoFormat()
         let mock = MockAudioCaptureService(formatToPrepare: format)
         _ = try mock.prepare()
@@ -456,14 +763,94 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             )
         )
 
-        mock.simulateAsyncFailure(TestError.example)
+        // A prepare() immediately after a throwing start() must fail —
+        // the caller has not yet run stop() cleanup for the uncommitted
+        // attempt.
+        XCTAssertThrowsError(
+            try mock.prepare()
+        ) { error in
+            guard case MockAudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail(
+                    "Expected prepareCalledFromInvalidState, got \(error)"
+                )
+            }
+        }
 
-        await mock.stop()
+        let outcome = await mock.stop()
+        XCTAssertNil(
+            outcome,
+            "an uncommitted attempt with no failure ever reported has no retained asynchronous outcome"
+        )
 
         await fulfillment(
             of: [onFailureCalled],
             timeout: 0.3
         )
+
+        // Only after stop() completes is a new prepare() allowed.
+        let reprepared = try mock.prepare()
+        assertFormatsEqual(reprepared, format)
+    }
+
+    func testFailureReportedDuringUncommittedThrowingStartCycleIsRetainedButNeverDelivered() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        mock.setShouldFailNextStart(true)
+
+        let onFailureCalled = XCTestExpectation(
+            description: "onFailure should NOT be called"
+        )
+        onFailureCalled.isInverted = true
+
+        XCTAssertThrowsError(
+            try mock.start(
+                onBuffer: { _ in },
+                onFailure: { _ in
+                    onFailureCalled.fulfill()
+                }
+            )
+        )
+
+        // A prepare() immediately after a throwing start() must fail —
+        // the caller has not yet run stop() cleanup for the uncommitted
+        // attempt.
+        XCTAssertThrowsError(
+            try mock.prepare()
+        ) { error in
+            guard case MockAudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail(
+                    "Expected prepareCalledFromInvalidState, got \(error)"
+                )
+            }
+        }
+
+        // start() throws only after cycleState is already set to
+        // .running(resources) — the gate and coordinator for this
+        // attempt exist even though onFailure was never committed. Lack
+        // of commitment must not be conflated with lack of a retained
+        // failure: an asynchronous failure reported into this window is
+        // still admitted, and stop()/closeAdmission() must still surface
+        // it, even though no handler was ever committed to receive it.
+        mock.simulateAsyncFailure(TestError.tagged(13))
+
+        let outcome = await mock.stop()
+
+        XCTAssertEqual(
+            outcome as? TestError,
+            .tagged(13),
+            "stop() must return whatever failure was actually admitted for the cycle, even though no handler was ever committed to receive it"
+        )
+
+        await fulfillment(
+            of: [onFailureCalled],
+            timeout: 0.3
+        )
+
+        // Only after stop() completes is a new prepare() allowed.
+        let reprepared = try mock.prepare()
+        assertFormatsEqual(reprepared, format)
     }
 
     func testNormalCleanStopNeverTriggersFailure() async throws {
@@ -539,6 +926,7 @@ final class MockAudioCaptureServiceTests: XCTestCase {
     }
 }
 
-private enum TestError: Error {
+private enum TestError: Error, Equatable {
     case example
+    case tagged(Int)
 }
