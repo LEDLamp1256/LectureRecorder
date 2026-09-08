@@ -60,8 +60,10 @@ final class AudioCaptureServiceTests: XCTestCase {
         let firstOutcome = await service.stop()
         let secondOutcome = await service.stop()
 
-        XCTAssertNil(firstOutcome)
-        XCTAssertNil(secondOutcome)
+        XCTAssertNil(firstOutcome.failure)
+        XCTAssertEqual(firstOutcome.observedCopyFailureCount, 0)
+        XCTAssertNil(secondOutcome.failure)
+        XCTAssertEqual(secondOutcome.observedCopyFailureCount, 0)
     }
 
     // MARK: - FailureCoordinator contract

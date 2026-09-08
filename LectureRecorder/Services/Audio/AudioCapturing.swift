@@ -38,11 +38,22 @@ nonisolated protocol AudioCapturing: Sendable {
     /// not wait for any asynchronous work independently launched by that
     /// invocation; see `start()`.
     ///
-    /// Returns the retained asynchronous capture failure for the most
-    /// recently completed cycle, if any. A cycle "completes" the first
-    /// time `stop()` finishes draining it; later `stop()` calls made
-    /// while idle return that same retained outcome again. A successful
-    /// `prepare()` resets it back to `nil` for the new cycle.
+    /// Returns the complete outcome for the most recently completed
+    /// cycle: the retained asynchronous capture failure, if any, and the
+    /// number of buffer copies observed failing during that cycle. The
+    /// failure is frozen the moment failure admission closes, before
+    /// teardown begins; the copy-failure count is sampled only after
+    /// both admitted buffer callbacks and any claimed failure-handler
+    /// delivery have finished draining, so a copy that fails after
+    /// `stop()` begins is still counted. The count reflects only what
+    /// this mechanism observed — it is not proof that the hardware or
+    /// downstream pipeline lost no audio.
+    ///
+    /// A cycle "completes" the first time `stop()` finishes draining it;
+    /// later `stop()` calls made while idle return that same retained
+    /// outcome again. A successful `prepare()` resets it back to a clean
+    /// outcome (`failure: nil, observedCopyFailureCount: 0`) for the new
+    /// cycle.
     @discardableResult
-    func stop() async -> Error?
+    func stop() async -> CaptureStopOutcome
 }
