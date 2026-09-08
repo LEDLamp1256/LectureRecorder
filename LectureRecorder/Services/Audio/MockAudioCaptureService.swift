@@ -23,7 +23,7 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         case idle
         case prepared(format: AVAudioFormat)
         case running(RunningResources)
-        case stopping
+        case stopping(Task<CaptureStopOutcome, Never>)
     }
 
     private nonisolated final class RunningResources {
@@ -31,24 +31,28 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         let format: AVAudioFormat
         let onBuffer: @Sendable (AVAudioPCMBuffer) -> Void
         let coordinator: FailureCoordinator
+        let copyFailureCounter: CopyFailureCounter
 
         init(
             gate: InFlightCallbackGate,
             format: AVAudioFormat,
             onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
-            coordinator: FailureCoordinator
+            coordinator: FailureCoordinator,
+            copyFailureCounter: CopyFailureCounter
         ) {
             self.gate = gate
             self.format = format
             self.onBuffer = onBuffer
             self.coordinator = coordinator
+            self.copyFailureCounter = copyFailureCounter
         }
     }
 
     private var cycleState: CycleState = .idle
-    private var inProgressStopTask: Task<Void, Never>?
-    private var inProgressStopOutcome: Error?
-    private var lastCompletedOutcome: Error?
+    private var lastCompletedOutcome = CaptureStopOutcome(
+        failure: nil,
+        observedCopyFailureCount: 0
+    )
 
     private let formatToPrepare: AVAudioFormat
     private var shouldFailNextStartStorage = false
@@ -59,6 +63,7 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     // mock, and never influence production control flow.
     private var didEnterStoppingHook: (@Sendable () -> Void)?
     private var didJoinInProgressStopHook: (@Sendable () -> Void)?
+    private var postResolutionHook: (@Sendable () -> Void)?
 
     init(formatToPrepare: AVAudioFormat) {
         self.formatToPrepare = formatToPrepare
@@ -96,6 +101,36 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         }
     }
 
+    /// Test-only seam: fires at most once, for whichever `stop()` caller
+    /// first reaches the point after its shared drain `Task` has already
+    /// resolved — cycleState/lastCompletedOutcome already published —
+    /// but before that caller returns its `CaptureStopOutcome`. One-shot:
+    /// consumed (read-and-cleared) atomically so it cannot also fire for
+    /// a later, unrelated `stop()` call. Lets a test hold one specific
+    /// caller at exactly that point to prove it still returns its own
+    /// cycle's result even after a later cycle begins and completes
+    /// while it's held.
+    func setPostResolutionHookForTesting(
+        _ hook: @escaping @Sendable () -> Void
+    ) {
+        controlQueue.sync {
+            postResolutionHook = hook
+        }
+    }
+
+    /// Atomically takes and clears the post-resolution hook, if any is
+    /// currently set. Runs under controlQueue only to read/clear the
+    /// stored closure reference — never to invoke it; the returned
+    /// closure must be called by the caller only after leaving
+    /// controlQueue's synchronization.
+    private func consumePostResolutionHookForTesting() -> (@Sendable () -> Void)? {
+        controlQueue.sync {
+            let hook = postResolutionHook
+            postResolutionHook = nil
+            return hook
+        }
+    }
+
     func prepare() throws -> AVAudioFormat {
         try controlQueue.sync {
             guard case .idle = cycleState else {
@@ -103,7 +138,10 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
             }
 
             cycleState = .prepared(format: formatToPrepare)
-            lastCompletedOutcome = nil
+            lastCompletedOutcome = CaptureStopOutcome(
+                failure: nil,
+                observedCopyFailureCount: 0
+            )
             return formatToPrepare
         }
     }
@@ -121,11 +159,13 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
             gate.open()
 
             let coordinator = FailureCoordinator()
+            let copyFailureCounter = CopyFailureCounter()
             let resources = RunningResources(
                 gate: gate,
                 format: format,
                 onBuffer: onBuffer,
-                coordinator: coordinator
+                coordinator: coordinator,
+                copyFailureCounter: copyFailureCounter
             )
 
             cycleState = .running(resources)
@@ -140,56 +180,61 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     }
 
     @discardableResult
-    func stop() async -> Error? {
-        let taskToAwait: Task<Void, Never>?
-        let outcome: Error?
+    func stop() async -> CaptureStopOutcome {
+        enum Action {
+            case returnImmediately(CaptureStopOutcome)
+            case awaitTask(Task<CaptureStopOutcome, Never>)
+        }
+
+        let action: Action
         let hookToFire: (@Sendable () -> Void)?
 
-        (taskToAwait, outcome, hookToFire) = controlQueue.sync {
+        (action, hookToFire) = controlQueue.sync {
             switch cycleState {
             case .idle:
-                return (nil, lastCompletedOutcome, nil)
+                return (.returnImmediately(lastCompletedOutcome), nil)
 
-            case .stopping:
-                return (inProgressStopTask, inProgressStopOutcome, didJoinInProgressStopHook)
+            case .stopping(let task):
+                return (.awaitTask(task), didJoinInProgressStopHook)
 
             case .prepared:
                 cycleState = .idle
-                return (nil, lastCompletedOutcome, nil)
+                return (.returnImmediately(lastCompletedOutcome), nil)
 
             case .running(let resources):
-                cycleState = .stopping
-
-                let closedOutcome = resources.coordinator.closeAdmission()
+                let closedFailure = resources.coordinator.closeAdmission()
                 resources.gate.close()
-
-                inProgressStopOutcome = closedOutcome
 
                 let gate = resources.gate
                 let coordinator = resources.coordinator
+                let copyFailureCounter = resources.copyFailureCounter
 
-                let task = Task { [weak self] in
+                let task = Task<CaptureStopOutcome, Never> { [weak self] in
                     async let bufferDrain: Void = gate.drain()
                     async let deliveryDrain: Void = coordinator.drainDelivery()
                     _ = await (bufferDrain, deliveryDrain)
 
+                    let outcome = CaptureStopOutcome(
+                        failure: closedFailure,
+                        observedCopyFailureCount: copyFailureCounter.load()
+                    )
+
                     guard let self else {
-                        return
+                        return outcome
                     }
 
                     self.controlQueue.sync {
                         if case .stopping = self.cycleState {
                             self.cycleState = .idle
-                            self.lastCompletedOutcome = closedOutcome
+                            self.lastCompletedOutcome = outcome
                         }
-
-                        self.inProgressStopTask = nil
-                        self.inProgressStopOutcome = nil
                     }
+
+                    return outcome
                 }
 
-                inProgressStopTask = task
-                return (task, closedOutcome, didEnterStoppingHook)
+                cycleState = .stopping(task)
+                return (.awaitTask(task), didEnterStoppingHook)
             }
         }
 
@@ -198,23 +243,36 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         // must never run inside a lock.
         hookToFire?()
 
-        await taskToAwait?.value
-        return outcome
+        switch action {
+        case .returnImmediately(let outcome):
+            return outcome
+        case .awaitTask(let task):
+            let outcome = await task.value
+
+            // Test-only, DEBUG-only: fires at most once, only for a
+            // caller that actually awaited the shared task above — never
+            // for a caller that took the .returnImmediately branch — and
+            // never while holding controlQueue.
+            consumePostResolutionHookForTesting()?()
+
+            return outcome
+        }
     }
 
     func injectBuffer(_ buffer: AVAudioPCMBuffer) {
         let snapshot: (
             InFlightCallbackGate,
+            CopyFailureCounter,
             @Sendable (AVAudioPCMBuffer) -> Void
         )? = controlQueue.sync {
             guard case .running(let resources) = cycleState else {
                 return nil
             }
 
-            return (resources.gate, resources.onBuffer)
+            return (resources.gate, resources.copyFailureCounter, resources.onBuffer)
         }
 
-        guard let (gate, onBuffer) = snapshot else {
+        guard let (gate, copyFailureCounter, onBuffer) = snapshot else {
             return
         }
 
@@ -226,11 +284,96 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
             gate.leave()
         }
 
-        guard let copy = buffer.deepCopy() else {
+        handleCopiedBuffer(
+            buffer.deepCopy(),
+            copyFailureCounter: copyFailureCounter,
+            onBuffer: onBuffer
+        )
+    }
+
+    /// Test-only seam: enters the same admission gate as `injectBuffer`,
+    /// but passes `nil` straight to the shared `handleCopiedBuffer` —
+    /// the same handler the production tap and `injectBuffer` use —
+    /// instead of a real deep copy. Proves the failure-accounting/
+    /// no-handoff branch deterministically, without needing to
+    /// construct an actually-malformed buffer.
+    func injectBufferForcingCopyFailure(_ buffer: AVAudioPCMBuffer) {
+        let snapshot: (
+            InFlightCallbackGate,
+            CopyFailureCounter,
+            @Sendable (AVAudioPCMBuffer) -> Void
+        )? = controlQueue.sync {
+            guard case .running(let resources) = cycleState else {
+                return nil
+            }
+
+            return (resources.gate, resources.copyFailureCounter, resources.onBuffer)
+        }
+
+        guard let (gate, copyFailureCounter, onBuffer) = snapshot else {
             return
         }
 
-        onBuffer(copy)
+        guard gate.tryEnter() else {
+            return
+        }
+
+        defer {
+            gate.leave()
+        }
+
+        handleCopiedBuffer(
+            nil,
+            copyFailureCounter: copyFailureCounter,
+            onBuffer: onBuffer
+        )
+    }
+
+    /// Test-only seam: same admission path, but blocks — after calling
+    /// `onCopyStarted` — until `releaseCopy` is signaled, remaining
+    /// admitted (the gate is not left) the entire time, then forces the
+    /// copy to fail via the same shared `handleCopiedBuffer`. Lets tests
+    /// prove `stop()` waits for a copy failure that resolves only after
+    /// `stop()` has already begun draining, and that the failure is
+    /// still counted. Must be called from a background thread — it
+    /// blocks synchronously on `releaseCopy`.
+    func injectBufferForcingCopyFailureBlockingUntilReleased(
+        _ buffer: AVAudioPCMBuffer,
+        onCopyStarted: @escaping @Sendable () -> Void,
+        releaseCopy: DispatchSemaphore
+    ) {
+        let snapshot: (
+            InFlightCallbackGate,
+            CopyFailureCounter,
+            @Sendable (AVAudioPCMBuffer) -> Void
+        )? = controlQueue.sync {
+            guard case .running(let resources) = cycleState else {
+                return nil
+            }
+
+            return (resources.gate, resources.copyFailureCounter, resources.onBuffer)
+        }
+
+        guard let (gate, copyFailureCounter, onBuffer) = snapshot else {
+            return
+        }
+
+        guard gate.tryEnter() else {
+            return
+        }
+
+        defer {
+            gate.leave()
+        }
+
+        onCopyStarted()
+        releaseCopy.wait()
+
+        handleCopiedBuffer(
+            nil,
+            copyFailureCounter: copyFailureCounter,
+            onBuffer: onBuffer
+        )
     }
 
     func simulateAsyncFailure(_ error: Error) {

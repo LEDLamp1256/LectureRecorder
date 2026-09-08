@@ -9,6 +9,7 @@
 import AVFoundation
 import Foundation
 import OSLog
+import Synchronization
 
 nonisolated enum AudioCaptureServiceError: LocalizedError, Sendable {
     case prepareCalledFromInvalidState
@@ -54,7 +55,7 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
         case idle
         case prepared(engine: AVAudioEngine, format: AVAudioFormat)
         case running(RunningResources)
-        case stopping
+        case stopping(Task<CaptureStopOutcome, Never>)
     }
 
     private nonisolated final class RunningResources {
@@ -62,25 +63,29 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
         let gate: InFlightCallbackGate
         let format: AVAudioFormat
         let coordinator: FailureCoordinator
+        let copyFailureCounter: CopyFailureCounter
         var configObserver: NSObjectProtocol?
 
         init(
             engine: AVAudioEngine,
             gate: InFlightCallbackGate,
             format: AVAudioFormat,
-            coordinator: FailureCoordinator
+            coordinator: FailureCoordinator,
+            copyFailureCounter: CopyFailureCounter
         ) {
             self.engine = engine
             self.gate = gate
             self.format = format
             self.coordinator = coordinator
+            self.copyFailureCounter = copyFailureCounter
         }
     }
 
     private var cycleState: CycleState = .idle
-    private var inProgressStopTask: Task<Void, Never>?
-    private var inProgressStopOutcome: Error?
-    private var lastCompletedOutcome: Error?
+    private var lastCompletedOutcome = CaptureStopOutcome(
+        failure: nil,
+        observedCopyFailureCount: 0
+    )
 
     init() {}
 
@@ -101,7 +106,10 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                 engine: engine,
                 format: format
             )
-            lastCompletedOutcome = nil
+            lastCompletedOutcome = CaptureStopOutcome(
+                failure: nil,
+                observedCopyFailureCount: 0
+            )
 
             Log.audio.info(
                 "AudioCaptureService prepared: \(format.sampleRate, privacy: .public)Hz \(format.channelCount, privacy: .public)ch"
@@ -135,15 +143,20 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
             gate.open()
 
             let coordinator = FailureCoordinator()
+            let copyFailureCounter = CopyFailureCounter()
             let resources = RunningResources(
                 engine: engine,
                 gate: gate,
                 format: preparedFormat,
-                coordinator: coordinator
+                coordinator: coordinator,
+                copyFailureCounter: copyFailureCounter
             )
 
             // Realtime path: admission -> copy -> handoff -> leave.
             // No logging, I/O, await, MainActor hop, or blocking primitive.
+            // deepCopy() is called exactly once; its optional result is
+            // handed to handleCopiedBuffer, which only ever performs an
+            // atomic increment (on failure) or the buffer handoff.
             engine.inputNode.installTap(
                 onBus: 0,
                 bufferSize: 4096,
@@ -157,11 +170,11 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
                     gate.leave()
                 }
 
-                guard let copy = buffer.deepCopy() else {
-                    return
-                }
-
-                onBuffer(copy)
+                handleCopiedBuffer(
+                    buffer.deepCopy(),
+                    copyFailureCounter: copyFailureCounter,
+                    onBuffer: onBuffer
+                )
             }
 
             resources.configObserver = NotificationCenter.default.addObserver(
@@ -197,76 +210,85 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
     }
 
     @discardableResult
-    func stop() async -> Error? {
-        let taskToAwait: Task<Void, Never>?
-        let outcome: Error?
+    func stop() async -> CaptureStopOutcome {
+        enum Action {
+            case returnImmediately(CaptureStopOutcome)
+            case awaitTask(Task<CaptureStopOutcome, Never>)
+        }
 
-        (taskToAwait, outcome) = controlQueue.sync {
+        let action: Action = controlQueue.sync {
             switch cycleState {
             case .idle:
-                return (nil, lastCompletedOutcome)
+                return .returnImmediately(lastCompletedOutcome)
 
-            case .stopping:
-                return (inProgressStopTask, inProgressStopOutcome)
+            case .stopping(let task):
+                return .awaitTask(task)
 
             case .prepared(let engine, _):
                 engine.stop()
                 cycleState = .idle
-                return (nil, lastCompletedOutcome)
+                return .returnImmediately(lastCompletedOutcome)
 
             case .running(let resources):
-                cycleState = .stopping
-
                 if let token = resources.configObserver {
                     NotificationCenter.default.removeObserver(token)
                 }
 
                 // Close failure admission before tearing anything else
-                // down, so the returned outcome for this cycle is fixed
+                // down, so the retained failure for this cycle is fixed
                 // the moment it's known — any failure reported after
-                // this point is rejected by the coordinator.
-                let closedOutcome = resources.coordinator.closeAdmission()
+                // this point is rejected by the coordinator. The
+                // copy-failure count is sampled later, after drainage —
+                // see below.
+                let closedFailure = resources.coordinator.closeAdmission()
                 resources.gate.close()
                 resources.engine.inputNode.removeTap(onBus: 0)
                 resources.engine.stop()
 
-                inProgressStopOutcome = closedOutcome
-
                 let gate = resources.gate
                 let coordinator = resources.coordinator
+                let copyFailureCounter = resources.copyFailureCounter
 
-                // weak self is safe here: closedOutcome is already
-                // captured locally and returned to this stop() call
+                // weak self is safe here: the eventual outcome is
+                // returned to every caller via the task's own result
                 // regardless of whether self survives to run the
                 // continuation below. If self is gone, no one can
                 // observe cycleState again anyway.
-                let task = Task { [weak self] in
+                let task = Task<CaptureStopOutcome, Never> { [weak self] in
                     async let bufferDrain: Void = gate.drain()
                     async let deliveryDrain: Void = coordinator.drainDelivery()
                     _ = await (bufferDrain, deliveryDrain)
 
+                    let outcome = CaptureStopOutcome(
+                        failure: closedFailure,
+                        observedCopyFailureCount: copyFailureCounter.load()
+                    )
+
                     guard let self else {
-                        return
+                        return outcome
                     }
 
                     self.controlQueue.sync {
                         if case .stopping = self.cycleState {
                             self.cycleState = .idle
-                            self.lastCompletedOutcome = closedOutcome
+                            self.lastCompletedOutcome = outcome
                         }
-
-                        self.inProgressStopTask = nil
-                        self.inProgressStopOutcome = nil
                     }
+
+                    return outcome
                 }
 
-                inProgressStopTask = task
-                return (task, closedOutcome)
+                cycleState = .stopping(task)
+                return .awaitTask(task)
             }
         }
 
-        await taskToAwait?.value
-        return outcome
+        switch action {
+        case .returnImmediately(let outcome):
+            return outcome
+        case .awaitTask(let task):
+            return await task.value
+        }
     }
 
     private static func negotiateAndValidateFormat(
@@ -527,6 +549,39 @@ nonisolated final class FailureCoordinator: @unchecked Sendable {
             handler(error)
         }
     }
+}
+
+/// Lock-free per-cycle counter of observed buffer-copy failures. Holds
+/// no reference to RunningResources or the engine, so capturing it in
+/// the tap closure cannot create a retain cycle.
+nonisolated final class CopyFailureCounter: Sendable {
+    private let count = Atomic<Int>(0)
+
+    func recordFailure() {
+        count.wrappingAdd(1, ordering: .sequentiallyConsistent)
+    }
+
+    func load() -> Int {
+        count.load(ordering: .sequentiallyConsistent)
+    }
+}
+
+/// Shared by the production tap and the mock's buffer-injection paths,
+/// so a forced failure in tests exercises identical accounting to a
+/// real deepCopy() failure. Performs only an atomic increment or the
+/// buffer handoff — no logging, I/O, awaits, or blocking primitives —
+/// so it is safe to call from the realtime tap.
+@inline(__always)
+nonisolated func handleCopiedBuffer(
+    _ copiedBuffer: AVAudioPCMBuffer?,
+    copyFailureCounter: CopyFailureCounter,
+    onBuffer: (AVAudioPCMBuffer) -> Void
+) {
+    guard let copiedBuffer else {
+        copyFailureCounter.recordFailure()
+        return
+    }
+    onBuffer(copiedBuffer)
 }
 
 nonisolated extension AVAudioPCMBuffer {

@@ -237,7 +237,7 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             timeout: 1.0
         )
 
-        let stopTask = Task<Error?, Never> {
+        let stopTask = Task<CaptureStopOutcome, Never> {
             let outcome = await mock.stop()
             stopReturnedPrematurely.fulfill()
             return outcome
@@ -297,7 +297,7 @@ final class MockAudioCaptureServiceTests: XCTestCase {
 
         await fulfillment(of: [handlerStarted], timeout: 1.0)
 
-        let stopTask = Task<Error?, Never> {
+        let stopTask = Task<CaptureStopOutcome, Never> {
             let outcome = await mock.stop()
             stopReturnedPrematurely.fulfill()
             return outcome
@@ -330,7 +330,8 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let outcome = await stopTask.value
         eventLog.mutate { $0.append("stopReturned") }
 
-        XCTAssertEqual(outcome as? TestError, .tagged(42))
+        XCTAssertEqual(outcome.failure as? TestError, .tagged(42))
+        XCTAssertEqual(outcome.observedCopyFailureCount, 0)
         XCTAssertEqual(
             eventLog.get(),
             ["handlerStarted", "handlerFinished", "stopReturned"],
@@ -354,8 +355,13 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let newOutcome = await mock.stop()
 
         XCTAssertNil(
-            newOutcome,
+            newOutcome.failure,
             "a fresh cycle must not inherit the previous cycle's retained failure"
+        )
+        XCTAssertEqual(
+            newOutcome.observedCopyFailureCount,
+            0,
+            "a fresh cycle must not inherit the previous cycle's copy-failure count"
         )
         XCTAssertTrue(
             newCycleFailures.get().isEmpty,
@@ -399,8 +405,8 @@ final class MockAudioCaptureServiceTests: XCTestCase {
 
         await fulfillment(of: [handlerStarted], timeout: 1.0)
 
-        let outcome1Box = TestBox<Error?>(nil)
-        let outcome2Box = TestBox<Error?>(nil)
+        let outcome1Box = TestBox<CaptureStopOutcome?>(nil)
+        let outcome2Box = TestBox<CaptureStopOutcome?>(nil)
 
         let firstTask = Task {
             outcome1Box.set(await mock.stop())
@@ -423,8 +429,10 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         await secondTask.value
         eventLog.mutate { $0.append("stopReturned") }
 
-        XCTAssertEqual(outcome1Box.get() as? TestError, .tagged(7))
-        XCTAssertEqual(outcome2Box.get() as? TestError, .tagged(7))
+        XCTAssertEqual(outcome1Box.get()?.failure as? TestError, .tagged(7))
+        XCTAssertEqual(outcome1Box.get()?.observedCopyFailureCount, 0)
+        XCTAssertEqual(outcome2Box.get()?.failure as? TestError, .tagged(7))
+        XCTAssertEqual(outcome2Box.get()?.observedCopyFailureCount, 0)
         XCTAssertEqual(
             eventLog.get(),
             ["handlerStarted", "handlerFinished", "stopReturned"],
@@ -456,13 +464,25 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             onFailure: { _ in }
         )
 
+        // Inject the forced copy failure before reporting the async
+        // failure: reportFailure's first-acceptance side effect closes
+        // the gate, so admission must happen while it's still open.
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
         mock.simulateAsyncFailure(TestError.tagged(9))
 
         let firstOutcome = await mock.stop()
         let secondOutcome = await mock.stop()
 
-        XCTAssertEqual(firstOutcome as? TestError, .tagged(9))
-        XCTAssertEqual(secondOutcome as? TestError, .tagged(9))
+        XCTAssertEqual(firstOutcome.failure as? TestError, .tagged(9))
+        XCTAssertEqual(firstOutcome.observedCopyFailureCount, 1)
+        XCTAssertEqual(secondOutcome.failure as? TestError, .tagged(9))
+        XCTAssertEqual(
+            secondOutcome.observedCopyFailureCount,
+            1,
+            "a repeated idle stop() must retain the completed cycle's copy-failure count"
+        )
     }
 
     func testConcurrentStopCallersJoinSameDrainAndReceiveSameOutcome() async throws {
@@ -513,13 +533,20 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             timeout: 1.0
         )
 
+        // A separate, non-blocking forced copy failure, admitted while
+        // the gate is still open, so both concurrent callers must
+        // observe the same nonzero count in addition to the same error.
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+
         // Report the failure only once the buffer is already admitted and
         // blocked, so injection isn't rejected by the resulting gate
         // closure.
         mock.simulateAsyncFailure(TestError.tagged(8))
 
-        let outcome1Box = TestBox<Error?>(nil)
-        let outcome2Box = TestBox<Error?>(nil)
+        let outcome1Box = TestBox<CaptureStopOutcome?>(nil)
+        let outcome2Box = TestBox<CaptureStopOutcome?>(nil)
 
         let firstTask = Task {
             outcome1Box.set(await mock.stop())
@@ -542,8 +569,14 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         await secondTask.value
         eventLog.mutate { $0.append("stopReturned") }
 
-        XCTAssertEqual(outcome1Box.get() as? TestError, .tagged(8))
-        XCTAssertEqual(outcome2Box.get() as? TestError, .tagged(8))
+        XCTAssertEqual(outcome1Box.get()?.failure as? TestError, .tagged(8))
+        XCTAssertEqual(outcome1Box.get()?.observedCopyFailureCount, 1)
+        XCTAssertEqual(outcome2Box.get()?.failure as? TestError, .tagged(8))
+        XCTAssertEqual(
+            outcome2Box.get()?.observedCopyFailureCount,
+            1,
+            "concurrent stop() callers must receive equivalent failure and copy-failure-count results"
+        )
         XCTAssertEqual(
             eventLog.get(),
             ["callbackStarted", "callbackFinished", "stopReturned"],
@@ -561,17 +594,26 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             onFailure: { _ in }
         )
 
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
         mock.simulateAsyncFailure(TestError.tagged(10))
 
         let firstOutcome = await mock.stop()
-        XCTAssertEqual(firstOutcome as? TestError, .tagged(10))
+        XCTAssertEqual(firstOutcome.failure as? TestError, .tagged(10))
+        XCTAssertEqual(firstOutcome.observedCopyFailureCount, 1)
 
         _ = try mock.prepare()
 
         let secondOutcome = await mock.stop()
         XCTAssertNil(
-            secondOutcome,
+            secondOutcome.failure,
             "a successful prepare() must reset the previous cycle's outcome"
+        )
+        XCTAssertEqual(
+            secondOutcome.observedCopyFailureCount,
+            0,
+            "a successful prepare() must reset the previous cycle's copy-failure count"
         )
     }
 
@@ -585,6 +627,9 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             onFailure: { _ in }
         )
 
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
         mock.simulateAsyncFailure(TestError.tagged(11))
 
         XCTAssertThrowsError(
@@ -600,9 +645,14 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let outcome = await mock.stop()
 
         XCTAssertEqual(
-            outcome as? TestError,
+            outcome.failure as? TestError,
             .tagged(11),
             "a failed prepare() attempt must not disturb the active cycle's retained outcome"
+        )
+        XCTAssertEqual(
+            outcome.observedCopyFailureCount,
+            1,
+            "a failed prepare() attempt must not disturb the active cycle's retained copy-failure count"
         )
     }
 
@@ -778,9 +828,10 @@ final class MockAudioCaptureServiceTests: XCTestCase {
 
         let outcome = await mock.stop()
         XCTAssertNil(
-            outcome,
+            outcome.failure,
             "an uncommitted attempt with no failure ever reported has no retained asynchronous outcome"
         )
+        XCTAssertEqual(outcome.observedCopyFailureCount, 0)
 
         await fulfillment(
             of: [onFailureCalled],
@@ -838,10 +889,11 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let outcome = await mock.stop()
 
         XCTAssertEqual(
-            outcome as? TestError,
+            outcome.failure as? TestError,
             .tagged(13),
             "stop() must return whatever failure was actually admitted for the cycle, even though no handler was ever committed to receive it"
         )
+        XCTAssertEqual(outcome.observedCopyFailureCount, 0)
 
         await fulfillment(
             of: [onFailureCalled],
@@ -923,6 +975,279 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         )
 
         await mock.stop()
+    }
+
+    // MARK: - CaptureStopOutcome
+
+    func testInitialIdleStopReturnsCleanOutcome() async {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+
+        let outcome = await mock.stop()
+
+        XCTAssertNil(outcome.failure)
+        XCTAssertEqual(outcome.observedCopyFailureCount, 0)
+    }
+
+    func testPreparedButNeverStartedStopReturnsCleanOutcome() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let outcome = await mock.stop()
+
+        XCTAssertNil(outcome.failure)
+        XCTAssertEqual(outcome.observedCopyFailureCount, 0)
+    }
+
+    func testForcedCopyFailureRecordsDropAndDoesNotHandOffBuffer() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let delivered = TestBox<Bool>(false)
+
+        try mock.start(
+            onBuffer: { _ in
+                delivered.set(true)
+            },
+            onFailure: { _ in }
+        )
+
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+
+        let outcome = await mock.stop()
+
+        XCTAssertFalse(
+            delivered.get(),
+            "a forced copy failure must never hand a buffer to onBuffer"
+        )
+        XCTAssertEqual(outcome.observedCopyFailureCount, 1)
+    }
+
+    func testAdmittedCopyFailureAfterStopBeginsIsWaitedForAndIncluded() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let copyStarted = XCTestExpectation(description: "copy started")
+        let stopEnteredDraining = XCTestExpectation(
+            description: "stop entered draining"
+        )
+        let stopReturnedPrematurely = XCTestExpectation(
+            description: "stop returned prematurely"
+        )
+        stopReturnedPrematurely.isInverted = true
+        let releaseCopy = DispatchSemaphore(value: 0)
+        let eventLog = TestBox<[String]>([])
+
+        defer { releaseCopy.signal() }
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+
+        mock.setDidEnterStoppingHookForTesting {
+            stopEnteredDraining.fulfill()
+        }
+
+        let box = UnsafeSendableBox(
+            value: makeSilentBuffer(frameCount: 4, format: format)
+        )
+
+        // The admission (tryEnter) happens on this detached thread before
+        // stop() is ever called below — the callback is already admitted
+        // by the time stop() begins closing the gate. It only *records*
+        // its failure after being released, which happens after stop()
+        // has already entered its draining path.
+        Thread.detachNewThread {
+            mock.injectBufferForcingCopyFailureBlockingUntilReleased(
+                box.value,
+                onCopyStarted: {
+                    eventLog.mutate { $0.append("copyStarted") }
+                    copyStarted.fulfill()
+                },
+                releaseCopy: releaseCopy
+            )
+        }
+
+        await fulfillment(of: [copyStarted], timeout: 1.0)
+
+        let stopTask = Task<CaptureStopOutcome, Never> {
+            let outcome = await mock.stop()
+            stopReturnedPrematurely.fulfill()
+            return outcome
+        }
+
+        // Deterministic: wait for stop() to have actually transitioned
+        // into its draining path — not a fixed delay — before relying on
+        // (and checking) non-completion.
+        await fulfillment(of: [stopEnteredDraining], timeout: 1.0)
+        await fulfillment(of: [stopReturnedPrematurely], timeout: 0.3)
+
+        releaseCopy.signal()
+
+        let outcome = await stopTask.value
+        eventLog.mutate { $0.append("stopReturned") }
+
+        XCTAssertEqual(
+            outcome.observedCopyFailureCount,
+            1,
+            "stop() must wait for an admitted-but-still-copying callback and include its recorded failure"
+        )
+        XCTAssertEqual(
+            eventLog.get(),
+            ["copyStarted", "stopReturned"],
+            "stop() must not return before the admitted copy failure resolves"
+        )
+    }
+
+    func testRetainedFailureAndObservedCopyFailureCountCoexist() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.simulateAsyncFailure(TestError.tagged(14))
+
+        let outcome = await mock.stop()
+
+        XCTAssertEqual(outcome.failure as? TestError, .tagged(14))
+        XCTAssertEqual(outcome.observedCopyFailureCount, 2)
+    }
+
+    func testOldStopCallerReceivesOwnCycleResultEvenAfterNewCycleBeginsAndCompletes() async throws {
+        let format = makeMonoFormat()
+        let mock = MockAudioCaptureService(formatToPrepare: format)
+        _ = try mock.prepare()
+
+        let handlerStarted = XCTestExpectation(description: "onFailure started")
+        let stopEnteredDraining = XCTestExpectation(
+            description: "stop entered draining"
+        )
+        let reachedPostResolutionHook = XCTestExpectation(
+            description: "old caller reached post-resolution hook"
+        )
+        let releaseHandler = DispatchSemaphore(value: 0)
+        let releasePostResolutionHook = DispatchSemaphore(value: 0)
+
+        // Ensure both holds are always released, even if an assertion
+        // above fails and unwinds the test early.
+        defer {
+            releaseHandler.signal()
+            releasePostResolutionHook.signal()
+        }
+
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in
+                handlerStarted.fulfill()
+                releaseHandler.wait()
+            }
+        )
+
+        mock.setDidEnterStoppingHookForTesting {
+            stopEnteredDraining.fulfill()
+        }
+
+        // Cycle A gets a distinctive failure AND a distinctive
+        // copy-failure count, injected before the async failure closes
+        // the gate, so the eventual assertion can't pass by coincidence
+        // against cycle B's (different) values.
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.simulateAsyncFailure(TestError.tagged(100))
+
+        await fulfillment(of: [handlerStarted], timeout: 1.0)
+
+        // Set the post-resolution hook before starting the old caller,
+        // so the old caller is guaranteed to reach it once its shared
+        // task resolves — this deterministically pauses that specific
+        // caller after cycleState/lastCompletedOutcome are already
+        // published, but strictly before it returns its outcome.
+        mock.setPostResolutionHookForTesting {
+            reachedPostResolutionHook.fulfill()
+            releasePostResolutionHook.wait()
+        }
+
+        // Old caller: its stop() call is the one that transitions cycle
+        // A from .running to .stopping and owns the shared drain task.
+        // It is deliberately never awaited to completion until the very
+        // end of this test — well after cycle B has begun and finished.
+        let oldCallerTask = Task<CaptureStopOutcome, Never> {
+            await mock.stop()
+        }
+
+        await fulfillment(of: [stopEnteredDraining], timeout: 1.0)
+
+        // Release cycle A's handler so its shared task can resolve and
+        // publish cycleState = .idle / lastCompletedOutcome.
+        releaseHandler.signal()
+
+        // The old caller's `await task.value` has now returned (task
+        // resolved, idle state already published) and it has reached
+        // the new post-resolution hook, where it is deterministically
+        // blocked — not yet having returned its CaptureStopOutcome.
+        await fulfillment(of: [reachedPostResolutionHook], timeout: 1.0)
+
+        // Confirm cycle A has already published idle state: a fresh,
+        // independent stop() call — distinct from the still-blocked old
+        // caller — observes .idle directly and returns the retained
+        // outcome immediately, without needing to await any task.
+        let settledOutcome = await mock.stop()
+        XCTAssertEqual(settledOutcome.failure as? TestError, .tagged(100))
+        XCTAssertEqual(settledOutcome.observedCopyFailureCount, 1)
+
+        // Cycle B: a full, independent cycle with a different failure
+        // AND a different copy-failure count, begun and completed
+        // entirely while the old caller remains blocked inside the
+        // post-resolution hook.
+        _ = try mock.prepare()
+        try mock.start(
+            onBuffer: { _ in },
+            onFailure: { _ in }
+        )
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.simulateAsyncFailure(TestError.tagged(200))
+        let cycleBOutcome = await mock.stop()
+        XCTAssertEqual(cycleBOutcome.failure as? TestError, .tagged(200))
+        XCTAssertEqual(cycleBOutcome.observedCopyFailureCount, 2)
+
+        // Release the old caller only now — strictly after cycle B has
+        // begun and fully completed.
+        releasePostResolutionHook.signal()
+
+        let oldOutcome = await oldCallerTask.value
+
+        XCTAssertEqual(
+            oldOutcome.failure as? TestError,
+            .tagged(100),
+            "an old stop() caller must receive its own cycle's failure, not a later cycle's"
+        )
+        XCTAssertEqual(
+            oldOutcome.observedCopyFailureCount,
+            1,
+            "an old stop() caller must receive its own cycle's copy-failure count, not a later cycle's"
+        )
     }
 }
 
