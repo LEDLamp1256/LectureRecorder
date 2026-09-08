@@ -36,3 +36,7 @@ Secrets.xcconfig
 LocalSecrets.xcconfig
 secrets.json
 secrets.plist
+
+# Claude Code local/personal files (not for commit)
+CLAUDE.local.md
+.claude/settings.local.json
