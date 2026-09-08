@@ -88,4 +88,49 @@ final class AtomicFileWriterTests: XCTestCase {
         let remaining = try FileManager.default.contentsOfDirectory(atPath: restrictedDirectory.path)
         XCTAssertTrue(remaining.isEmpty, "No temporary or destination file should remain after a failed write")
     }
+
+    private struct DatedFixture: Decodable {
+        let timestamp: Date
+    }
+
+    func testDefaultDecoderDecodesFractionalSecondTimestamp() throws {
+        let json = #"{"timestamp":"2026-01-15T10:30:00.500Z"}"#
+        let data = Data(json.utf8)
+
+        let decoded = try AtomicFileWriter.defaultDecoder.decode(DatedFixture.self, from: data)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let components = DateComponents(year: 2026, month: 1, day: 15, hour: 10, minute: 30, second: 0)
+        let wholeSecond = try XCTUnwrap(calendar.date(from: components))
+        let expected = wholeSecond.addingTimeInterval(0.5)
+
+        XCTAssertEqual(decoded.timestamp.timeIntervalSince1970, expected.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func testDefaultDecoderDecodesWholeSecondTimestamp() throws {
+        let json = #"{"timestamp":"2026-01-15T10:30:00Z"}"#
+        let data = Data(json.utf8)
+
+        let decoded = try AtomicFileWriter.defaultDecoder.decode(DatedFixture.self, from: data)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let components = DateComponents(year: 2026, month: 1, day: 15, hour: 10, minute: 30, second: 0)
+        let expected = try XCTUnwrap(calendar.date(from: components))
+
+        XCTAssertEqual(decoded.timestamp.timeIntervalSince1970, expected.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func testDefaultDecoderRejectsMalformedTimestampAsDataCorrupted() throws {
+        let json = #"{"timestamp":"not-a-date"}"#
+        let data = Data(json.utf8)
+
+        XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(DatedFixture.self, from: data)) { error in
+            guard case DecodingError.dataCorrupted = error else {
+                XCTFail("Expected DecodingError.dataCorrupted, got \(error)")
+                return
+            }
+        }
+    }
 }
