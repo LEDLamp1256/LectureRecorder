@@ -10,8 +10,12 @@
 /// `stop()`'s teardown. `observedCopyFailureCount` is the number of
 /// buffer copies this mechanism observed failing during the cycle,
 /// sampled only after every admitted buffer callback has finished
-/// draining — including ones that begin after `stop()` starts closing
-/// the cycle. It is not proof that the hardware or downstream pipeline
+/// draining. A callback already admitted before `stop()` closes the
+/// gate may still be in flight when `stop()` begins; its copy failure,
+/// if any, is recorded — and counted here — only once that callback
+/// actually finishes, which can happen after `stop()` has already begun
+/// draining. No callback can be newly admitted once the gate is closed.
+/// This count is not proof that the hardware or downstream pipeline
 /// lost no audio; it reflects only what this accounting observed.
 struct CaptureStopOutcome: Sendable {
     let failure: Error?

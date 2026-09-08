@@ -63,6 +63,7 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     // mock, and never influence production control flow.
     private var didEnterStoppingHook: (@Sendable () -> Void)?
     private var didJoinInProgressStopHook: (@Sendable () -> Void)?
+    private var postResolutionHook: (@Sendable () -> Void)?
 
     init(formatToPrepare: AVAudioFormat) {
         self.formatToPrepare = formatToPrepare
@@ -97,6 +98,36 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     ) {
         controlQueue.sync {
             didJoinInProgressStopHook = hook
+        }
+    }
+
+    /// Test-only seam: fires at most once, for whichever `stop()` caller
+    /// first reaches the point after its shared drain `Task` has already
+    /// resolved — cycleState/lastCompletedOutcome already published —
+    /// but before that caller returns its `CaptureStopOutcome`. One-shot:
+    /// consumed (read-and-cleared) atomically so it cannot also fire for
+    /// a later, unrelated `stop()` call. Lets a test hold one specific
+    /// caller at exactly that point to prove it still returns its own
+    /// cycle's result even after a later cycle begins and completes
+    /// while it's held.
+    func setPostResolutionHookForTesting(
+        _ hook: @escaping @Sendable () -> Void
+    ) {
+        controlQueue.sync {
+            postResolutionHook = hook
+        }
+    }
+
+    /// Atomically takes and clears the post-resolution hook, if any is
+    /// currently set. Runs under controlQueue only to read/clear the
+    /// stored closure reference — never to invoke it; the returned
+    /// closure must be called by the caller only after leaving
+    /// controlQueue's synchronization.
+    private func consumePostResolutionHookForTesting() -> (@Sendable () -> Void)? {
+        controlQueue.sync {
+            let hook = postResolutionHook
+            postResolutionHook = nil
+            return hook
         }
     }
 
@@ -216,7 +247,15 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         case .returnImmediately(let outcome):
             return outcome
         case .awaitTask(let task):
-            return await task.value
+            let outcome = await task.value
+
+            // Test-only, DEBUG-only: fires at most once, only for a
+            // caller that actually awaited the shared task above — never
+            // for a caller that took the .returnImmediately branch — and
+            // never while holding controlQueue.
+            consumePostResolutionHookForTesting()?()
+
+            return outcome
         }
     }
 

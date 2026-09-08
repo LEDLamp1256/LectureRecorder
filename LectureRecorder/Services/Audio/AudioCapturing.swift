@@ -44,10 +44,14 @@ nonisolated protocol AudioCapturing: Sendable {
     /// failure is frozen the moment failure admission closes, before
     /// teardown begins; the copy-failure count is sampled only after
     /// both admitted buffer callbacks and any claimed failure-handler
-    /// delivery have finished draining, so a copy that fails after
-    /// `stop()` begins is still counted. The count reflects only what
-    /// this mechanism observed — it is not proof that the hardware or
-    /// downstream pipeline lost no audio.
+    /// delivery have finished draining. A callback already admitted
+    /// before admission closes may still be in flight when `stop()`
+    /// begins; its copy failure, if any, is recorded — and counted here
+    /// — only once that callback actually finishes, which can happen
+    /// after `stop()` has already begun draining. No callback can be
+    /// newly admitted once admission is closed. The count reflects only
+    /// what this mechanism observed — it is not proof that the hardware
+    /// or downstream pipeline lost no audio.
     ///
     /// A cycle "completes" the first time `stop()` finishes draining it;
     /// later `stop()` calls made while idle return that same retained

@@ -1138,9 +1138,18 @@ final class MockAudioCaptureServiceTests: XCTestCase {
         let stopEnteredDraining = XCTestExpectation(
             description: "stop entered draining"
         )
+        let reachedPostResolutionHook = XCTestExpectation(
+            description: "old caller reached post-resolution hook"
+        )
         let releaseHandler = DispatchSemaphore(value: 0)
+        let releasePostResolutionHook = DispatchSemaphore(value: 0)
 
-        defer { releaseHandler.signal() }
+        // Ensure both holds are always released, even if an assertion
+        // above fails and unwinds the test early.
+        defer {
+            releaseHandler.signal()
+            releasePostResolutionHook.signal()
+        }
 
         try mock.start(
             onBuffer: { _ in },
@@ -1154,47 +1163,90 @@ final class MockAudioCaptureServiceTests: XCTestCase {
             stopEnteredDraining.fulfill()
         }
 
+        // Cycle A gets a distinctive failure AND a distinctive
+        // copy-failure count, injected before the async failure closes
+        // the gate, so the eventual assertion can't pass by coincidence
+        // against cycle B's (different) values.
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
         mock.simulateAsyncFailure(TestError.tagged(100))
 
         await fulfillment(of: [handlerStarted], timeout: 1.0)
 
-        // Old caller: joins cycle A's in-progress stop while its handler
-        // is still held, and is deliberately never awaited until the end
-        // of this test — well after cycle B has begun and completed.
+        // Set the post-resolution hook before starting the old caller,
+        // so the old caller is guaranteed to reach it once its shared
+        // task resolves — this deterministically pauses that specific
+        // caller after cycleState/lastCompletedOutcome are already
+        // published, but strictly before it returns its outcome.
+        mock.setPostResolutionHookForTesting {
+            reachedPostResolutionHook.fulfill()
+            releasePostResolutionHook.wait()
+        }
+
+        // Old caller: its stop() call is the one that transitions cycle
+        // A from .running to .stopping and owns the shared drain task.
+        // It is deliberately never awaited to completion until the very
+        // end of this test — well after cycle B has begun and finished.
         let oldCallerTask = Task<CaptureStopOutcome, Never> {
             await mock.stop()
         }
 
         await fulfillment(of: [stopEnteredDraining], timeout: 1.0)
 
+        // Release cycle A's handler so its shared task can resolve and
+        // publish cycleState = .idle / lastCompletedOutcome.
         releaseHandler.signal()
 
-        // Settle cycle A to idle deterministically via a throwaway
-        // stop() call — this does not consume oldCallerTask's result,
-        // since every caller of a shared in-progress stop receives that
-        // task's own value, not a value re-derived from service state.
+        // The old caller's `await task.value` has now returned (task
+        // resolved, idle state already published) and it has reached
+        // the new post-resolution hook, where it is deterministically
+        // blocked — not yet having returned its CaptureStopOutcome.
+        await fulfillment(of: [reachedPostResolutionHook], timeout: 1.0)
+
+        // Confirm cycle A has already published idle state: a fresh,
+        // independent stop() call — distinct from the still-blocked old
+        // caller — observes .idle directly and returns the retained
+        // outcome immediately, without needing to await any task.
         let settledOutcome = await mock.stop()
         XCTAssertEqual(settledOutcome.failure as? TestError, .tagged(100))
+        XCTAssertEqual(settledOutcome.observedCopyFailureCount, 1)
 
-        // Cycle B: a full, independent cycle with a different outcome,
-        // begun and completed entirely after cycle A settled.
+        // Cycle B: a full, independent cycle with a different failure
+        // AND a different copy-failure count, begun and completed
+        // entirely while the old caller remains blocked inside the
+        // post-resolution hook.
         _ = try mock.prepare()
         try mock.start(
             onBuffer: { _ in },
             onFailure: { _ in }
         )
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
+        mock.injectBufferForcingCopyFailure(
+            makeSilentBuffer(frameCount: 4, format: format)
+        )
         mock.simulateAsyncFailure(TestError.tagged(200))
         let cycleBOutcome = await mock.stop()
         XCTAssertEqual(cycleBOutcome.failure as? TestError, .tagged(200))
+        XCTAssertEqual(cycleBOutcome.observedCopyFailureCount, 2)
 
-        // The old caller, resumed only now, must still see cycle A's
-        // result — not cycle B's, and not a nil/reset value.
+        // Release the old caller only now — strictly after cycle B has
+        // begun and fully completed.
+        releasePostResolutionHook.signal()
+
         let oldOutcome = await oldCallerTask.value
 
         XCTAssertEqual(
             oldOutcome.failure as? TestError,
             .tagged(100),
-            "an old stop() caller must receive its own cycle's result, not a later cycle's"
+            "an old stop() caller must receive its own cycle's failure, not a later cycle's"
+        )
+        XCTAssertEqual(
+            oldOutcome.observedCopyFailureCount,
+            1,
+            "an old stop() caller must receive its own cycle's copy-failure count, not a later cycle's"
         )
     }
 }
