@@ -60,12 +60,14 @@ the Debug build via:
 and `open` the resulting `LectureRecorder.app`.
 
 ## Branch & Review Workflow
-- `dev` is the active development branch; `main` reflects the last
-  reviewed/stable state.
-- Claude works on `dev` (or a feature branch off `dev` when asked) and
-  does not merge into `main` or push directly to `main`.
-- Changes are subject to review (by the user, relaying ChatGPT's
-  architectural review) before merging to `main`.
+- `dev` is the integration branch; `main` reflects the last reviewed/stable
+  state.
+- Implementation normally occurs on a `claude/<task-name>` feature branch
+  created from the agreed `dev` baseline; amendments continue on that same
+  existing task branch.
+- Direct implementation on `dev` requires explicit authorization.
+- Merging into `dev` or `main` requires Dylan's explicit authorization,
+  informed by ChatGPT's architecture/code review.
 
 ## Prohibited Changes
 - Any transcription/Whisper work not explicitly requested in the current task.
@@ -77,8 +79,9 @@ and `open` the resulting `LectureRecorder.app`.
 
 ## Definition of Done
 - Debug build succeeds.
-- Full unit test suite passes (currently 73/73); new/changed behavior has
-  matching tests.
+- The full unit test suite command completes successfully (no stored test
+  count — verify the current run, not a remembered number); new/changed
+  behavior has matching tests.
 - No invariant above is violated.
 - Implementation matches the accepted plan; any necessary deviation was
   surfaced and approved, not made silently.
@@ -91,3 +94,19 @@ At the end of implementation work, report:
    a check passed that wasn't actually run.
 4. Files changed.
 5. Open questions or follow-ups for ChatGPT/architecture review.
+
+## Architecture Boundaries
+- `AudioCaptureService` (and the `AudioCapturing` protocol it implements)
+  owns capture preparation, starting, callback admission, asynchronous-
+  failure retention, and Stop draining.
+- `SessionManager` owns the higher-level session lifecycle: integrating
+  capture with chunk-writer output, session manifests, and terminal
+  session state.
+
+## Source Files — Phase 2 Audio Capture Layer
+- `AudioCapturing.swift` — protocol defining the idle → prepare() → prepared → start() → running → stop() → idle lifecycle contract
+- `AudioCaptureService.swift` — real AVAudioEngine-backed implementation; validates hardware format has no implicit sample-rate/channel conversion before accepting it; `FailureCoordinator` resolves the race between `start()` committing and an async failure landing before/after that commit, tracks the claimed `onFailure` delivery on its own dedicated queue via a `DispatchGroup`, and `stop()` waits for both buffer-gate draining and that delivery to finish before returning
+- `MockAudioCaptureService.swift` — hardware-free test double (`#if DEBUG`), same lifecycle/protocol and `FailureCoordinator`-backed draining contract as the real service, with inject-buffer, simulate-failure, and (test-only) stop-transition observation hooks
+- `InFlightCallbackGate.swift` — lock-free, single-cycle admission gate (built on `Synchronization.Atomic`) that lets `stop()` wait until every already-admitted buffer callback has actually finished
+- `AudioChunkWriter.swift` — consumes buffers off its own serial queue, splits them at chunk boundaries, writes `.caf` files via a `.partial` → rename-on-finalize pattern so a crash mid-chunk leaves a recoverable partial file
+- `ChunkBoundaryPlanner.swift` — pure integer arithmetic for splitting a buffer across chunk boundaries, deliberately dependency-free so the boundary math (where off-by-one bugs would drop or duplicate audio) can be exhaustively unit tested
