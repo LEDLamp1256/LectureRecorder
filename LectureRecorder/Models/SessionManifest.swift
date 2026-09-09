@@ -15,7 +15,10 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
     /// manifest Phase 1 ever persisted has an empty `chunks` array (real
     /// chunk metadata didn't exist until Phase 2A), so there is no
     /// existing on-disk `ChunkMetadata` payload for the new required
-    /// field to break decoding on.
+    /// field to break decoding on. Adding
+    /// `observedCaptureCopyFailureCount` also did NOT require a bump:
+    /// it is optional, so a manifest written before this field existed
+    /// simply decodes it as `nil`.
     static let currentSchemaVersion = 1
 
     var schemaVersion: Int
@@ -32,6 +35,16 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
     /// `status == .failed`. Set by `SessionManager` when it persists a
     /// failure record so the reason is visible later without needing logs.
     var failureDescription: String?
+    /// Buffer copies observed failing during the most recently completed
+    /// capture cycle for this session (see `CaptureStopOutcome`). `nil`
+    /// means no capture cycle has yet produced this evidence for this
+    /// manifest (including every manifest written before this field
+    /// existed) — distinct from `0`, which means a cycle ran and observed
+    /// zero copy failures. Not present in any manifest written before
+    /// this field existed; decodes to `nil` for those. Not proof that no
+    /// other audio was lost — see `CaptureStopOutcome`'s own
+    /// documentation.
+    var observedCaptureCopyFailureCount: Int? = nil
 
     static func newSession(
         id: UUID,
@@ -49,7 +62,8 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
             chunks: [],
             endReason: nil,
             endedCleanly: false,
-            failureDescription: nil
+            failureDescription: nil,
+            observedCaptureCopyFailureCount: nil
         )
     }
 }
