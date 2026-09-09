@@ -67,6 +67,24 @@ final class AudioCaptureServiceTests: XCTestCase {
         XCTAssertEqual(secondOutcome.observedCopyFailureCount, 0)
     }
 
+    /// Both tests below construct a real `AudioCaptureService` and call
+    /// its real `prepare()` against whatever audio hardware and
+    /// microphone permission state actually exist on the machine running
+    /// the test — deliberately, since a hardware-free double cannot
+    /// reproduce an AVFoundation-internal assertion (see the doc comment
+    /// on `testPrepareSucceedsAgainstRealHardwareWithoutCrashing` below).
+    /// That makes both opt-in only: skipped by default so the rest of
+    /// the suite stays portable to CI/headless environments with no
+    /// input device or ungranted microphone permission, and runnable
+    /// on demand with `LECTURE_RECORDER_RUN_HARDWARE_TESTS=1`.
+    private func skipUnlessHardwareTestsEnabled() throws {
+        guard ProcessInfo.processInfo.environment["LECTURE_RECORDER_RUN_HARDWARE_TESTS"] == "1" else {
+            throw XCTSkip(
+                "Skipped by default: exercises a real AVAudioEngine against real audio hardware and requires microphone permission already granted to the test host. Set the environment variable LECTURE_RECORDER_RUN_HARDWARE_TESTS=1 to run it."
+            )
+        }
+    }
+
     /// Regression test for a real-hardware-only crash: no other test in
     /// this suite ever calls `prepare()` on a real `AudioCaptureService`
     /// against a real `AVAudioEngine` — every other test either exercises
@@ -82,6 +100,8 @@ final class AudioCaptureServiceTests: XCTestCase {
     /// accessed. This exercises the exact previously-crashing call
     /// sequence directly; a mock cannot substitute for it.
     func testPrepareSucceedsAgainstRealHardwareWithoutCrashing() async throws {
+        try skipUnlessHardwareTestsEnabled()
+
         let service = AudioCaptureService()
 
         let format = try service.prepare()
@@ -102,6 +122,8 @@ final class AudioCaptureServiceTests: XCTestCase {
     /// commit-only-on-full-success discipline without needing to force
     /// an actual hardware failure from a test.
     func testPrepareFailureLeavesCycleStateReusable() async throws {
+        try skipUnlessHardwareTestsEnabled()
+
         let service = AudioCaptureService()
 
         _ = try service.prepare()
