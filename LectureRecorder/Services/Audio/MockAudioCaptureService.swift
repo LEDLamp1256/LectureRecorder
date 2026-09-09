@@ -56,6 +56,8 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
 
     private let formatToPrepare: AVAudioFormat
     private var shouldFailNextStartStorage = false
+    private var shouldFailNextPrepareStorage = false
+    private var stopCallCountStorage = 0
 
     // Test-only observation seams (below), so tests can prove ordering
     // deterministically instead of relying on a fixed delay before
@@ -65,6 +67,24 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     private var didJoinInProgressStopHook: (@Sendable () -> Void)?
     private var postResolutionHook: (@Sendable () -> Void)?
 
+    /// Fired synchronously from `start()`, strictly after committing
+    /// `cycleState`/the failure coordinator and after leaving
+    /// `controlQueue`'s synchronization (never from inside it, since the
+    /// hook is free to call `injectBuffer`/`simulateAsyncFailure`, both of
+    /// which themselves take `controlQueue.sync` — re-entering that lock
+    /// from inside itself would deadlock). Lets a test invoke the
+    /// just-installed `onBuffer`/`onFailure` closures directly, before
+    /// `start()` returns to its caller, without relying on an uncontrolled
+    /// background dispatch that might only run after `start()` has already
+    /// returned. One-shot: consumed (read-and-cleared) atomically so it
+    /// cannot also fire for a later, unrelated `start()` call.
+    private var startCommitHookForTesting: (
+        @Sendable (
+            @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+            @escaping @Sendable (Error) -> Void
+        ) -> Void
+    )?
+
     init(formatToPrepare: AVAudioFormat) {
         self.formatToPrepare = formatToPrepare
     }
@@ -72,6 +92,49 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
     func setShouldFailNextStart(_ value: Bool) {
         controlQueue.sync {
             shouldFailNextStartStorage = value
+        }
+    }
+
+    /// Test-only seam: forces the next `prepare()` call to throw
+    /// `MockAudioCaptureServiceError.simulatedPrepareFailure` instead of
+    /// succeeding, without mutating `cycleState`. One-shot: cleared after
+    /// the forced failure fires once.
+    func setShouldFailNextPrepare(_ value: Bool) {
+        controlQueue.sync {
+            shouldFailNextPrepareStorage = value
+        }
+    }
+
+    /// Test-only seam: total number of times `stop()` has been called,
+    /// regardless of which `cycleState` branch it took. Lets a test prove
+    /// `SessionManager` calls `captureService.stop()` exactly once per
+    /// recording cycle, including on Start-failure cleanup paths.
+    var stopCallCountForTesting: Int {
+        controlQueue.sync { stopCallCountStorage }
+    }
+
+    /// See `startCommitHookForTesting`.
+    func setStartCommitHookForTesting(
+        _ hook: @escaping @Sendable (
+            @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+            @escaping @Sendable (Error) -> Void
+        ) -> Void
+    ) {
+        controlQueue.sync {
+            startCommitHookForTesting = hook
+        }
+    }
+
+    private func consumeStartCommitHookForTesting() -> (
+        @Sendable (
+            @escaping @Sendable (AVAudioPCMBuffer) -> Void,
+            @escaping @Sendable (Error) -> Void
+        ) -> Void
+    )? {
+        controlQueue.sync {
+            let hook = startCommitHookForTesting
+            startCommitHookForTesting = nil
+            return hook
         }
     }
 
@@ -137,6 +200,11 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
                 throw MockAudioCaptureServiceError.prepareCalledFromInvalidState
             }
 
+            if shouldFailNextPrepareStorage {
+                shouldFailNextPrepareStorage = false
+                throw MockAudioCaptureServiceError.simulatedPrepareFailure
+            }
+
             cycleState = .prepared(format: formatToPrepare)
             lastCompletedOutcome = CaptureStopOutcome(
                 failure: nil,
@@ -177,6 +245,18 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
 
             coordinator.markCommitted(onFailure: onFailure)
         }
+
+        // Outside controlQueue's synchronization (avoids a re-entrant
+        // deadlock with injectBuffer/simulateAsyncFailure, both of which
+        // call controlQueue.sync themselves). Fires synchronously and
+        // deterministically, strictly before start() returns to its
+        // caller — see startCommitHookForTesting. Skipped entirely if the
+        // block above threw, since a thrown start() must never arm this
+        // hook (mirrors the real contract: "if start() throws, onFailure
+        // must never later fire for that cycle").
+        if let hook = consumeStartCommitHookForTesting() {
+            hook(onBuffer, onFailure)
+        }
     }
 
     @discardableResult
@@ -190,6 +270,8 @@ nonisolated final class MockAudioCaptureService: AudioCapturing, @unchecked Send
         let hookToFire: (@Sendable () -> Void)?
 
         (action, hookToFire) = controlQueue.sync {
+            stopCallCountStorage += 1
+
             switch cycleState {
             case .idle:
                 return (.returnImmediately(lastCompletedOutcome), nil)
@@ -395,6 +477,7 @@ nonisolated enum MockAudioCaptureServiceError: LocalizedError, Sendable {
     case prepareCalledFromInvalidState
     case startCalledFromInvalidState
     case simulatedStartFailure
+    case simulatedPrepareFailure
 
     var errorDescription: String? {
         switch self {
@@ -404,6 +487,8 @@ nonisolated enum MockAudioCaptureServiceError: LocalizedError, Sendable {
             return "start() may only be called immediately after prepare()."
         case .simulatedStartFailure:
             return "Simulated start failure."
+        case .simulatedPrepareFailure:
+            return "Simulated prepare failure."
         }
     }
 }

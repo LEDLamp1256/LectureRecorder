@@ -101,7 +101,7 @@ private enum InFlightChunk {
     case pendingDirectorySync(canonicalURL: URL)
 }
 
-nonisolated final class AudioChunkWriter: @unchecked Sendable {
+nonisolated final class AudioChunkWriter: AudioChunkWriting, @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.lecturerecorder.audiochunkwriter")
     private let chunksDirectory: URL
     private let format: AVAudioFormat
