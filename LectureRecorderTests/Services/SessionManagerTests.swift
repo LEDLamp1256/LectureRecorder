@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import LectureRecorder
 
@@ -88,6 +89,16 @@ final class SessionManagerTests: XCTestCase {
     private var sessionManager: SessionManager!
     private var permissionService: MockMicrophonePermissionService!
     private var failingStore: FailingSessionStore!
+    private var captureService: MockAudioCaptureService!
+
+    private func makeTestAudioFormat() -> AVAudioFormat {
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 8_000,
+            channels: 1,
+            interleaved: false
+        )!
+    }
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -99,7 +110,12 @@ final class SessionManagerTests: XCTestCase {
         let realStore = SessionStore(locator: locator)
         failingStore = FailingSessionStore(wrapped: realStore)
         permissionService = MockMicrophonePermissionService(status: .granted)
-        sessionManager = SessionManager(store: failingStore, permissionService: permissionService)
+        captureService = MockAudioCaptureService(formatToPrepare: makeTestAudioFormat())
+        sessionManager = SessionManager(
+            store: failingStore,
+            permissionService: permissionService,
+            captureService: captureService
+        )
     }
 
     override func tearDownWithError() throws {
@@ -425,5 +441,37 @@ final class SessionManagerTests: XCTestCase {
         // The originally-troubled session's ID must not leak into the next session.
         await sessionManager.startSession()
         XCTAssertNotEqual(sessionManager.activeSession?.sessionID, sessionID)
+    }
+
+    // MARK: - Stage B: inert capture dependency injection
+
+    func testConstructionWithCaptureServiceLeavesInitialStateUnchanged() {
+        XCTAssertEqual(sessionManager.state, .idle)
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertNil(sessionManager.lastCompletedSession)
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        XCTAssertTrue(sessionManager.canStart)
+    }
+
+    /// A successful `prepare()` on the injected mock is only possible if
+    /// its cycle state is still exactly `.idle` — `prepare()` throws
+    /// `prepareCalledFromInvalidState` from any other state, and the only
+    /// way to leave `.idle` is a *successful* `prepare()` call. This test
+    /// therefore deterministically proves `prepare()` itself was never
+    /// called during `SessionManager`'s construction, using only the
+    /// mock's existing public API — no new seam.
+    ///
+    /// It does not, on its own, distinguish "start() was never called"
+    /// from "start() was called but threw" — a `start()` attempt from
+    /// `.idle` throws `startCalledFromInvalidState` without mutating
+    /// `cycleState`, so a hypothetical swallowed `start()` call would not
+    /// be caught by this assertion alone. The stronger claim — that no
+    /// capture operation of any kind is invoked anywhere in
+    /// `SessionManager`'s construction — is established structurally:
+    /// `SessionManager.swift` contains zero `captureService.` references
+    /// outside the stored-property assignment (verified by direct source
+    /// inspection, not runtime behavior).
+    func testConstructionInvokesNoCaptureOperation() throws {
+        XCTAssertNoThrow(try captureService.prepare())
     }
 }

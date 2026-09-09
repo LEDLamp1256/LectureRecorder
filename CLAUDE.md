@@ -10,8 +10,15 @@ Whisper/whisper.cpp transcription is a later, not-yet-authorized phase.
 ## Non-Negotiable Invariants
 These override convenience, performance, or "cleaner code" arguments:
 
-- Recording starts and stops only on explicit user action (Start/Stop).
-  No automatic start/stop.
+- Recording starts only through explicit user action (Start) and normally
+  stops only through explicit user action (Stop). Silence, voice activity
+  detection (VAD), elapsed time, transcription, or any other content-based
+  or timing-based logic must never automatically start or stop recording.
+  The sole exception: a terminal capture or writer failure may trigger
+  automatic failure-containment shutdown, so the UI cannot keep claiming
+  `.recording` after durable capture has become impossible. That shutdown
+  path must use the same unified, result-bearing shutdown owner as an
+  explicit user Stop, and it must never automatically restart recording.
 - Microphone capture is continuous once started.
 - Voice activity detection (VAD) must never gate what gets recorded to
   source audio. VAD, if ever used, may only inform downstream processing —
