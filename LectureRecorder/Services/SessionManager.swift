@@ -624,8 +624,19 @@ final class SessionManager: ObservableObject {
         }
 
         let paths = runtime.paths
-        currentRuntime = nil
 
+        // `currentRuntime` is deliberately kept alive (not nil'd) through
+        // the `await store.writeManifest(...)` suspension below and is
+        // only cleared immediately before each branch's final
+        // `transition(to:)` call. `store`'s production implementation is
+        // an `actor`, so that `await` is a genuine cross-actor suspension
+        // point — a second, concurrent `stopSession()` call landing in
+        // its `.stopping` branch reads `currentRuntime?.shutdownTask` to
+        // join this same shutdown; if `currentRuntime` were cleared
+        // before this suspension, that read would see `nil` and return
+        // immediately while `state` is still `.stopping`, breaking
+        // `stopSession()`'s own documented "a second concurrent caller
+        // observes the same real completion" contract.
         do {
             try await store.writeManifest(finalManifest, paths: paths)
             await currentSessionLogger?.log(
@@ -645,6 +656,7 @@ final class SessionManager: ObservableObject {
                 lastCompletedSession = finalManifest
             }
 
+            currentRuntime = nil
             transition(to: finalManifest.status == .completed ? .completed : .failed(finalManifest.failureDescription ?? "Recording failed."))
             Log.session.info(
                 "Session ended: \(finalManifest.sessionID.uuidString, privacy: .public) status=\(finalManifest.status.rawValue, privacy: .public)"
@@ -666,6 +678,7 @@ final class SessionManager: ObservableObject {
                 canRetry: true
             )
 
+            currentRuntime = nil
             transition(to: .failed(finalManifest.failureDescription ?? error.localizedDescription))
         }
     }

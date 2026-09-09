@@ -30,9 +30,24 @@ private actor FailingSessionStore: SessionStoring {
     private var failCreateDirectories = false
     private var failCreateLogger = false
     private var writeManifestFailureQueue: [Bool] = []
+    private var writeManifestGate: CheckedContinuation<Void, Never>?
+    private var shouldGateNextWrite = false
 
     init(wrapped: SessionStore) {
         self.wrapped = wrapped
+    }
+
+    /// Test-only seam: the *next* `writeManifest` call suspends
+    /// indefinitely (a genuine actor-isolated suspension, exactly like
+    /// the real cross-actor await it stands in for) until
+    /// `releaseWriteManifestGate()` is called. One-shot.
+    func armWriteManifestGate() {
+        shouldGateNextWrite = true
+    }
+
+    func releaseWriteManifestGate() {
+        writeManifestGate?.resume()
+        writeManifestGate = nil
     }
 
     func setFailCreateDirectoriesFlag(_ value: Bool) {
@@ -59,6 +74,12 @@ private actor FailingSessionStore: SessionStoring {
     }
 
     func writeManifest(_ manifest: SessionManifest, paths: SessionPaths) async throws {
+        if shouldGateNextWrite {
+            shouldGateNextWrite = false
+            await withCheckedContinuation { continuation in
+                writeManifestGate = continuation
+            }
+        }
         if !writeManifestFailureQueue.isEmpty {
             let shouldFail = writeManifestFailureQueue.removeFirst()
             if shouldFail {
@@ -726,6 +747,7 @@ final class SessionManagerTests: XCTestCase {
         chunkWriterFactory.setWriterToReturn(writer)
 
         await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
         // The first interior write fails; the second (final, at Stop)
         // succeeds, carrying the complete accumulated list.
         await failingStore.setWriteManifestFailureQueue([true])
@@ -741,6 +763,18 @@ final class SessionManagerTests: XCTestCase {
             return
         }
         XCTAssertNil(sessionManager.unresolvedIssue, "the final write succeeded, so nothing should remain unresolved")
+        // The prior version of this test stopped at the state/unresolved
+        // assertions above, which would still pass even if chunk 1 (the
+        // event yielded *after* the interior failure) had been silently
+        // dropped instead of kept in memory-only mode. A .failed session
+        // never populates lastCompletedSession, so read the actually
+        // persisted on-disk manifest (the final write succeeded, per the
+        // assertion above) to prove the real claim in this test's name.
+        let onDisk = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(
+            onDisk.chunks.map(\.sequenceNumber), [0, 1],
+            "a valid event yielded after an interior persistence failure must still be accumulated and reach the final manifest"
+        )
     }
 
     /// Directly exercises the non-self-awaiting design: an interior
@@ -911,6 +945,61 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(sessionManager.state, .completed)
         XCTAssertEqual(captureService.stopCallCountForTesting, 1, "two racing Stop callers must share one shutdown, not run it twice")
         XCTAssertEqual(writer.finishRecordingCallCount, 1)
+    }
+
+    /// Regression test for a real defect found by independent review: a
+    /// second, concurrent `stopSession()` call must observe the *actual*
+    /// shutdown completion, not return early merely because
+    /// `currentRuntime` had already been cleared while the final
+    /// manifest write — a genuine cross-actor suspension, since the
+    /// production `SessionStore` is an `actor` — is still in flight.
+    /// Uses an explicit gate on the store's `writeManifest` (not a sleep
+    /// or a fixed-duration poll) to deterministically place the first
+    /// caller's shutdown task inside that exact suspension window before
+    /// the second caller ever calls `stopSession()`.
+    func testSecondConcurrentStopJoinsRealShutdownEvenDuringFinalManifestWrite() async throws {
+        await sessionManager.startSession()
+        await failingStore.armWriteManifestGate()
+
+        let reachedStopping = XCTestExpectation(description: "reached .stopping")
+        var cancellable: AnyCancellable?
+        cancellable = sessionManager.$state
+            .dropFirst()
+            .sink { state in
+                if state == .stopping {
+                    reachedStopping.fulfill()
+                }
+            }
+
+        let firstStop = Task { await sessionManager.stopSession() }
+        await fulfillment(of: [reachedStopping], timeout: 5.0)
+        cancellable?.cancel()
+
+        // The first caller's shutdown task is now suspended inside the
+        // gated writeManifest call — currentRuntime is still non-nil at
+        // this exact point (the fix under test), so a second concurrent
+        // stopSession() call landing here must join the real shutdown
+        // rather than returning immediately.
+        final class CompletionBox: @unchecked Sendable {
+            var secondStopCompleted = false
+        }
+        let box = CompletionBox()
+        let secondStop = Task {
+            await sessionManager.stopSession()
+            box.secondStopCompleted = true
+        }
+
+        await Task.yield()
+        XCTAssertFalse(
+            box.secondStopCompleted,
+            "a second concurrent stopSession() call must not return before the real shutdown (still mid-manifest-write) completes"
+        )
+
+        await failingStore.releaseWriteManifestGate()
+        await firstStop.value
+        await secondStop.value
+
+        XCTAssertEqual(sessionManager.state, .completed)
     }
 
     func testRepeatedStopAfterCompletionRemainsHarmless() async throws {
