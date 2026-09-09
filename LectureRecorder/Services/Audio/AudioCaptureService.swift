@@ -96,11 +96,21 @@ nonisolated final class AudioCaptureService: AudioCapturing, @unchecked Sendable
             }
 
             let engine = AVAudioEngine()
-            engine.prepare()
 
+            // AVAudioEngine's input/output nodes are lazily attached to
+            // the graph the first time `.inputNode`/`.outputNode` is
+            // accessed. `engine.prepare()` requires at least one of them
+            // to already exist in the graph — calling it on a brand-new
+            // engine before ever touching `.inputNode` crashes with
+            // "required condition is false: inputNode != nullptr ||
+            // outputNode != nullptr". Accessing `engine.inputNode` here
+            // (to negotiate/validate the format) instantiates it, so
+            // `prepare()` below always runs against a non-empty graph.
             let format = try Self.negotiateAndValidateFormat(
                 inputNode: engine.inputNode
             )
+
+            engine.prepare()
 
             cycleState = .prepared(
                 engine: engine,

@@ -6,6 +6,7 @@
 //
 
 
+import AVFoundation
 import XCTest
 @testable import LectureRecorder
 
@@ -64,6 +65,55 @@ final class AudioCaptureServiceTests: XCTestCase {
         XCTAssertEqual(firstOutcome.observedCopyFailureCount, 0)
         XCTAssertNil(secondOutcome.failure)
         XCTAssertEqual(secondOutcome.observedCopyFailureCount, 0)
+    }
+
+    /// Regression test for a real-hardware-only crash: no other test in
+    /// this suite ever calls `prepare()` on a real `AudioCaptureService`
+    /// against a real `AVAudioEngine` — every other test either exercises
+    /// `FailureCoordinator` in isolation or uses the hardware-free
+    /// `MockAudioCaptureService`, which has no `AVAudioEngine` at all and
+    /// so cannot reproduce an AVFoundation-internal assertion. `prepare()`
+    /// previously called `engine.prepare()` before ever accessing
+    /// `engine.inputNode`, which crashed on real hardware with "required
+    /// condition is false: inputNode != nullptr || outputNode !=
+    /// nullptr" — `AVAudioEngine.prepare()` requires the graph to already
+    /// contain an instantiated input or output node, and that node is
+    /// only lazily attached the first time `.inputNode`/`.outputNode` is
+    /// accessed. This exercises the exact previously-crashing call
+    /// sequence directly; a mock cannot substitute for it.
+    func testPrepareSucceedsAgainstRealHardwareWithoutCrashing() async throws {
+        let service = AudioCaptureService()
+
+        let format = try service.prepare()
+
+        XCTAssertGreaterThan(format.sampleRate, 0)
+        XCTAssertGreaterThan(format.channelCount, 0)
+
+        _ = await service.stop()
+    }
+
+    /// Confirms `cycleState` is only committed away from `.idle` once
+    /// `prepare()` fully succeeds: a second `prepare()` attempt while
+    /// already `.prepared` is rejected, and `stop()` correctly returns
+    /// the cycle to `.idle` so `prepare()` is reusable afterward. Both
+    /// share the same single `controlQueue.sync` closure and
+    /// mutate-only-at-the-end structure a hardware-format-negotiation
+    /// failure would also go through, so this exercises the same
+    /// commit-only-on-full-success discipline without needing to force
+    /// an actual hardware failure from a test.
+    func testPrepareFailureLeavesCycleStateReusable() async throws {
+        let service = AudioCaptureService()
+
+        _ = try service.prepare()
+        XCTAssertThrowsError(try service.prepare()) { error in
+            guard case AudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail("Expected prepareCalledFromInvalidState, got \(error)")
+            }
+        }
+
+        _ = await service.stop()
+
+        XCTAssertNoThrow(try service.prepare(), "prepare() must be reusable from .idle after stop()")
     }
 
     // MARK: - FailureCoordinator contract
