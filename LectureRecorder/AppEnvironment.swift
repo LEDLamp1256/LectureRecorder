@@ -11,10 +11,12 @@ final class AppEnvironment: ObservableObject {
         let store = SessionStore()
         let permissionService = MicrophonePermissionService()
         let captureService = AudioCaptureService()
+        let chunkWriterFactory = DefaultAudioChunkWriterFactory()
         self.sessionManager = SessionManager(
             store: store,
             permissionService: permissionService,
-            captureService: captureService
+            captureService: captureService,
+            chunkWriterFactory: chunkWriterFactory
         )
     }
 }

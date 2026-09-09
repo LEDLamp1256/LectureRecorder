@@ -6,6 +6,7 @@
 //
 
 
+import AVFoundation
 import XCTest
 @testable import LectureRecorder
 
@@ -64,6 +65,77 @@ final class AudioCaptureServiceTests: XCTestCase {
         XCTAssertEqual(firstOutcome.observedCopyFailureCount, 0)
         XCTAssertNil(secondOutcome.failure)
         XCTAssertEqual(secondOutcome.observedCopyFailureCount, 0)
+    }
+
+    /// Both tests below construct a real `AudioCaptureService` and call
+    /// its real `prepare()` against whatever audio hardware and
+    /// microphone permission state actually exist on the machine running
+    /// the test — deliberately, since a hardware-free double cannot
+    /// reproduce an AVFoundation-internal assertion (see the doc comment
+    /// on `testPrepareSucceedsAgainstRealHardwareWithoutCrashing` below).
+    /// That makes both opt-in only: skipped by default so the rest of
+    /// the suite stays portable to CI/headless environments with no
+    /// input device or ungranted microphone permission, and runnable
+    /// on demand with `LECTURE_RECORDER_RUN_HARDWARE_TESTS=1`.
+    private func skipUnlessHardwareTestsEnabled() throws {
+        guard ProcessInfo.processInfo.environment["LECTURE_RECORDER_RUN_HARDWARE_TESTS"] == "1" else {
+            throw XCTSkip(
+                "Skipped by default: exercises a real AVAudioEngine against real audio hardware and requires microphone permission already granted to the test host. Set the environment variable LECTURE_RECORDER_RUN_HARDWARE_TESTS=1 to run it."
+            )
+        }
+    }
+
+    /// Regression test for a real-hardware-only crash: no other test in
+    /// this suite ever calls `prepare()` on a real `AudioCaptureService`
+    /// against a real `AVAudioEngine` — every other test either exercises
+    /// `FailureCoordinator` in isolation or uses the hardware-free
+    /// `MockAudioCaptureService`, which has no `AVAudioEngine` at all and
+    /// so cannot reproduce an AVFoundation-internal assertion. `prepare()`
+    /// previously called `engine.prepare()` before ever accessing
+    /// `engine.inputNode`, which crashed on real hardware with "required
+    /// condition is false: inputNode != nullptr || outputNode !=
+    /// nullptr" — `AVAudioEngine.prepare()` requires the graph to already
+    /// contain an instantiated input or output node, and that node is
+    /// only lazily attached the first time `.inputNode`/`.outputNode` is
+    /// accessed. This exercises the exact previously-crashing call
+    /// sequence directly; a mock cannot substitute for it.
+    func testPrepareSucceedsAgainstRealHardwareWithoutCrashing() async throws {
+        try skipUnlessHardwareTestsEnabled()
+
+        let service = AudioCaptureService()
+
+        let format = try service.prepare()
+
+        XCTAssertGreaterThan(format.sampleRate, 0)
+        XCTAssertGreaterThan(format.channelCount, 0)
+
+        _ = await service.stop()
+    }
+
+    /// Confirms `cycleState` is only committed away from `.idle` once
+    /// `prepare()` fully succeeds: a second `prepare()` attempt while
+    /// already `.prepared` is rejected, and `stop()` correctly returns
+    /// the cycle to `.idle` so `prepare()` is reusable afterward. Both
+    /// share the same single `controlQueue.sync` closure and
+    /// mutate-only-at-the-end structure a hardware-format-negotiation
+    /// failure would also go through, so this exercises the same
+    /// commit-only-on-full-success discipline without needing to force
+    /// an actual hardware failure from a test.
+    func testPrepareFailureLeavesCycleStateReusable() async throws {
+        try skipUnlessHardwareTestsEnabled()
+
+        let service = AudioCaptureService()
+
+        _ = try service.prepare()
+        XCTAssertThrowsError(try service.prepare()) { error in
+            guard case AudioCaptureServiceError.prepareCalledFromInvalidState = error else {
+                return XCTFail("Expected prepareCalledFromInvalidState, got \(error)")
+            }
+        }
+
+        _ = await service.stop()
+
+        XCTAssertNoThrow(try service.prepare(), "prepare() must be reusable from .idle after stop()")
     }
 
     // MARK: - FailureCoordinator contract

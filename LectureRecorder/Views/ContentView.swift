@@ -215,7 +215,8 @@ private struct SessionInfoView: View {
                         channels: 1,
                         interleaved: false
                     )!
-                )
+                ),
+                chunkWriterFactory: DefaultAudioChunkWriterFactory()
             )
         )
 }

@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import XCTest
 @testable import LectureRecorder
 
@@ -29,9 +30,24 @@ private actor FailingSessionStore: SessionStoring {
     private var failCreateDirectories = false
     private var failCreateLogger = false
     private var writeManifestFailureQueue: [Bool] = []
+    private var writeManifestGate: CheckedContinuation<Void, Never>?
+    private var shouldGateNextWrite = false
 
     init(wrapped: SessionStore) {
         self.wrapped = wrapped
+    }
+
+    /// Test-only seam: the *next* `writeManifest` call suspends
+    /// indefinitely (a genuine actor-isolated suspension, exactly like
+    /// the real cross-actor await it stands in for) until
+    /// `releaseWriteManifestGate()` is called. One-shot.
+    func armWriteManifestGate() {
+        shouldGateNextWrite = true
+    }
+
+    func releaseWriteManifestGate() {
+        writeManifestGate?.resume()
+        writeManifestGate = nil
     }
 
     func setFailCreateDirectoriesFlag(_ value: Bool) {
@@ -58,6 +74,12 @@ private actor FailingSessionStore: SessionStoring {
     }
 
     func writeManifest(_ manifest: SessionManifest, paths: SessionPaths) async throws {
+        if shouldGateNextWrite {
+            shouldGateNextWrite = false
+            await withCheckedContinuation { continuation in
+                writeManifestGate = continuation
+            }
+        }
         if !writeManifestFailureQueue.isEmpty {
             let shouldFail = writeManifestFailureQueue.removeFirst()
             if shouldFail {
@@ -90,6 +112,7 @@ final class SessionManagerTests: XCTestCase {
     private var permissionService: MockMicrophonePermissionService!
     private var failingStore: FailingSessionStore!
     private var captureService: MockAudioCaptureService!
+    private var chunkWriterFactory: FakeAudioChunkWriterFactory!
 
     private func makeTestAudioFormat() -> AVAudioFormat {
         AVAudioFormat(
@@ -111,10 +134,12 @@ final class SessionManagerTests: XCTestCase {
         failingStore = FailingSessionStore(wrapped: realStore)
         permissionService = MockMicrophonePermissionService(status: .granted)
         captureService = MockAudioCaptureService(formatToPrepare: makeTestAudioFormat())
+        chunkWriterFactory = FakeAudioChunkWriterFactory()
         sessionManager = SessionManager(
             store: failingStore,
             permissionService: permissionService,
-            captureService: captureService
+            captureService: captureService,
+            chunkWriterFactory: chunkWriterFactory
         )
     }
 
@@ -465,13 +490,709 @@ final class SessionManagerTests: XCTestCase {
     /// from "start() was called but threw" — a `start()` attempt from
     /// `.idle` throws `startCalledFromInvalidState` without mutating
     /// `cycleState`, so a hypothetical swallowed `start()` call would not
-    /// be caught by this assertion alone. The stronger claim — that no
-    /// capture operation of any kind is invoked anywhere in
-    /// `SessionManager`'s construction — is established structurally:
-    /// `SessionManager.swift` contains zero `captureService.` references
-    /// outside the stored-property assignment (verified by direct source
-    /// inspection, not runtime behavior).
+    /// be caught by this assertion alone. As of Stage C, `SessionManager`
+    /// does call `captureService` from `startSession()`/shutdown — this
+    /// test only proves construction itself (`init`) touches nothing.
     func testConstructionInvokesNoCaptureOperation() throws {
         XCTAssertNoThrow(try captureService.prepare())
+    }
+
+    // MARK: - Stage C: helpers
+
+    private func makeChunkMetadata(sequenceNumber: Int) -> ChunkMetadata {
+        ChunkMetadata(
+            sequenceNumber: sequenceNumber,
+            fileName: "chunk_\(sequenceNumber).caf",
+            startOffsetSeconds: Double(sequenceNumber) * 30.0,
+            durationSeconds: 30.0,
+            frameCount: 240_000,
+            state: .completed
+        )
+    }
+
+    private func makeTestBuffer(frameCount: AVAudioFrameCount = 10) -> AVAudioPCMBuffer {
+        let buffer = AVAudioPCMBuffer(pcmFormat: makeTestAudioFormat(), frameCapacity: frameCount)!
+        buffer.frameLength = frameCount
+        return buffer
+    }
+
+    // MARK: - Stage C: Start wiring
+
+    func testStartSessionPersistsNegotiatedFormatNotDefault() async throws {
+        await sessionManager.startSession()
+
+        XCTAssertEqual(sessionManager.state, .recording)
+        let session = try XCTUnwrap(sessionManager.activeSession)
+        XCTAssertEqual(session.audioFormat.sampleRate, makeTestAudioFormat().sampleRate)
+        XCTAssertNotEqual(session.audioFormat, AudioFormatDescriptor.defaultTarget)
+    }
+
+    func testStartSessionConstructsWriterWithSessionChunksDirectoryNegotiatedFormatAndThirtySecondDuration() async throws {
+        await sessionManager.startSession()
+
+        let calls = chunkWriterFactory.recordedCalls
+        XCTAssertEqual(calls.count, 1)
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.targetChunkDurationSeconds, 30.0)
+        XCTAssertEqual(call.format.sampleRate, makeTestAudioFormat().sampleRate)
+        XCTAssertTrue(call.chunksDirectory.path.hasSuffix("chunks"))
+    }
+
+    func testBufferInjectedAfterStartReachesWriter() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        captureService.injectBuffer(makeTestBuffer())
+
+        XCTAssertEqual(writer.acceptBufferCallCount, 1)
+    }
+
+    // MARK: - Stage C: Start-callback race safety
+
+    func testBufferCallbackInvokedBeforeMockStartReturnsReachesWriter() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        struct SendableBufferBox: @unchecked Sendable {
+            let buffer: AVAudioPCMBuffer
+        }
+        let box = SendableBufferBox(buffer: makeTestBuffer())
+
+        captureService.setStartCommitHookForTesting { onBuffer, _ in
+            onBuffer(box.buffer)
+        }
+
+        await sessionManager.startSession()
+
+        XCTAssertEqual(sessionManager.state, .recording)
+        XCTAssertEqual(
+            writer.acceptBufferCallCount, 1,
+            "a buffer delivered synchronously during start(), before it returns, must still reach the already-installed writer"
+        )
+    }
+
+    func testFailureCallbackInvokedBeforeMockStartReturnsIsCallable() async throws {
+        final class InvocationBox: @unchecked Sendable {
+            var invoked = false
+        }
+        let box = InvocationBox()
+
+        captureService.setStartCommitHookForTesting { _, onFailure in
+            onFailure(TestInjectedError.injected)
+            box.invoked = true
+        }
+
+        await sessionManager.startSession()
+
+        XCTAssertTrue(
+            box.invoked,
+            "onFailure must be safely invocable before start() returns to its caller, without touching half-installed state"
+        )
+    }
+
+    /// Full round-trip for the same race as above: proves the failure
+    /// claimed synchronously inside start()'s call frame is not merely
+    /// invocable but actually drives SessionManager out of `.recording`
+    /// and into `.failed` once its scheduled MainActor Task gets a turn.
+    /// The gate is a Combine subscription on `$state` fulfilling an
+    /// expectation on the first non-`.recording` value observed after
+    /// Start — deterministic in that it reacts to the real state change
+    /// whenever the runtime schedules it, not a fixed delay.
+    func testFailureCallbackClaimedDuringStartEventuallyReachesFailed() async throws {
+        captureService.setStartCommitHookForTesting { _, onFailure in
+            onFailure(TestInjectedError.injected)
+        }
+
+        let reachedTerminalState = XCTestExpectation(description: "left .recording")
+        var cancellable: AnyCancellable?
+        cancellable = sessionManager.$state
+            .dropFirst()
+            .sink { state in
+                if case .failed = state {
+                    reachedTerminalState.fulfill()
+                }
+            }
+
+        await sessionManager.startSession()
+        await fulfillment(of: [reachedTerminalState], timeout: 5.0)
+        cancellable?.cancel()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected a failure claimed synchronously during start() to eventually reach .failed, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    // MARK: - Stage C: steady-state event consumption
+
+    func testFinalizedEventsUpdateInMemoryAndOnDiskManifestInOrder() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 1)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        let completed = try XCTUnwrap(sessionManager.lastCompletedSession)
+        XCTAssertEqual(completed.chunks.map(\.sequenceNumber), [0, 1])
+
+        let onDisk = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(onDisk.chunks.map(\.sequenceNumber), [0, 1])
+    }
+
+    func testFinalPartialEventIsConsumedBeforeFinalSessionPersistence() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+
+        // finishRecording() does not auto-terminate this fake's stream —
+        // the test simulates the writer finalizing one last partial chunk
+        // only after finishRecording() is called, then terminating.
+        let stopTask = Task { await sessionManager.stopSession() }
+
+        // Deterministic gate: wait for finishRecording() to actually be
+        // called (proving capture has already been drained) before
+        // yielding the final event and terminating the stream.
+        while writer.finishRecordingCallCount == 0 {
+            await Task.yield()
+        }
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.finishStream()
+
+        await stopTask.value
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertEqual(sessionManager.lastCompletedSession?.chunks.map(\.sequenceNumber), [0])
+    }
+
+    func testSequenceGapIsTerminal() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 2)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed after a sequence gap, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    func testDuplicateSequenceIsTerminal() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed after a duplicate sequence number, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    func testOutOfOrderSequenceIsTerminal() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 1)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed after an out-of-order sequence number, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    // MARK: - Stage C: interior manifest persistence failure
+
+    func testInteriorManifestFailureBecomesTerminalAndLeavesRecording() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed after an interior manifest persistence failure, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    func testInteriorManifestFailureContinuesMemoryOnlyDrainOfSubsequentValidEvents() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        // The first interior write fails; the second (final, at Stop)
+        // succeeds, carrying the complete accumulated list.
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 1)))
+        writer.finishStream()
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertNil(sessionManager.unresolvedIssue, "the final write succeeded, so nothing should remain unresolved")
+        // The prior version of this test stopped at the state/unresolved
+        // assertions above, which would still pass even if chunk 1 (the
+        // event yielded *after* the interior failure) had been silently
+        // dropped instead of kept in memory-only mode. A .failed session
+        // never populates lastCompletedSession, so read the actually
+        // persisted on-disk manifest (the final write succeeded, per the
+        // assertion above) to prove the real claim in this test's name.
+        let onDisk = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(
+            onDisk.chunks.map(\.sequenceNumber), [0, 1],
+            "a valid event yielded after an interior persistence failure must still be accumulated and reach the final manifest"
+        )
+    }
+
+    /// Directly exercises the non-self-awaiting design: an interior
+    /// manifest failure is signaled from inside the event-consumer loop
+    /// itself, and the shared shutdown (a *different* task) must still be
+    /// able to await that same consumer task's completion without
+    /// hanging.
+    func testNoEventConsumerSelfAwaitDeadlockOnInteriorFailure() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        writer.yield(.finalized(makeChunkMetadata(sequenceNumber: 0)))
+        writer.finishStream()
+
+        // If the consumer ever awaited itself or the shutdown task it
+        // signals, this would hang forever; XCTest's own timeout is the
+        // backstop, but reaching a terminal state at all is the proof.
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected shutdown to complete (not hang) and reach .failed, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    // MARK: - Stage C: capture/writer failures
+
+    func testCapturePrepareFailure() async throws {
+        captureService.setShouldFailNextPrepare(true)
+
+        await sessionManager.startSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertNil(sessionManager.activeSession)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
+        XCTAssertTrue(contents.isEmpty, "prepare() failing before any directory/manifest exists must leave nothing on disk")
+    }
+
+    func testCaptureStartFailureCallsStopAndPersistsFailure() async throws {
+        captureService.setShouldFailNextStart(true)
+
+        await sessionManager.startSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertEqual(
+            captureService.stopCallCountForTesting, 1,
+            "captureService.stop() must be called even though start() itself threw"
+        )
+    }
+
+    func testWriterConstructionFailureStopsPreparedCaptureAndRewritesSessionAsFailed() async throws {
+        chunkWriterFactory.setErrorToThrow(TestInjectedError.injected)
+
+        await sessionManager.startSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+    }
+
+    func testCaptureRuntimeFailureEntersSharedShutdown() async throws {
+        await sessionManager.startSession()
+        XCTAssertEqual(sessionManager.state, .recording)
+
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+
+        // simulateAsyncFailure schedules delivery on FailureCoordinator's
+        // own delivery queue, which then hops to MainActor via a Task.
+        // stopSession(), called next, deterministically joins whatever
+        // shutdown that delivery already started (or starts its own
+        // .userStopped-triggered shutdown if delivery hasn't landed yet —
+        // either way the retained operational failure, once recorded,
+        // always wins the final status).
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected a retained capture failure to force .failed, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    func testCaptureStopOutcomeFailureForcesFailedEvenOnCleanUserStop() async throws {
+        await sessionManager.startSession()
+
+        // Claim a failure that is retained but not yet delivered before
+        // stop() begins draining — CaptureStopOutcome.failure will carry
+        // it even though the user is about to call a clean stopSession().
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("A retained CaptureStopOutcome failure must prevent .completed even on a user-initiated Stop, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    func testWriterStreamFailureEntersSharedShutdown() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        writer.failStream(TestInjectedError.injected)
+
+        // The consumer's catch branch signals shutdown without awaiting
+        // it; stopSession() joins that same shutdown deterministically.
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed after a writer stream failure, got \(sessionManager.state)")
+            return
+        }
+    }
+
+    // MARK: - Stage C: shutdown ordering and exactly-once discipline
+
+    func testCaptureDrainBeforeWriterFinish() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+
+        var observedFinishBeforeStopReturned = false
+        captureService.setDidEnterStoppingHookForTesting {
+            observedFinishBeforeStopReturned = writer.finishRecordingCallCount > 0
+        }
+
+        await sessionManager.stopSession()
+
+        XCTAssertFalse(
+            observedFinishBeforeStopReturned,
+            "finishRecording() must not be called until captureService.stop()'s drain has completed"
+        )
+        XCTAssertEqual(writer.finishRecordingCallCount, 1)
+    }
+
+    func testExactlyOnceCaptureStopAndWriterFinish() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        await sessionManager.stopSession()
+
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+        XCTAssertEqual(writer.finishRecordingCallCount, 1)
+    }
+
+    func testTwoConcurrentStopCallersJoinTheSameShutdown() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+
+        async let first: Void = sessionManager.stopSession()
+        async let second: Void = sessionManager.stopSession()
+        _ = await (first, second)
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1, "two racing Stop callers must share one shutdown, not run it twice")
+        XCTAssertEqual(writer.finishRecordingCallCount, 1)
+    }
+
+    /// Regression test for a real defect found by independent review: a
+    /// second, concurrent `stopSession()` call must observe the *actual*
+    /// shutdown completion, not return early merely because
+    /// `currentRuntime` had already been cleared while the final
+    /// manifest write — a genuine cross-actor suspension, since the
+    /// production `SessionStore` is an `actor` — is still in flight.
+    /// Uses an explicit gate on the store's `writeManifest` (not a sleep
+    /// or a fixed-duration poll) to deterministically place the first
+    /// caller's shutdown task inside that exact suspension window before
+    /// the second caller ever calls `stopSession()`.
+    func testSecondConcurrentStopJoinsRealShutdownEvenDuringFinalManifestWrite() async throws {
+        await sessionManager.startSession()
+        await failingStore.armWriteManifestGate()
+
+        let reachedStopping = XCTestExpectation(description: "reached .stopping")
+        var cancellable: AnyCancellable?
+        cancellable = sessionManager.$state
+            .dropFirst()
+            .sink { state in
+                if state == .stopping {
+                    reachedStopping.fulfill()
+                }
+            }
+
+        let firstStop = Task { await sessionManager.stopSession() }
+        await fulfillment(of: [reachedStopping], timeout: 5.0)
+        cancellable?.cancel()
+
+        // The first caller's shutdown task is now suspended inside the
+        // gated writeManifest call — currentRuntime is still non-nil at
+        // this exact point (the fix under test), so a second concurrent
+        // stopSession() call landing here must join the real shutdown
+        // rather than returning immediately.
+        final class CompletionBox: @unchecked Sendable {
+            var secondStopCompleted = false
+        }
+        let box = CompletionBox()
+        let secondStop = Task {
+            await sessionManager.stopSession()
+            box.secondStopCompleted = true
+        }
+
+        await Task.yield()
+        XCTAssertFalse(
+            box.secondStopCompleted,
+            "a second concurrent stopSession() call must not return before the real shutdown (still mid-manifest-write) completes"
+        )
+
+        await failingStore.releaseWriteManifestGate()
+        await firstStop.value
+        await secondStop.value
+
+        XCTAssertEqual(sessionManager.state, .completed)
+    }
+
+    func testRepeatedStopAfterCompletionRemainsHarmless() async throws {
+        await sessionManager.startSession()
+        await sessionManager.stopSession()
+        XCTAssertEqual(sessionManager.state, .completed)
+
+        await sessionManager.stopSession()
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+    }
+
+    func testNoBufferProcessingAfterStop() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        await sessionManager.stopSession()
+
+        captureService.injectBuffer(makeTestBuffer())
+
+        XCTAssertEqual(writer.acceptBufferCallCount, 0, "no buffer may reach the writer once capture has been drained and stopped")
+    }
+
+    /// Proves the final terminal state is never observed before shutdown
+    /// has actually finished draining the writer's stream: while the
+    /// stream is deliberately held open, `state` must still be
+    /// `.stopping`, not `.completed`.
+    func testNoPrematureCompletedBeforeStreamTerminates() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+
+        let stopTask = Task { await sessionManager.stopSession() }
+
+        while writer.finishRecordingCallCount == 0 {
+            await Task.yield()
+        }
+        // finishRecording() has been called, but the fake's stream is
+        // still deliberately open (auto-terminate disabled) — the final
+        // manifest must not have been persisted as .completed yet.
+        XCTAssertEqual(sessionManager.state, .stopping)
+
+        writer.finishStream()
+        await stopTask.value
+
+        XCTAssertEqual(sessionManager.state, .completed)
+    }
+
+    // MARK: - Stage C: multiple operational failures and precedence
+
+    func testMultipleOperationalFailuresFormatPrimaryAndSecondaryDeterministically() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        writer.failStream(TestInjectedError.injected)
+
+        await sessionManager.stopSession()
+
+        guard case .failed(let message) = sessionManager.state else {
+            XCTFail("Expected .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("additional error during shutdown"), "a second, distinct operational failure must appear as a secondary diagnostic")
+    }
+
+    // MARK: - Stage C: retry correction
+
+    func testFailedStatusFinalManifestRetryRemainsFailedNotCompleted() async throws {
+        let writer = FakeAudioChunkWriter()
+        chunkWriterFactory.setWriterToReturn(writer)
+
+        await sessionManager.startSession()
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        await sessionManager.stopSession()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("Expected .failed before retry, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertNotNil(sessionManager.unresolvedIssue)
+
+        await sessionManager.retryResolution()
+
+        guard case .failed = sessionManager.state else {
+            XCTFail("A successfully retried .failed manifest must remain .failed, got \(sessionManager.state)")
+            return
+        }
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        XCTAssertNil(sessionManager.lastCompletedSession, "retrying a failed session's final write must never populate lastCompletedSession")
+    }
+
+    // MARK: - Stage C: stale-generation safety and lifetime cleanup
+
+    func testStaleRuntimeGenerationFailureSignalIsIgnored() async throws {
+        final class ClosureBox: @unchecked Sendable {
+            var onFailure: (@Sendable (Error) -> Void)?
+        }
+        let box = ClosureBox()
+        captureService.setStartCommitHookForTesting { _, onFailure in
+            box.onFailure = onFailure
+        }
+
+        await sessionManager.startSession()
+        await sessionManager.stopSession()
+        XCTAssertEqual(sessionManager.state, .completed)
+
+        await sessionManager.startSession()
+        XCTAssertEqual(sessionManager.state, .recording)
+
+        box.onFailure?(TestInjectedError.injected)
+        await Task.yield()
+
+        XCTAssertEqual(sessionManager.state, .recording, "a stale failure signal from an already-torn-down cycle must not affect a new cycle")
+    }
+
+    func testRuntimeAndWriterAreReleasedAfterShutdownCompletes() async throws {
+        weak var weakWriter: AnyObject?
+
+        do {
+            // A factory scoped to this block, not the shared
+            // `chunkWriterFactory` from setUp: the shared factory would
+            // itself keep a strong reference to `writer` in its own
+            // configured-return-value state for the rest of the test
+            // method, which would make this assertion meaningless
+            // regardless of what SessionManager does.
+            let scopedFactory = FakeAudioChunkWriterFactory()
+            let writer = FakeAudioChunkWriter()
+            weakWriter = writer
+            scopedFactory.setWriterToReturn(writer)
+
+            let scopedManager = SessionManager(
+                store: failingStore,
+                permissionService: permissionService,
+                captureService: captureService,
+                chunkWriterFactory: scopedFactory
+            )
+
+            await scopedManager.startSession()
+            await scopedManager.stopSession()
+        }
+
+        XCTAssertNil(weakWriter, "the writer must not be retained anywhere once its recording cycle's shutdown has completed")
+    }
+
+    // MARK: - Stage C: production-adapter integration
+
+    func testRealAudioChunkWriterAdapterProducesFinalizedChunkOnDisk() async throws {
+        chunkWriterFactory = FakeAudioChunkWriterFactory()
+        let defaultFactory = DefaultAudioChunkWriterFactory()
+        sessionManager = SessionManager(
+            store: failingStore,
+            permissionService: permissionService,
+            captureService: captureService,
+            chunkWriterFactory: defaultFactory
+        )
+
+        await sessionManager.startSession()
+        let paths = try XCTUnwrap(sessionManager.activeSession).sessionID
+
+        let format = makeTestAudioFormat()
+        // One second at 8kHz mono, well over one real 30s-target chunk's
+        // worth is unnecessary here — the point is only to prove the
+        // real adapter wires up and can write real audio, not to
+        // exercise chunk-rotation math (already covered exhaustively by
+        // AudioChunkWriterTests). A partial chunk finalized at Stop is
+        // sufficient proof of end-to-end wiring.
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8_000)!
+        buffer.frameLength = 8_000
+        if let channel = buffer.floatChannelData {
+            for frame in 0..<Int(buffer.frameLength) {
+                channel[0][frame] = 0
+            }
+        }
+        captureService.injectBuffer(buffer)
+
+        await sessionManager.stopSession()
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        let completed = try XCTUnwrap(sessionManager.lastCompletedSession)
+        XCTAssertEqual(completed.chunks.count, 1)
+        XCTAssertEqual(completed.chunks.first?.frameCount, 8_000)
+
+        let chunkFileURL = tempDirectory
+            .appendingPathComponent(paths.uuidString)
+            .appendingPathComponent("chunks")
+            .appendingPathComponent(completed.chunks[0].fileName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: chunkFileURL.path))
     }
 }
