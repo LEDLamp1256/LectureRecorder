@@ -59,6 +59,11 @@ final class SessionManager: ObservableObject {
 
     private let store: any SessionStoring
     private let permissionService: MicrophonePermissionServing
+    /// Injected capture dependency. Stage B only: retained for future
+    /// lifecycle integration, never called from anywhere in this file yet.
+    /// `SessionManager` owns this instance for the lifetime of the app
+    /// environment — it is never constructed here, and never per-session.
+    private let captureService: any AudioCapturing
 
     private var currentSessionPaths: SessionPaths?
     private var currentSessionLogger: SessionFileLogger?
@@ -67,9 +72,14 @@ final class SessionManager: ObservableObject {
     private var isRetryInFlight = false
     private var isDiscardInFlight = false
 
-    init(store: any SessionStoring, permissionService: MicrophonePermissionServing) {
+    init(
+        store: any SessionStoring,
+        permissionService: MicrophonePermissionServing,
+        captureService: any AudioCapturing
+    ) {
         self.store = store
         self.permissionService = permissionService
+        self.captureService = captureService
     }
 
     var canStart: Bool {

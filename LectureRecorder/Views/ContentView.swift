@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 struct ContentView: View {
@@ -206,7 +207,15 @@ private struct SessionInfoView: View {
         .environmentObject(
             SessionManager(
                 store: SessionStore(),
-                permissionService: MockMicrophonePermissionService(status: .granted)
+                permissionService: MockMicrophonePermissionService(status: .granted),
+                captureService: MockAudioCaptureService(
+                    formatToPrepare: AVAudioFormat(
+                        commonFormat: .pcmFormatFloat32,
+                        sampleRate: 44_100,
+                        channels: 1,
+                        interleaved: false
+                    )!
+                )
             )
         )
 }

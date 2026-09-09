@@ -10,6 +10,11 @@ final class AppEnvironment: ObservableObject {
     init() {
         let store = SessionStore()
         let permissionService = MicrophonePermissionService()
-        self.sessionManager = SessionManager(store: store, permissionService: permissionService)
+        let captureService = AudioCaptureService()
+        self.sessionManager = SessionManager(
+            store: store,
+            permissionService: permissionService,
+            captureService: captureService
+        )
     }
 }
