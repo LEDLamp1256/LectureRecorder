@@ -81,10 +81,19 @@ nonisolated struct ReconciliationReport: Sendable {
 /// ## Actor reentrancy
 /// `Transcribing.transcribe` is `async`, so this actor is reentrant across
 /// that `await` — declaring it an actor does not by itself serialize two
-/// calls processing the same job. `processJob` guards against this with an
-/// in-memory `activeAttempts` set, checked and inserted into synchronously
-/// (no `await` precedes the check) before any suspending call is made; see
-/// `processJob` and `claimJob`.
+/// calls processing the same job. Two calls each awaiting a *different*
+/// suspending call (e.g. `store.loadJob`) can both be in flight on this
+/// actor at once, so a guard that only checks an in-memory set before its
+/// *own* first suspension is not enough — the reservation into that set
+/// must itself land before that first suspension, or a second call can
+/// still observe the set as empty. `claimJob` reserves its
+/// `activeAttempts` key synchronously, immediately after the "already
+/// claimed" check and before the first `await` in its body
+/// (`store.loadJob`), and releases that reservation on every failure path
+/// via a single `do`/`catch` wrapping the rest of the function.
+/// `processJob` then owns the reservation for the remainder of the
+/// attempt and releases it unconditionally via `defer`. See `claimJob`
+/// and `processJob`.
 actor TranscriptionCoordinator {
     private let store: any TranscriptionStoring
     private let transcriber: any Transcribing
@@ -266,53 +275,62 @@ actor TranscriptionCoordinator {
 
     /// Transitions a `.queued` job to `.running` with a fresh attempt ID,
     /// after revalidating that its source `.caf` file is still present.
-    /// Guards concurrent same-instance claims via `activeAttempts`,
-    /// checked and inserted into synchronously before any suspension.
+    ///
+    /// Guards concurrent same-instance claims via `activeAttempts`. The
+    /// key is both *checked* and *reserved* (inserted) synchronously,
+    /// before the first `await` in this function (`store.loadJob`) — not
+    /// just checked. Reserving first, rather than only checking first,
+    /// closes the reentrancy window across that suspension: a second call
+    /// arriving while this one is suspended inside `store.loadJob` (or any
+    /// later `await` in this function) must see the key already present.
+    /// Every exit after the reservation — `jobNotFound`, `jobNotClaimable`,
+    /// `sourceMissing`, a `replaceJob` failure, or any other error — rolls
+    /// the reservation back via the single `do`/`catch` below, so a failed
+    /// claim never leaks ownership. Only a *successful* claim leaves the
+    /// key reserved, handing ownership to `processJob`'s own `defer`.
     func claimJob(sequenceNumber: Int, paths: TranscriptionArtifactPaths) async throws -> TranscriptionJob {
         let key = TranscriptionAttemptKey(sessionID: paths.sessionID, chunkSequenceNumber: sequenceNumber)
         guard !activeAttempts.contains(key) else {
             throw TranscriptionCoordinatorError.alreadyClaimedByThisCoordinator(sequenceNumber: sequenceNumber)
         }
-
-        guard let job = try await store.loadJob(sequenceNumber: sequenceNumber, paths: paths) else {
-            throw TranscriptionCoordinatorError.jobNotFound(sequenceNumber: sequenceNumber)
-        }
-        guard job.state == .queued else {
-            throw TranscriptionCoordinatorError.jobNotClaimable(sequenceNumber: sequenceNumber, state: job.state)
-        }
-
-        let audioURL = paths.chunkAudioURL(fileName: job.source.chunkFileName)
-        guard FileManager.default.fileExists(atPath: audioURL.path) else {
-            var missing = job
-            missing.state = .failed
-            missing.currentAttemptID = nil
-            missing.lastFailure = TranscriptionFailure(
-                category: .sourceMissing,
-                message: "Source audio file \(job.source.chunkFileName) was not found before claiming.",
-                retryDisposition: .retryable,
-                failureDate: now(),
-                attemptNumber: job.attemptCount
-            )
-            missing.updatedDate = now()
-            try await store.replaceJob(missing, paths: paths)
-            throw TranscriptionCoordinatorError.sourceMissing(sequenceNumber: sequenceNumber)
-        }
-
         activeAttempts.insert(key)
 
-        var running = job
-        running.state = .running
-        running.currentAttemptID = makeAttemptID()
-        running.attemptCount += 1
-        running.updatedDate = now()
-
         do {
+            guard let job = try await store.loadJob(sequenceNumber: sequenceNumber, paths: paths) else {
+                throw TranscriptionCoordinatorError.jobNotFound(sequenceNumber: sequenceNumber)
+            }
+            guard job.state == .queued else {
+                throw TranscriptionCoordinatorError.jobNotClaimable(sequenceNumber: sequenceNumber, state: job.state)
+            }
+
+            let audioURL = paths.chunkAudioURL(fileName: job.source.chunkFileName)
+            guard FileManager.default.fileExists(atPath: audioURL.path) else {
+                var missing = job
+                missing.state = .failed
+                missing.currentAttemptID = nil
+                missing.lastFailure = TranscriptionFailure(
+                    category: .sourceMissing,
+                    message: "Source audio file \(job.source.chunkFileName) was not found before claiming.",
+                    retryDisposition: .retryable,
+                    failureDate: now(),
+                    attemptNumber: job.attemptCount
+                )
+                missing.updatedDate = now()
+                try await store.replaceJob(missing, paths: paths)
+                throw TranscriptionCoordinatorError.sourceMissing(sequenceNumber: sequenceNumber)
+            }
+
+            var running = job
+            running.state = .running
+            running.currentAttemptID = makeAttemptID()
+            running.attemptCount += 1
+            running.updatedDate = now()
             try await store.replaceJob(running, paths: paths)
+            return running
         } catch {
             activeAttempts.remove(key)
             throw error
         }
-        return running
     }
 
     /// Commits `output` as an immutable result and transitions the job to
@@ -354,7 +372,22 @@ actor TranscriptionCoordinator {
             completed.state = .completed
             completed.currentAttemptID = nil
             completed.updatedDate = now()
-            try await store.replaceJob(completed, paths: paths)
+            do {
+                try await store.replaceJob(completed, paths: paths)
+            } catch {
+                // The result is already durably committed at this point.
+                // A failure persisting the job's own completed-state
+                // transition must not be reclassified as a transcription
+                // failure by processJob's generic catch-all — that would
+                // silently orphan an already-successful result behind a
+                // job marked `.failed(.unknown, .permanent)`. Leave the
+                // job exactly as reconciliation expects to find it —
+                // `.running` with this attempt still current — by
+                // surfacing the same durability-uncertain signal already
+                // used one case below for the sibling filesystem-level
+                // outcome.
+                throw TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: sequenceNumber)
+            }
             return completed
         case .committedDurabilityUncertain:
             throw TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: sequenceNumber)

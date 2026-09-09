@@ -287,4 +287,161 @@ final class TranscriptionStoreTests: XCTestCase {
         let results = try await store.loadAllJobArtifacts(paths: paths)
         XCTAssertEqual(results.count, 0)
     }
+
+    // MARK: - commitResult integrity-error cases for an existing result file
+
+    func testCommitResultReportsIntegrityErrorForCorruptExistingResultWithoutTouchingIt() async throws {
+        let store = TranscriptionStore()
+        try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
+        let url = paths.resultURL(sequenceNumber: 0)
+        try Data("not json".utf8).write(to: url)
+
+        let outcome = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
+        guard case .integrityError = outcome else {
+            return XCTFail("Expected .integrityError, got \(outcome)")
+        }
+
+        let stillThere = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(stillThere, "not json")
+    }
+
+    func testCommitResultReportsIntegrityErrorForIdentityMismatchedExistingResultWithoutTouchingIt() async throws {
+        let store = TranscriptionStore()
+        try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
+        let url = paths.resultURL(sequenceNumber: 0)
+        // A validly-encoded result, but for a different sequence number --
+        // its decoded identity does not match the path it's found at.
+        let mismatched = makeResult(sequenceNumber: 7)
+        try AtomicFileWriter.defaultEncoder.encode(mismatched).write(to: url)
+
+        let outcome = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
+        guard case .integrityError = outcome else {
+            return XCTFail("Expected .integrityError, got \(outcome)")
+        }
+
+        let reloadedRaw = try Data(contentsOf: url)
+        let reloadedMismatched = try AtomicFileWriter.defaultDecoder.decode(TranscriptResult.self, from: reloadedRaw)
+        XCTAssertEqual(reloadedMismatched.source.chunkSequenceNumber, 7)
+    }
+
+    // MARK: - Partial-tolerant bulk enumeration: remaining inconsistency categories
+
+    func testLoadAllJobArtifactsReportsUnsupportedSchemaWhileContinuingWithValidJobs() async throws {
+        let store = TranscriptionStore()
+        _ = try await store.createJobIfAbsent(makeJob(sequenceNumber: 0), paths: paths)
+
+        try FileManager.default.createDirectory(at: paths.jobsDirectory, withIntermediateDirectories: true)
+        var futureJob = makeJob(sequenceNumber: 1)
+        futureJob.schemaVersion = 999
+        try AtomicFileWriter.defaultEncoder.encode(futureJob).write(to: paths.jobURL(sequenceNumber: 1))
+
+        _ = try await store.createJobIfAbsent(makeJob(sequenceNumber: 2), paths: paths)
+
+        let results = try await store.loadAllJobArtifacts(paths: paths)
+        XCTAssertEqual(results.count, 3)
+
+        var successCount = 0
+        for result in results {
+            switch result {
+            case .success:
+                successCount += 1
+            case .failure(let seq, let inconsistency):
+                XCTAssertEqual(seq, 1)
+                guard case .unsupportedJobSchema(_, let version) = inconsistency else {
+                    return XCTFail("Expected .unsupportedJobSchema, got \(inconsistency)")
+                }
+                XCTAssertEqual(version, 999)
+            }
+        }
+        XCTAssertEqual(successCount, 2)
+    }
+
+    func testLoadAllResultArtifactsReportsUnsupportedSchemaWhileContinuing() async throws {
+        let store = TranscriptionStore()
+        _ = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
+
+        try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
+        var futureResult = makeResult(sequenceNumber: 1)
+        futureResult.schemaVersion = 999
+        try AtomicFileWriter.defaultEncoder.encode(futureResult).write(to: paths.resultURL(sequenceNumber: 1))
+
+        _ = try await store.commitResult(makeResult(sequenceNumber: 2), paths: paths)
+
+        let results = try await store.loadAllResultArtifacts(paths: paths)
+        XCTAssertEqual(results.count, 3)
+
+        var successCount = 0
+        for result in results {
+            switch result {
+            case .success:
+                successCount += 1
+            case .failure(let seq, let inconsistency):
+                XCTAssertEqual(seq, 1)
+                guard case .unsupportedResultSchema(_, let version) = inconsistency else {
+                    return XCTFail("Expected .unsupportedResultSchema, got \(inconsistency)")
+                }
+                XCTAssertEqual(version, 999)
+            }
+        }
+        XCTAssertEqual(successCount, 2)
+    }
+
+    func testLoadAllResultArtifactsIsPartialTolerantAcrossCorruptAndValidResults() async throws {
+        let store = TranscriptionStore()
+        _ = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
+
+        try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
+        try Data("not json".utf8).write(to: paths.resultURL(sequenceNumber: 1))
+
+        _ = try await store.commitResult(makeResult(sequenceNumber: 2), paths: paths)
+
+        let results = try await store.loadAllResultArtifacts(paths: paths)
+        XCTAssertEqual(results.count, 3)
+
+        var successCount = 0
+        var failureCount = 0
+        for result in results {
+            switch result {
+            case .success:
+                successCount += 1
+            case .failure(let seq, let inconsistency):
+                failureCount += 1
+                XCTAssertEqual(seq, 1)
+                guard case .corruptResult = inconsistency else {
+                    return XCTFail("Expected .corruptResult, got \(inconsistency)")
+                }
+            }
+        }
+        XCTAssertEqual(successCount, 2)
+        XCTAssertEqual(failureCount, 1)
+    }
+
+    func testLoadAllResultArtifactsReportsIdentityMismatchWhileContinuing() async throws {
+        let store = TranscriptionStore()
+        _ = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
+
+        try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
+        // A validly-encoded result for sequence 9, placed at sequence 1's path.
+        let mismatched = makeResult(sequenceNumber: 9)
+        try AtomicFileWriter.defaultEncoder.encode(mismatched).write(to: paths.resultURL(sequenceNumber: 1))
+
+        _ = try await store.commitResult(makeResult(sequenceNumber: 2), paths: paths)
+
+        let results = try await store.loadAllResultArtifacts(paths: paths)
+        XCTAssertEqual(results.count, 3)
+
+        var successCount = 0
+        for result in results {
+            switch result {
+            case .success:
+                successCount += 1
+            case .failure(let seq, let inconsistency):
+                XCTAssertEqual(seq, 1)
+                guard case .jobResultIdentityMismatch = inconsistency else {
+                    return XCTFail("Expected .jobResultIdentityMismatch, got \(inconsistency)")
+                }
+            }
+        }
+        XCTAssertEqual(successCount, 2)
+    }
 }

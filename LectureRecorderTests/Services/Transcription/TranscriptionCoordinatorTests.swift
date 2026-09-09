@@ -594,4 +594,250 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         guard case .failed = segments[1].state else { return XCTFail("expected failed at 1") }
         guard case .completed = segments[2].state else { return XCTFail("expected completed at 2") }
     }
+
+    // MARK: - Genuine concurrent claim race (regression for the check-then-act
+    // reentrancy bug: `activeAttempts.insert` used to happen only after the
+    // `await store.loadJob` suspension, so two truly concurrent calls could
+    // both pass the "already claimed" guard before either reserved the key)
+
+    func testConcurrentProcessJobCallsOnSameCoordinatorRefuseTheSecondAndTranscribeOnlyOnce() async throws {
+        let realStore = TranscriptionStore()
+        let gatedStore = GatedTranscriptionStore(wrapped: realStore)
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: gatedStore, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        await gatedStore.armGate(forSequenceNumber: 0)
+
+        let firstTask = Task {
+            try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+        }
+
+        // Prove real overlap: wait until the first call is genuinely
+        // suspended inside `store.loadJob` before starting the second.
+        while await !gatedStore.hasEnteredGate {
+            await Task.yield()
+        }
+
+        let secondTask = Task {
+            try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+        }
+
+        // The second call must resolve to a refusal on its own, without
+        // the gate ever being released — proving the refusal happened
+        // synchronously against the first call's already-reserved key,
+        // not merely after the first call eventually finished.
+        do {
+            _ = try await secondTask.value
+            XCTFail("Expected the second concurrent call to be refused")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .alreadyClaimedByThisCoordinator = error else {
+                return XCTFail("Expected alreadyClaimedByThisCoordinator, got \(error)")
+            }
+        }
+
+        await gatedStore.release()
+        let completed = try await firstTask.value
+
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertEqual(transcriber.recordedCalls.count, 1)
+
+        let finalJob = try await realStore.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(finalJob?.attemptCount, 1)
+
+        let result = try await realStore.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertNotNil(result)
+    }
+
+    // MARK: - Failure-window persistence tests (using `FailingTranscriptionStore`)
+
+    func testClaimJobFailurePersistingRunningLeavesJobQueuedTranscriberNotInvokedAndReleasesOwnership() async throws {
+        let realStore = TranscriptionStore()
+        let failingStore = FailingTranscriptionStore(wrapped: realStore)
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: failingStore, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        await failingStore.setReplaceJobFailureQueue([true])
+
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected the injected replaceJob failure to propagate")
+        } catch is FailingTranscriptionStore.TestInjectedError {
+            // expected
+        }
+
+        XCTAssertEqual(transcriber.recordedCalls.count, 0)
+
+        let job = try await realStore.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(job?.state, .queued)
+        XCTAssertEqual(job?.attemptCount, 0)
+
+        // A later call, once the store is healthy again, must be able to
+        // claim and process the job normally — proving the failed attempt
+        // above did not leak `activeAttempts` ownership.
+        let completedJob = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(completedJob.state, .completed)
+        XCTAssertEqual(transcriber.recordedCalls.count, 1)
+    }
+
+    func testCompleteJobPersistenceFailureAfterCommitLeavesJobRunningAndReconciliationCompletesIt() async throws {
+        let realStore = TranscriptionStore()
+        let failingStore = FailingTranscriptionStore(wrapped: realStore)
+        let attemptID = UUID()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: failingStore, transcriber: transcriber, makeAttemptID: { attemptID })
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        // First replaceJob (claimJob's queued -> running) succeeds; the
+        // second (completeJob's running -> completed, reached only after
+        // commitResult has already durably succeeded) fails.
+        await failingStore.setReplaceJobFailureQueue([false, true])
+
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected commitDurabilityUncertain")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .commitDurabilityUncertain = error else {
+                return XCTFail("Expected commitDurabilityUncertain, got \(error)")
+            }
+        }
+
+        // The immutable result really was committed and must remain
+        // present, untouched, and correctly attributed.
+        let result = try await realStore.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertNotNil(result)
+        XCTAssertEqual(result?.attemptID, attemptID)
+
+        // The job's own durable state was never advanced past .running
+        // (the failed write never landed).
+        let job = try await realStore.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(job?.state, .running)
+        XCTAssertEqual(job?.currentAttemptID, attemptID)
+
+        // This coordinator's in-memory claim was released, not leaked --
+        // proven by getting `jobNotClaimable` (the durable state check)
+        // rather than `alreadyClaimedByThisCoordinator` (the in-memory
+        // ownership check) on a same-instance retry.
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected jobNotClaimable")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .jobNotClaimable = error else {
+                return XCTFail("Expected jobNotClaimable, got \(error)")
+            }
+        }
+
+        // A fresh coordinator instance, with no in-memory activeAttempts
+        // of its own, must reconcile this into .completed using the
+        // matching-attempt result already durably on disk.
+        let freshCoordinator = makeCoordinator(store: realStore)
+        let report = try await freshCoordinator.reconcileState(paths: artifactPaths)
+        let reconciled = report.jobs.first { $0.source.chunkSequenceNumber == 0 }
+        XCTAssertEqual(reconciled?.state, .completed)
+    }
+
+    func testCancellationPersistenceFailureStillRethrowsAndLeavesAbandonedRunningAttemptForReconciliation() async throws {
+        let realStore = TranscriptionStore()
+        let failingStore = FailingTranscriptionStore(wrapped: realStore)
+        let transcriber = CancellationAwareFakeTranscriber()
+        transcriber.armGate()
+        let coordinator = makeCoordinator(store: failingStore, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        // First replaceJob (queued -> running) succeeds; the second
+        // (failJob's running -> failed, on the cancellation path) fails.
+        await failingStore.setReplaceJobFailureQueue([false, true])
+
+        let task = Task {
+            try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+        }
+
+        while !transcriber.hasEnteredGate {
+            await Task.yield()
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // Cancellation must still rethrow even though the durable
+            // failure-persistence write below it failed.
+        }
+
+        let result = try await realStore.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertNil(result)
+
+        let job = try await realStore.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(job?.state, .running)
+
+        // Ownership was released on the original coordinator, not leaked
+        // — proven the same way as above (jobNotClaimable, not
+        // alreadyClaimedByThisCoordinator).
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected jobNotClaimable")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .jobNotClaimable = error else {
+                return XCTFail("Expected jobNotClaimable, got \(error)")
+            }
+        }
+
+        let freshCoordinator = makeCoordinator(store: realStore)
+        let report = try await freshCoordinator.reconcileState(paths: artifactPaths)
+        let reconciled = report.jobs.first { $0.source.chunkSequenceNumber == 0 }
+        XCTAssertEqual(reconciled?.state, .failed)
+        XCTAssertEqual(reconciled?.lastFailure?.category, .abandonedRunningAttempt)
+        XCTAssertEqual(reconciled?.lastFailure?.retryDisposition, .retryable)
+    }
+
+    func testProcessJobLeavesJobRunningOnCommitDurabilityUncertainAndReconciliationCompletesIt() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        let attemptID = UUID()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, makeAttemptID: { attemptID })
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        // Simulate the real crash window: the exclusive rename genuinely
+        // succeeded (a valid result carrying this attempt's identity
+        // really is on disk), but the containing-directory fsync could
+        // not be confirmed. The spy is forced to report
+        // `.createdDurabilityUncertain` without touching disk itself, so
+        // this pre-written file stands in for "the rename already
+        // happened."
+        let resultURL = artifactPaths.resultURL(sequenceNumber: 0)
+        let precommitted = makeResult(sequenceNumber: 0, attemptID: attemptID)
+        try FileManager.default.createDirectory(at: artifactPaths.resultsDirectory, withIntermediateDirectories: true)
+        try AtomicFileWriter.defaultEncoder.encode(precommitted).write(to: resultURL)
+        spy.forceResult(.success(.createdDurabilityUncertain), forURL: resultURL)
+
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected commitDurabilityUncertain")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .commitDurabilityUncertain = error else {
+                return XCTFail("Expected commitDurabilityUncertain, got \(error)")
+            }
+        }
+
+        let job = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(job?.state, .running)
+        XCTAssertEqual(job?.currentAttemptID, attemptID)
+
+        do {
+            _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("Expected jobNotClaimable (proving activeAttempts ownership was released, not leaked)")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .jobNotClaimable = error else {
+                return XCTFail("Expected jobNotClaimable, got \(error)")
+            }
+        }
+
+        let freshCoordinator = makeCoordinator(store: store)
+        let report = try await freshCoordinator.reconcileState(paths: artifactPaths)
+        let reconciled = report.jobs.first { $0.source.chunkSequenceNumber == 0 }
+        XCTAssertEqual(reconciled?.state, .completed)
+    }
 }
