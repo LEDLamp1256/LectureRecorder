@@ -10,6 +10,17 @@ import AVFoundation
 import Foundation
 import OSLog
 
+/// The outcome of a chunk finalization durability failure, distinguishing a
+/// structured Stage 1 `ChunkDurabilityFailure` (preserved intact, including
+/// its stage and errno information) from any other, unexpected error a
+/// `ChunkFinalizationFileSystem` conformer might throw. `ChunkRenameCollision`
+/// is deliberately never represented here — it always maps to
+/// `AudioChunkWriterError.chunkFileAlreadyExists` instead, never to this type.
+nonisolated enum AudioChunkFinalizationFailure: Sendable {
+    case durability(ChunkDurabilityFailure)
+    case unexpected(String)
+}
+
 nonisolated enum AudioChunkWriterError: LocalizedError, Sendable {
     case invalidChunkDuration(Double)
     case unsupportedFormat(String)
@@ -18,6 +29,15 @@ nonisolated enum AudioChunkWriterError: LocalizedError, Sendable {
     case writeFailed(sequenceNumber: Int, underlying: String)
     case renameFailed(sequenceNumber: Int, from: URL, to: URL, underlying: String)
     case bufferFormatMismatch(expected: String, actual: String)
+    /// A chunk's file-sync, atomic rename, or directory-sync durability
+    /// operation failed after its `AVAudioFile` was already closed.
+    /// `recoveryURL` is the writer's own determination of which artifact is
+    /// recoverable — the partial file for a file-sync or rename failure, or
+    /// the canonical file for a directory-sync failure (which occurs only
+    /// after a successful rename) — and is not simply copied from a
+    /// structured `ChunkDurabilityFailure.path`, since that path is the
+    /// directory itself for directory-sync failures.
+    case chunkFinalizationFailed(sequenceNumber: Int, recoveryURL: URL, failure: AudioChunkFinalizationFailure)
 
     var errorDescription: String? {
         switch self {
@@ -35,6 +55,13 @@ nonisolated enum AudioChunkWriterError: LocalizedError, Sendable {
             return "Failed to rename chunk #\(seq) from \(from.lastPathComponent) to \(to.lastPathComponent): \(underlying)"
         case .bufferFormatMismatch(let expected, let actual):
             return "Captured buffer format (\(actual)) does not match the writer's negotiated format (\(expected))"
+        case .chunkFinalizationFailed(let seq, let url, let failure):
+            switch failure {
+            case .durability(let durabilityFailure):
+                return "Failed to durably finalize chunk #\(seq) (recoverable at \(url.lastPathComponent)) during \(durabilityFailure.stage.rawValue): \(durabilityFailure.primaryMessage) (errno \(durabilityFailure.primaryErrno))"
+            case .unexpected(let description):
+                return "Failed to durably finalize chunk #\(seq) (recoverable at \(url.lastPathComponent)): unexpected error — \(description)"
+            }
         }
     }
 
@@ -43,7 +70,8 @@ nonisolated enum AudioChunkWriterError: LocalizedError, Sendable {
         case .chunkFileAlreadyExists(let seq, _),
              .unableToCreateChunkFile(let seq, _, _),
              .writeFailed(let seq, _),
-             .renameFailed(let seq, _, _, _):
+             .renameFailed(let seq, _, _, _),
+             .chunkFinalizationFailed(let seq, _, _):
             return seq
         case .invalidChunkDuration, .unsupportedFormat, .bufferFormatMismatch:
             return nil
@@ -59,17 +87,31 @@ private struct UnsafeSendableBuffer: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
 }
 
+/// The state of whatever chunk file is currently owned by the writer,
+/// replacing a pair of independently-nilable `AVAudioFile?`/`URL?` fields
+/// (which could not by themselves distinguish "closed but not yet synced"
+/// from "renamed but not yet directory-synced") with an explicit enum that
+/// makes those recovery windows — and their correct recovery URL —
+/// unambiguous. Mirrors the explicit-state-enum pattern already used by
+/// `AudioCaptureService.CycleState`.
+private enum InFlightChunk {
+    case none
+    case writing(file: AVAudioFile, partialURL: URL)
+    case finalizingPartial(partialURL: URL)
+    case pendingDirectorySync(canonicalURL: URL)
+}
+
 nonisolated final class AudioChunkWriter: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.lecturerecorder.audiochunkwriter")
     private let chunksDirectory: URL
     private let format: AVAudioFormat
     private let framesPerChunk: Int
+    private let chunkFinalizationFileSystem: any ChunkFinalizationFileSystem
     private let continuation: AsyncThrowingStream<ChunkEvent, Error>.Continuation
 
     let events: AsyncThrowingStream<ChunkEvent, Error>
 
-    private var currentFile: AVAudioFile?
-    private var currentPartialURL: URL?
+    private var inFlightChunk: InFlightChunk = .none
     private var currentSequenceNumber = 0
     private var framesInCurrentChunk = 0
     private var cumulativeFramesBeforeCurrentChunk: Int64 = 0
@@ -78,7 +120,8 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
     init(
         chunksDirectory: URL,
         format: AVAudioFormat,
-        targetChunkDurationSeconds: Double
+        targetChunkDurationSeconds: Double,
+        chunkFinalizationFileSystem: any ChunkFinalizationFileSystem
     ) throws {
         guard format.commonFormat == .pcmFormatFloat32, !format.isInterleaved else {
             throw AudioChunkWriterError.unsupportedFormat(
@@ -96,6 +139,7 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         self.chunksDirectory = chunksDirectory
         self.format = format
         self.framesPerChunk = computedFramesPerChunk
+        self.chunkFinalizationFileSystem = chunkFinalizationFileSystem
 
         var continuation: AsyncThrowingStream<ChunkEvent, Error>.Continuation!
         self.events = AsyncThrowingStream<ChunkEvent, Error>(bufferingPolicy: .unbounded) { cont in
@@ -171,14 +215,16 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
     }
 
     private func writeSegment(_ segment: ChunkBoundaryPlanner.Segment, from buffer: AVAudioPCMBuffer) throws {
-        if currentFile == nil {
-            try openNewChunkFile(sequenceNumber: segment.chunkSequenceNumber)
-        }
-
-        guard let file = currentFile else {
+        let file: AVAudioFile
+        switch inFlightChunk {
+        case .none:
+            file = try openNewChunkFile(sequenceNumber: segment.chunkSequenceNumber)
+        case .writing(let existingFile, _):
+            file = existingFile
+        case .finalizingPartial, .pendingDirectorySync:
             throw AudioChunkWriterError.writeFailed(
                 sequenceNumber: segment.chunkSequenceNumber,
-                underlying: "No open file after openNewChunkFile succeeded — internal inconsistency."
+                underlying: "writeSegment called while a previous chunk was still finalizing — internal inconsistency."
             )
         }
 
@@ -220,7 +266,8 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         }
     }
 
-    private func openNewChunkFile(sequenceNumber: Int) throws {
+    @discardableResult
+    private func openNewChunkFile(sequenceNumber: Int) throws -> AVAudioFile {
         let url = partialURL(for: sequenceNumber)
         guard !FileManager.default.fileExists(atPath: url.path) else {
             throw AudioChunkWriterError.chunkFileAlreadyExists(sequenceNumber: sequenceNumber, url: url)
@@ -233,9 +280,9 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
                 commonFormat: format.commonFormat,
                 interleaved: format.isInterleaved
             )
-            currentFile = file
-            currentPartialURL = url
+            inFlightChunk = .writing(file: file, partialURL: url)
             Log.audio.debug("Opened chunk file #\(sequenceNumber, privacy: .public): \(url.lastPathComponent, privacy: .public)")
+            return file
         } catch {
             throw AudioChunkWriterError.unableToCreateChunkFile(
                 sequenceNumber: sequenceNumber,
@@ -245,32 +292,63 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         }
     }
 
+    /// Finalizes the currently-open chunk through the full durability
+    /// sequence: close the `AVAudioFile`, synchronize the completed
+    /// `.partial` file to stable storage, atomically (non-replacingly)
+    /// rename it to its canonical name, and synchronize the containing
+    /// directory so the rename itself survives a crash. `.finalized` is
+    /// yielded, and `cumulativeFramesBeforeCurrentChunk`/`inFlightChunk`'s
+    /// success state advance, only after all three durability operations —
+    /// not just the rename — have returned successfully. Every durability
+    /// call happens on this writer's own private serial `queue`, never on
+    /// the caller of `acceptBuffer`/`finishRecording` or any real-time
+    /// audio callback thread.
+    ///
+    /// A collision on rename (`ChunkRenameCollision`) is kept distinct from
+    /// every other durability failure and maps to the existing
+    /// `.chunkFileAlreadyExists` error, carrying the canonical destination
+    /// URL — the colliding path, not this writer's recoverable artifact.
+    /// Every other failure (a real `ChunkDurabilityFailure`, or any other
+    /// unexpected error a `ChunkFinalizationFileSystem` conformer might
+    /// throw) maps to `.chunkFinalizationFailed`, carrying this writer's own
+    /// determination of the correct recovery URL — the partial file for a
+    /// file-sync or non-collision rename failure, or the canonical file for
+    /// a directory-sync failure, since that failure occurs only after the
+    /// rename already succeeded.
     private func finalizeCurrentChunk() throws {
-        guard let file = currentFile, let partialURL = currentPartialURL else { return }
+        guard case .writing(let file, let partialURL) = inFlightChunk else { return }
 
         let sequenceNumber = currentSequenceNumber
         let frameCount = framesInCurrentChunk
 
         file.close()
-        currentFile = nil
-
-        let canonicalURL = canonicalChunkURL(for: sequenceNumber)
-        guard !FileManager.default.fileExists(atPath: canonicalURL.path) else {
-            throw AudioChunkWriterError.chunkFileAlreadyExists(
-                sequenceNumber: sequenceNumber,
-                url: canonicalURL
-            )
-        }
+        inFlightChunk = .finalizingPartial(partialURL: partialURL)
 
         do {
-            try FileManager.default.moveItem(at: partialURL, to: canonicalURL)
+            try chunkFinalizationFileSystem.synchronizeFile(at: partialURL)
         } catch {
-            throw AudioChunkWriterError.renameFailed(
+            throw mapFinalizationError(error, sequenceNumber: sequenceNumber, recoveryURL: partialURL)
+        }
+
+        let canonicalURL = canonicalChunkURL(for: sequenceNumber)
+
+        do {
+            try chunkFinalizationFileSystem.rename(from: partialURL, to: canonicalURL)
+        } catch let collision as ChunkRenameCollision {
+            throw AudioChunkWriterError.chunkFileAlreadyExists(
                 sequenceNumber: sequenceNumber,
-                from: partialURL,
-                to: canonicalURL,
-                underlying: error.localizedDescription
+                url: collision.destination
             )
+        } catch {
+            throw mapFinalizationError(error, sequenceNumber: sequenceNumber, recoveryURL: partialURL)
+        }
+
+        inFlightChunk = .pendingDirectorySync(canonicalURL: canonicalURL)
+
+        do {
+            try chunkFinalizationFileSystem.synchronizeDirectory(at: chunksDirectory)
+        } catch {
+            throw mapFinalizationError(error, sequenceNumber: sequenceNumber, recoveryURL: canonicalURL)
         }
 
         let metadata = ChunkMetadata(
@@ -283,7 +361,7 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         )
 
         cumulativeFramesBeforeCurrentChunk += Int64(frameCount)
-        currentPartialURL = nil
+        inFlightChunk = .none
 
         Log.audio.info(
             "Finalized chunk #\(sequenceNumber, privacy: .public): \(metadata.fileName, privacy: .public) (\(frameCount, privacy: .public) frames)"
@@ -291,8 +369,33 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         yield(.finalized(metadata))
     }
 
+    /// Maps any thrown error other than `ChunkRenameCollision` (handled
+    /// separately at its own call site) into `.chunkFinalizationFailed`. A
+    /// structured Stage 1 `ChunkDurabilityFailure` is preserved intact so
+    /// its stage/errno information is never lost; any other, unexpected
+    /// error from a `ChunkFinalizationFileSystem` conformer is captured by
+    /// description rather than silently dropped or misreported as a
+    /// durability failure it did not actually produce.
+    private func mapFinalizationError(
+        _ error: Error,
+        sequenceNumber: Int,
+        recoveryURL: URL
+    ) -> AudioChunkWriterError {
+        let failure: AudioChunkFinalizationFailure
+        if let durabilityFailure = error as? ChunkDurabilityFailure {
+            failure = .durability(durabilityFailure)
+        } else {
+            failure = .unexpected(String(describing: error))
+        }
+        return .chunkFinalizationFailed(
+            sequenceNumber: sequenceNumber,
+            recoveryURL: recoveryURL,
+            failure: failure
+        )
+    }
+
     private func finalizeOnStop() {
-        guard currentFile != nil else {
+        guard case .writing = inFlightChunk else {
             continuation.finish()
             return
         }
@@ -305,18 +408,40 @@ nonisolated final class AudioChunkWriter: @unchecked Sendable {
         }
     }
 
+    /// Terminates the writer after any failure — a write-time failure while
+    /// a chunk is still open, or a finalization-stage failure after its
+    /// file was already closed. Recovery logging is driven by
+    /// `inFlightChunk` rather than a `currentFile != nil` check, so it
+    /// remains correct (and never silent) across every recovery window:
+    /// mid-write (file still open, must be closed exactly once here),
+    /// mid-finalization before rename succeeds (file already closed;
+    /// partial file is the recoverable artifact), and after a successful
+    /// rename but before directory sync completes (canonical file is the
+    /// recoverable artifact; its directory-entry durability is unconfirmed,
+    /// not lost).
     private func fail(with error: Error) {
         Log.audio.error("AudioChunkWriter failing: \(error.localizedDescription, privacy: .public)")
         hasFinished = true
 
-        if currentFile != nil {
-            currentFile?.close()
+        switch inFlightChunk {
+        case .none:
+            break
+        case .writing(let file, let partialURL):
+            file.close()
             Log.audio.error(
-                "Preserving interrupted partial chunk for recovery: \(self.currentPartialURL?.lastPathComponent ?? "unknown", privacy: .public)"
+                "Preserving interrupted partial chunk for recovery: \(partialURL.lastPathComponent, privacy: .public)"
+            )
+        case .finalizingPartial(let partialURL):
+            Log.audio.error(
+                "Preserving interrupted partial chunk for recovery: \(partialURL.lastPathComponent, privacy: .public)"
+            )
+        case .pendingDirectorySync(let canonicalURL):
+            Log.audio.error(
+                "Chunk was renamed to its canonical name but directory synchronization did not complete — its directory-entry durability across an unclean shutdown is unconfirmed. Preserving for recovery: \(canonicalURL.lastPathComponent, privacy: .public)"
             )
         }
 
-        currentFile = nil
+        inFlightChunk = .none
         continuation.finish(throwing: error)
     }
 
