@@ -1,0 +1,472 @@
+import Darwin
+import Foundation
+
+// LectureRecorderWorkerFixture: a deterministic, argument-driven fake
+// worker used only by T2's own tests. It never invokes a shell, never
+// selects another executable, never touches the network, the microphone,
+// or a model — it only implements the fixed set of modes below, selected
+// by a `--mode=<name>` argument. Everything else about how it is launched
+// (executable path, environment, working directory) is decided entirely
+// by the caller (`FoundationProcessRunner`), never by this process itself.
+
+struct ParsedArguments {
+    var mode: String
+    var delayMilliseconds: Int
+    var sourcePath: String?
+    var readyFilePath: String?
+}
+
+/// Signals readiness to an external test by creating an empty file at a
+/// test-supplied path — an out-of-band channel independent of stdout/
+/// stderr, which `FoundationProcessRunner` only exposes as a single,
+/// fully-captured `Data` once the pipe reaches EOF (i.e., not observable
+/// live while the child is still running). Polling for this file's
+/// existence lets a test wait for a genuine interleaving point (e.g.,
+/// "the SIGTERM-ignore handler is installed") without expanding
+/// `FoundationProcessRunner`'s production API and without substituting an
+/// arbitrary sleep as proof of the intended ordering.
+func announceReady(at path: String?) {
+    guard let path else { return }
+    FileManager.default.createFile(atPath: path, contents: Data())
+}
+
+func parseArguments() -> ParsedArguments {
+    var mode = "success"
+    var delayMilliseconds = 300
+    var sourcePath: String?
+    var readyFilePath: String?
+
+    for argument in CommandLine.arguments.dropFirst() {
+        if argument.hasPrefix("--mode=") {
+            mode = String(argument.dropFirst("--mode=".count))
+        } else if argument.hasPrefix("--delay-ms=") {
+            delayMilliseconds = Int(argument.dropFirst("--delay-ms=".count)) ?? delayMilliseconds
+        } else if argument.hasPrefix("--source-path=") {
+            sourcePath = String(argument.dropFirst("--source-path=".count))
+        } else if argument.hasPrefix("--ready-file=") {
+            readyFilePath = String(argument.dropFirst("--ready-file=".count))
+        }
+    }
+
+    return ParsedArguments(mode: mode, delayMilliseconds: delayMilliseconds, sourcePath: sourcePath, readyFilePath: readyFilePath)
+}
+
+func readAllStdin() -> Data {
+    FileHandle.standardInput.readDataToEndOfFile()
+}
+
+func writeStdout(_ data: Data) {
+    FileHandle.standardOutput.write(data)
+}
+
+func writeStderr(_ data: Data) {
+    FileHandle.standardError.write(data)
+}
+
+func decodeRequest(_ data: Data) -> FixtureRequestEnvelope? {
+    try? JSONDecoder().decode(FixtureRequestEnvelope.self, from: data)
+}
+
+func encode(_ envelope: FixtureResponseEnvelope) -> Data {
+    (try? JSONEncoder().encode(envelope)) ?? Data()
+}
+
+/// Builds a response that matches `request`'s identity exactly, unless one
+/// of the `mismatch*` flags asks this fixture to deliberately corrupt a
+/// specific identity field — used to exercise the worker client's identity
+/// validation from the other side of a real process boundary.
+func makeMatchingResponse(
+    for request: FixtureRequestEnvelope,
+    schemaVersion: Int = FixtureProtocolConstants.currentSchemaVersion,
+    mismatchRequestID: Bool = false,
+    mismatchAttemptID: Bool = false,
+    mismatchSessionID: Bool = false,
+    mismatchChunkSequence: Bool = false,
+    mismatchSourceIdentity: Bool = false,
+    wrongWorkerIdentifier: Bool = false,
+    outcome: FixtureOutcome = .success,
+    outputText: String = "fixture transcript",
+    failureMessage: String = "fixture declared failure"
+) -> FixtureResponseEnvelope {
+    FixtureResponseEnvelope(
+        schemaVersion: schemaVersion,
+        requestID: mismatchRequestID ? UUID() : request.requestID,
+        attemptID: mismatchAttemptID ? UUID() : request.attemptID,
+        sessionID: mismatchSessionID ? UUID() : request.sessionID,
+        chunkSequenceNumber: mismatchChunkSequence ? request.chunkSequenceNumber + 1 : request.chunkSequenceNumber,
+        sourceIdentity: mismatchSourceIdentity ? request.sourceIdentity + "-corrupted" : request.sourceIdentity,
+        workerIdentifier: wrongWorkerIdentifier ? "not-\(FixtureProtocolConstants.workerIdentifier)" : FixtureProtocolConstants.workerIdentifier,
+        workerVersion: FixtureProtocolConstants.workerVersion,
+        outcome: outcome,
+        output: outcome == .success ? FixtureOutput(text: outputText) : nil,
+        failure: outcome == .failure ? FixtureDeclaredFailure(message: failureMessage) : nil
+    )
+}
+
+func largeFillerText(approximateByteCount: Int) -> String {
+    String(repeating: "A", count: approximateByteCount)
+}
+
+// MARK: - Mode dispatch
+
+let arguments = parseArguments()
+
+switch arguments.mode {
+
+case "success":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else {
+        exit(1)
+    }
+    writeStdout(encode(makeMatchingResponse(for: request, outcome: .success)))
+    exit(0)
+
+case "failure":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else {
+        exit(1)
+    }
+    writeStdout(encode(makeMatchingResponse(for: request, outcome: .failure)))
+    exit(0)
+
+case "nonzero-no-response":
+    _ = readAllStdin()
+    exit(7)
+
+case "nonzero-with-success-json":
+    // Deliberately fails loudly (distinct exit 9) on decode/encode failure
+    // rather than silently writing nothing — this mode exists specifically
+    // to prove a nonzero exit overrides even well-formed JSON, so it must
+    // be indistinguishable from "no response" only when it actually failed
+    // to build one, never as an unnoticed silent fallback.
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(9) }
+    let responseData = encode(makeMatchingResponse(for: request, outcome: .success))
+    guard !responseData.isEmpty else { exit(9) }
+    writeStdout(responseData)
+    exit(7)
+
+case "empty-stdout":
+    // Also used, with a large raw stdin payload, to exercise pipe-capacity
+    // behavior at the process-runner layer without any JSON involved.
+    _ = readAllStdin()
+    exit(0)
+
+case "echo-stdin":
+    // Raw byte-level echo, no JSON involved — proves exact stdin bytes
+    // (including large payloads exceeding pipe capacity) survive the
+    // round trip unmodified.
+    writeStdout(readAllStdin())
+    exit(0)
+
+case "malformed-json":
+    _ = readAllStdin()
+    writeStdout(Data("{not valid json".utf8))
+    exit(0)
+
+case "truncated-json":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    var full = encode(makeMatchingResponse(for: request))
+    full = full.prefix(max(1, full.count / 2))
+    writeStdout(full)
+    exit(0)
+
+case "multiple-json-values":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    let one = encode(makeMatchingResponse(for: request))
+    writeStdout(one)
+    writeStdout(one)
+    exit(0)
+
+case "trailing-garbage":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request)))
+    writeStdout(Data(" not json garbage".utf8))
+    exit(0)
+
+case "unsupported-schema":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(
+        for: request,
+        schemaVersion: FixtureProtocolConstants.unsupportedSchemaVersion
+    )))
+    exit(0)
+
+case "mismatch-request-id":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, mismatchRequestID: true)))
+    exit(0)
+
+case "mismatch-attempt-id":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, mismatchAttemptID: true)))
+    exit(0)
+
+case "mismatch-session-id":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, mismatchSessionID: true)))
+    exit(0)
+
+case "mismatch-chunk-sequence":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, mismatchChunkSequence: true)))
+    exit(0)
+
+case "mismatch-source-identity":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, mismatchSourceIdentity: true)))
+    exit(0)
+
+case "wrong-worker-identity":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request, wrongWorkerIdentifier: true)))
+    exit(0)
+
+case "large-stdout":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    let filler = largeFillerText(approximateByteCount: 16 * 1024 * 1024)
+    writeStdout(encode(makeMatchingResponse(for: request, outputText: filler)))
+    exit(0)
+
+case "short-stderr-nonzero-exit":
+    // Short, non-empty, valid stderr paired with a nonzero exit — proves
+    // ordinary short diagnostics are rendered in full, untruncated.
+    _ = readAllStdin()
+    writeStderr(Data("boom: something went wrong".utf8))
+    exit(3)
+
+case "large-stderr-nonzero-exit":
+    // Large stderr paired with a nonzero exit, so the client classifies
+    // it as .processFailure — used to prove the resulting errorDescription
+    // stays bounded regardless of how much stderr was actually captured.
+    _ = readAllStdin()
+    writeStderr(Data(largeFillerText(approximateByteCount: 1 * 1024 * 1024).utf8))
+    exit(3)
+
+case "invalid-utf8-stderr-nonzero-exit":
+    // Invalid UTF-8 bytes on stderr, paired with a nonzero exit — proves
+    // the diagnostic preview never crashes on malformed byte sequences.
+    _ = readAllStdin()
+    writeStderr(Data([0xFF, 0xFE, 0xC0, 0x80, 0x41, 0x42, 0x43]))
+    exit(3)
+
+case "large-stderr":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStderr(Data(largeFillerText(approximateByteCount: 4 * 1024 * 1024).utf8))
+    writeStdout(encode(makeMatchingResponse(for: request)))
+    exit(0)
+
+case "large-both":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    let stdoutFiller = Data(largeFillerText(approximateByteCount: 16 * 1024 * 1024).utf8)
+    let stderrFiller = Data(largeFillerText(approximateByteCount: 4 * 1024 * 1024).utf8)
+    let chunkSize = 32 * 1024
+    var offset = 0
+    while offset < max(stdoutFiller.count, stderrFiller.count) {
+        let end = min(offset + chunkSize, stdoutFiller.count)
+        if offset < stdoutFiller.count {
+            writeStdout(stdoutFiller.subdata(in: offset..<end))
+        }
+        let sEnd = min(offset + chunkSize, stderrFiller.count)
+        if offset < stderrFiller.count {
+            writeStderr(stderrFiller.subdata(in: offset..<sEnd))
+        }
+        offset += chunkSize
+    }
+    writeStdout(encode(makeMatchingResponse(for: request)))
+    exit(0)
+
+case "delayed-response":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    Thread.sleep(forTimeInterval: Double(arguments.delayMilliseconds) / 1000.0)
+    writeStdout(encode(makeMatchingResponse(for: request)))
+    exit(0)
+
+case "respond-then-hang":
+    // Writes a fully valid, matching success response, then hangs — proves
+    // a complete response already sitting in the pipe is discarded once a
+    // fatal intervention (e.g. timeout) has already claimed the outcome.
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(9) }
+    writeStdout(encode(makeMatchingResponse(for: request, outcome: .success)))
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
+case "invalid-outcome-success-with-no-output":
+    // Hand-built JSON (bypassing the Codable struct, which cannot
+    // represent this invalid shape) — outcome:"success" with output:null.
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(9) }
+    let json = """
+    {"schemaVersion":\(FixtureProtocolConstants.currentSchemaVersion),"requestID":"\(request.requestID.uuidString)","attemptID":"\(request.attemptID.uuidString)","sessionID":"\(request.sessionID.uuidString)","chunkSequenceNumber":\(request.chunkSequenceNumber),"sourceIdentity":"\(request.sourceIdentity)","workerIdentifier":"\(FixtureProtocolConstants.workerIdentifier)","workerVersion":"\(FixtureProtocolConstants.workerVersion)","outcome":"success","output":null,"failure":null}
+    """
+    writeStdout(Data(json.utf8))
+    exit(0)
+
+case "invalid-outcome-both-present":
+    // Hand-built JSON: outcome:"success" with BOTH output and failure set.
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(9) }
+    let json = """
+    {"schemaVersion":\(FixtureProtocolConstants.currentSchemaVersion),"requestID":"\(request.requestID.uuidString)","attemptID":"\(request.attemptID.uuidString)","sessionID":"\(request.sessionID.uuidString)","chunkSequenceNumber":\(request.chunkSequenceNumber),"sourceIdentity":"\(request.sourceIdentity)","workerIdentifier":"\(FixtureProtocolConstants.workerIdentifier)","workerVersion":"\(FixtureProtocolConstants.workerVersion)","outcome":"success","output":{"text":"hi"},"failure":{"message":"also here"}}
+    """
+    writeStdout(Data(json.utf8))
+    exit(0)
+
+case "close-stdin-early-then-respond":
+    // Proves the fail-closed stdin rule at the raw process-runner layer:
+    // closes its read end immediately (never reads the real request, so
+    // it cannot know the real identity), then still writes a plausible,
+    // well-formed-looking response and exits 0. The runner must discard
+    // this — the caller supplies a large stdin payload so the write
+    // genuinely fails, and the overall outcome must be
+    // .stdinDeliveryFailed regardless of this stdout content.
+    close(0)
+    let placeholder = """
+    {"schemaVersion":1,"requestID":"00000000-0000-0000-0000-000000000000","attemptID":"00000000-0000-0000-0000-000000000000","sessionID":"00000000-0000-0000-0000-000000000000","chunkSequenceNumber":0,"sourceIdentity":"placeholder","workerIdentifier":"\(FixtureProtocolConstants.workerIdentifier)","workerVersion":"\(FixtureProtocolConstants.workerVersion)","outcome":"success","output":{"text":"should never be trusted"},"failure":null}
+    """
+    writeStdout(Data(placeholder.utf8))
+    exit(0)
+
+case "self-signal":
+    // Genuine, timeout/cancellation-independent signal death: the child
+    // kills itself immediately, unrelated to any runner-side escalation.
+    _ = readAllStdin()
+    raise(SIGABRT)
+    exit(1) // unreachable if raise() behaves as expected
+
+case "ignore-sigterm":
+    signal(SIGTERM, SIG_IGN)
+    _ = readAllStdin()
+    // Outlast any reasonable test grace period; only SIGKILL ends this.
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
+case "ignore-sigterm-announce-ready":
+    // Installs the SIGTERM-ignore handler and announces readiness via the
+    // ready-file BEFORE sleeping, so a test can poll for that file and
+    // only then trigger cancellation/termination — proving the intended
+    // interleaving (handler genuinely installed before termination is
+    // requested) rather than relying on an arbitrary sleep to hope the
+    // handler is installed in time.
+    signal(SIGTERM, SIG_IGN)
+    announceReady(at: arguments.readyFilePath)
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
+case "close-stdin-then-hang":
+    // Breaks the stdin contract immediately (closes its read end without
+    // ever reading), then hangs well past any reasonable overallTimeout —
+    // proving a stdin-delivery failure is published and terminates the
+    // invocation promptly, rather than only being recorded after the
+    // full timeout has already elapsed and won the race to classify the
+    // outcome.
+    close(0)
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
+case "close-stdin-early":
+    close(0)
+    Thread.sleep(forTimeInterval: 0.3)
+    exit(0)
+
+case "delay-read-stdin":
+    writeStderr(Data("waiting\n".utf8))
+    // Announces readiness immediately before committing to the read-free
+    // delay, so a test can poll for this file and only then act — proving
+    // the child has genuinely stopped reading (and the parent's write will
+    // therefore block once the pipe buffer fills) rather than relying on
+    // an arbitrary sleep to hope that state has been reached.
+    announceReady(at: arguments.readyFilePath)
+    Thread.sleep(forTimeInterval: Double(arguments.delayMilliseconds) / 1000.0)
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData) else { exit(1) }
+    writeStdout(encode(makeMatchingResponse(for: request)))
+    exit(0)
+
+case "three-way-pipe-pressure":
+    // Genuinely three-directional pipe pressure: this child reads stdin
+    // and writes stdout AND stderr in the same interleaved loop, each
+    // stream comfortably exceeding an ordinary Darwin pipe's ~64KiB
+    // buffer. A parent implementation that serialized any of these three
+    // directions — e.g. fully writing stdin before reading any output, or
+    // draining stdout to completion before touching stderr — deadlocks
+    // here: this child blocks writing to a full stdout (or stderr) pipe
+    // waiting to be read, while the parent's stdin write blocks waiting
+    // for this child to keep reading, and nothing in a serialized
+    // ordering ever breaks that cycle. Stdin content is opaque filler,
+    // not protocol JSON — this mode exercises `FoundationProcessRunner`'s
+    // own concurrent-drainage machinery, not worker-protocol decoding.
+    let chunkSize = 32 * 1024
+    let outputChunkCount = 64 // 64 * 32KiB = 2MiB on stdout, 2MiB on stderr
+    let stdoutFiller = Data(repeating: 0x4F, count: chunkSize) // 'O'
+    let stderrFiller = Data(repeating: 0x45, count: chunkSize) // 'E'
+    var stdinByteCount = 0
+    var readBuffer = [UInt8](repeating: 0, count: chunkSize)
+
+    // Raw POSIX `read(2)` on fd 0 rather than `FileHandle.read(upToCount:)`:
+    // unambiguous, directly-specified blocking semantics on a pipe
+    // descriptor (0 means EOF, a positive count is genuine data, -1/EINTR
+    // is retried) that don't depend on Foundation's own throwing-optional
+    // wrapper around the same syscall.
+    func readStdinChunk() -> Int {
+        while true {
+            let bytesRead = readBuffer.withUnsafeMutableBytes { buffer -> Int in
+                Darwin.read(0, buffer.baseAddress, chunkSize)
+            }
+            if bytesRead >= 0 { return bytesRead }
+            if errno == EINTR { continue }
+            return 0
+        }
+    }
+
+    for _ in 0..<outputChunkCount {
+        writeStdout(stdoutFiller)
+        writeStderr(stderrFiller)
+        stdinByteCount += readStdinChunk()
+    }
+    // Drain whatever stdin remains to completion, confirming the
+    // parent's write was fully delivered rather than merely "enough to
+    // unstick the interleaved loop above."
+    while true {
+        let n = readStdinChunk()
+        if n == 0 { break }
+        stdinByteCount += n
+    }
+    writeStdout(Data("\nSTDIN_BYTES=\(stdinByteCount)\n".utf8))
+    exit(0)
+
+case "echo-args":
+    let echoed = CommandLine.arguments.dropFirst(2) // skip executable path and --mode=echo-args
+    let data = (try? JSONEncoder().encode(Array(echoed))) ?? Data()
+    writeStdout(data)
+    exit(0)
+
+case "read-source-file":
+    let requestData = readAllStdin()
+    guard let request = decodeRequest(requestData), let sourcePath = arguments.sourcePath else { exit(1) }
+    guard let fileData = FileManager.default.contents(atPath: sourcePath) else {
+        writeStdout(encode(makeMatchingResponse(for: request, outcome: .failure, failureMessage: "could not read source file")))
+        exit(0)
+    }
+    writeStdout(encode(makeMatchingResponse(for: request, outputText: "read \(fileData.count) bytes")))
+    exit(0)
+
+default:
+    FileHandle.standardError.write(Data("unknown fixture mode: \(arguments.mode)\n".utf8))
+    exit(64)
+}
