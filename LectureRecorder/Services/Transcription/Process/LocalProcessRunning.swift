@@ -39,7 +39,16 @@ nonisolated struct ProcessInvocationRequest: Sendable {
     /// small positive literal; this documents the contract for whatever
     /// eventually does.
     var overallTimeout: TimeInterval
-    /// Same non-finite/negative handling as `overallTimeout` above.
+    /// Handled differently from `overallTimeout` above, not identically:
+    /// `FoundationProcessRunner.dispatchTimeInterval(fromSeconds:)` clamps
+    /// any non-finite (`.infinity`, `.nan`) *or* non-positive (zero or
+    /// negative) value to a zero-length wait, rather than to a
+    /// large-but-finite one. In every such case, the forced-escalation
+    /// deadline (SIGKILL after the grace period) becomes immediately
+    /// eligible rather than deferred — the opposite of what `.infinity`
+    /// means for `overallTimeout`. No current call site passes anything
+    /// other than a small positive literal; this documents the contract
+    /// for whatever eventually does.
     var gracePeriod: TimeInterval
 
     init(

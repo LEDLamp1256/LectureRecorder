@@ -521,7 +521,12 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// first claims the outcome and begins the grace period, and a
     /// cancellation arriving *during* that already-in-progress grace wait
     /// neither shortens it, restarts it, nor changes the final
-    /// classification away from `.timedOut`.
+    /// classification away from `.timedOut`. Timing/scheduling-based
+    /// supplementary coverage, not a deterministic gate: it relies on a
+    /// fixed `Task.sleep` landing the cancellation inside the grace
+    /// window under whatever scheduler this happens to run under, rather
+    /// than on an out-of-band readiness signal the way the deterministic
+    /// tests elsewhere in this file do.
     func testTimeoutGraceContinuesUnaffectedByLaterCancellation() async throws {
         let gracePeriod: TimeInterval = 1.0
         let overallTimeout: TimeInterval = 0.2

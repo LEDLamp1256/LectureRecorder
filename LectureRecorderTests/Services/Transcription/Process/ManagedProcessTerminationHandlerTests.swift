@@ -64,24 +64,23 @@ final class ManagedProcessTerminationHandlerTests: XCTestCase {
             }
             XCTAssertFalse(managedProcess.isRunning, "fixture should have already exited before observation is installed")
 
-            let fired = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                var didFire = false
-                managedProcess.observeTermination { _ in
-                    didFire = true
-                    continuation.resume(returning: didFire)
-                }
-                // Fallback in case the handler never fires: resume after a
-                // bounded wait so this test fails loudly instead of
-                // hanging the suite. (If this branch is ever hit, `fired`
-                // is reported false and the assertion below fails.)
-                DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) {
-                    if !didFire {
-                        continuation.resume(returning: false)
-                    }
-                }
+            // XCTestExpectation's `fulfill()` is thread-safe and idempotent
+            // to call from any queue, and `XCTWaiter.wait(for:timeout:)` is
+            // XCTest's own single, race-free wait/timeout mechanism that
+            // reports its outcome as a value — unlike a hand-rolled
+            // `CheckedContinuation`, there is no unsynchronized shared flag
+            // and no way for two competing resumers to both "win" (a
+            // `CheckedContinuation` resumed twice traps). A fresh
+            // expectation and waiter are created each iteration, and
+            // nothing here schedules a manual fallback timer that could
+            // outlive this iteration (or the test) waiting to fire.
+            let terminationObserved = XCTestExpectation(description: "termination handler fired after post-exit installation")
+            managedProcess.observeTermination { _ in
+                terminationObserved.fulfill()
             }
+            let waitResult = XCTWaiter().wait(for: [terminationObserved], timeout: 3.0)
 
-            if !fired {
+            if waitResult != .completed {
                 missed += 1
             }
             try? stdoutPipe.fileHandleForReading.close()

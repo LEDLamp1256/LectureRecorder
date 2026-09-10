@@ -398,7 +398,7 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     /// comes first — using `DispatchQueue.asyncAfter`, which is immune to
     /// Swift Task cancellation (unlike `Task.sleep`/`ContinuousClock.sleep`,
     /// which both throw the instant the calling task is cancelled). This
-    /// is what lets the grace period elapse for real, in monotonic wall
+    /// is what lets the grace period elapse for real, in monotonic elapsed
     /// time, even when the invocation that requested termination has
     /// itself already been cancelled — while still returning as soon as
     /// the child actually exits, rather than always waiting out the full
