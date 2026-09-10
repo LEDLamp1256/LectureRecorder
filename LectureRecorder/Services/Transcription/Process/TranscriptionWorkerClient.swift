@@ -10,7 +10,12 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
     case locatorFailure(EmbeddedWorkerLocatorError)
     case requestEncodingFailed(underlying: String)
     case process(ProcessRunFailure)
-    case processFailure(exitStatus: Int32?, signal: Int32?, capturedStderr: String)
+    /// `stderr` is the full runner-bounded capture (already capped at the
+    /// invocation's `maximumStderrBytes`, e.g. up to 1 MiB) — preserved
+    /// here as data for any future diagnostic consumer, but
+    /// `errorDescription` deliberately never interpolates it in full; see
+    /// `diagnosticPreview(of:runnerTruncated:)`.
+    case processFailure(exitStatus: Int32?, signal: Int32?, stderr: Data, stderrTruncated: Bool)
     case missingResponse
     case malformedResponse(underlying: String)
     case unsupportedSchemaVersion(Int)
@@ -26,11 +31,9 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
             return "Failed to encode worker request: \(underlying)"
         case .process(let underlying):
             return underlying.errorDescription
-        case .processFailure(let exitStatus, let signal, let capturedStderr):
-            if let signal {
-                return "Worker process was terminated by signal \(signal). stderr: \(capturedStderr)"
-            }
-            return "Worker process exited with status \(exitStatus ?? -1). stderr: \(capturedStderr)"
+        case .processFailure(let exitStatus, let signal, let stderr, let stderrTruncated):
+            let reason = signal.map { "signal \($0)" } ?? "exit status \(exitStatus ?? -1)"
+            return "Worker process terminated abnormally (\(reason)). \(Self.diagnosticPreview(of: stderr, runnerTruncated: stderrTruncated))"
         case .missingResponse:
             return "Worker process exited zero but produced no response."
         case .malformedResponse(let underlying):
@@ -44,6 +47,47 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
         case .invalidOutcomeShape:
             return "Worker response's outcome/output/failure shape was inconsistent."
         }
+    }
+
+    /// Caps any stderr excerpt embedded in a diagnostic string at
+    /// ~4 KiB of *rendered output* — deliberately much tighter than the
+    /// runner's own up-to-1-MiB retention bound, which governs what is
+    /// *captured*, not what is safe to fold into a single
+    /// `errorDescription` string. Bounding only the input byte slice
+    /// before decoding is not sufficient: `String(decoding:as: UTF8.self)`
+    /// replaces each invalid byte with U+FFFD, a 3-byte UTF-8 sequence, so
+    /// a 4 KiB slice of invalid bytes can decode to a ~12 KiB string. This
+    /// walks the decoded scalars and stops once the *rendered* text would
+    /// exceed the limit, so the returned string's UTF-8 byte count is
+    /// actually bounded regardless of the input's validity. Never crashes
+    /// on invalid UTF-8 or on truncating mid-multi-byte-sequence: decoding
+    /// via `String(decoding:as:)` already replaced any invalid bytes
+    /// before this ever walks scalars, and appending whole
+    /// `Unicode.Scalar`s one at a time can never split one.
+    private static func diagnosticPreview(of stderr: Data, runnerTruncated: Bool) -> String {
+        guard !stderr.isEmpty else {
+            return "No stderr output."
+        }
+        let byteLimit = 4 * 1024
+        let inputPreview = stderr.prefix(byteLimit)
+        let decoded = String(decoding: inputPreview, as: UTF8.self)
+
+        var boundedText = ""
+        var renderedByteCount = 0
+        var outputWasTruncated = false
+        for scalar in decoded.unicodeScalars {
+            let scalarByteCount = String(scalar).utf8.count
+            guard renderedByteCount + scalarByteCount <= byteLimit else {
+                outputWasTruncated = true
+                break
+            }
+            boundedText.unicodeScalars.append(scalar)
+            renderedByteCount += scalarByteCount
+        }
+
+        let wasTruncated = runnerTruncated || inputPreview.count < stderr.count || outputWasTruncated
+        let truncationNote = wasTruncated ? " [stderr truncated]" : ""
+        return "stderr (\(stderr.count) bytes captured): \(boundedText)\(truncationNote)"
     }
 }
 
@@ -165,13 +209,15 @@ nonisolated struct TranscriptionWorkerClient: Sendable {
             return .infrastructureFailure(.processFailure(
                 exitStatus: status,
                 signal: nil,
-                capturedStderr: stderrPreview(result.stderr)
+                stderr: result.stderr,
+                stderrTruncated: result.stderrTruncated
             ))
         case .uncaughtSignal(let signalNumber):
             return .infrastructureFailure(.processFailure(
                 exitStatus: nil,
                 signal: signalNumber,
-                capturedStderr: stderrPreview(result.stderr)
+                stderr: result.stderr,
+                stderrTruncated: result.stderrTruncated
             ))
         }
     }
@@ -240,9 +286,5 @@ nonisolated struct TranscriptionWorkerClient: Sendable {
             }
             return .workerDeclaredFailure(failure)
         }
-    }
-
-    private func stderrPreview(_ data: Data) -> String {
-        String(data: data, encoding: .utf8) ?? "<\(data.count) bytes, not valid UTF-8>"
     }
 }

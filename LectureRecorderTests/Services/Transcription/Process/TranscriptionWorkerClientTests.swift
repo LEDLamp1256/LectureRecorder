@@ -50,7 +50,7 @@ final class TranscriptionWorkerClientTests: XCTestCase {
 
     func testNonzeroExitWithNoResponseIsProcessFailure() async {
         let outcome = await submit(mode: "nonzero-no-response")
-        guard case .infrastructureFailure(.processFailure(let status, _, _)) = outcome else {
+        guard case .infrastructureFailure(.processFailure(let status, _, _, _)) = outcome else {
             return XCTFail("Expected .processFailure, got \(outcome)")
         }
         XCTAssertEqual(status, 7)
@@ -58,7 +58,7 @@ final class TranscriptionWorkerClientTests: XCTestCase {
 
     func testNonzeroExitWithApparentlyValidSuccessJSONCannotBeOverriddenByJSON() async {
         let outcome = await submit(mode: "nonzero-with-success-json")
-        guard case .infrastructureFailure(.processFailure(let status, _, _)) = outcome else {
+        guard case .infrastructureFailure(.processFailure(let status, _, _, _)) = outcome else {
             return XCTFail("A nonzero exit must never be overridden by well-formed JSON on stdout; got \(outcome)")
         }
         XCTAssertEqual(status, 7)
@@ -71,7 +71,7 @@ final class TranscriptionWorkerClientTests: XCTestCase {
         // FoundationProcessRunnerTests.testForcedTerminationWhenSIGTERMIsIgnored).
         // The generous timeout here must never itself fire.
         let outcome = await submit(mode: "self-signal", overallTimeout: 5.0)
-        guard case .infrastructureFailure(.processFailure(let status, let signal, _)) = outcome else {
+        guard case .infrastructureFailure(.processFailure(let status, let signal, _, _)) = outcome else {
             return XCTFail("Expected .processFailure from a signaled termination, got \(outcome)")
         }
         XCTAssertNil(status)
@@ -220,6 +220,60 @@ final class TranscriptionWorkerClientTests: XCTestCase {
         guard case .infrastructureFailure(.invalidOutcomeShape) = outcome else {
             return XCTFail("Expected .invalidOutcomeShape, got \(outcome)")
         }
+    }
+
+    // MARK: - Bounded error-description diagnostics
+
+    func testLargeStderrProducesABoundedErrorDescriptionNotTheFullCapture() async {
+        let outcome = await submit(mode: "large-stderr-nonzero-exit", overallTimeout: 10.0)
+        guard case .infrastructureFailure(let failure) = outcome else {
+            return XCTFail("Expected .infrastructureFailure, got \(outcome)")
+        }
+        guard case .processFailure(_, _, let stderr, _) = failure else {
+            return XCTFail("Expected .processFailure, got \(failure)")
+        }
+        // The retained capture itself is the full ~1 MiB bounded-by-the-
+        // runner value — that's approved and expected.
+        XCTAssertGreaterThan(stderr.count, 512 * 1024)
+
+        // The rendered description must stay short regardless.
+        let description = failure.errorDescription ?? ""
+        XCTAssertLessThan(description.utf8.count, 8 * 1024, "errorDescription must stay bounded even when the full retained stderr is ~1 MiB")
+        XCTAssertTrue(description.contains("truncated"), "description should explicitly indicate truncation")
+    }
+
+    func testInvalidUTF8StderrDoesNotCrashDescriptionRendering() async {
+        let outcome = await submit(mode: "invalid-utf8-stderr-nonzero-exit", overallTimeout: 10.0)
+        guard case .infrastructureFailure(let failure) = outcome else {
+            return XCTFail("Expected .infrastructureFailure, got \(outcome)")
+        }
+        guard case .processFailure(_, _, let stderr, _) = failure else {
+            return XCTFail("Expected .processFailure, got \(failure)")
+        }
+        // The fixture actually wrote invalid-UTF-8 bytes — confirm that,
+        // not just that some description exists (a wrong outcome case, or
+        // a fixture that emitted nothing, would otherwise pass vacuously).
+        XCTAssertEqual(stderr, Data([0xFF, 0xFE, 0xC0, 0x80, 0x41, 0x42, 0x43]))
+        // Reaching this line without a crash is itself part of the proof.
+        let description = failure.errorDescription ?? ""
+        XCTAssertTrue(description.contains("7 bytes captured"))
+        XCTAssertTrue(description.contains("ABC"), "the trailing valid ASCII bytes should still render through the replacement characters")
+    }
+
+    func testOrdinaryShortDiagnosticsRemainUsefulAndUntruncated() async {
+        let outcome = await submit(mode: "short-stderr-nonzero-exit", overallTimeout: 5.0)
+        guard case .infrastructureFailure(let failure) = outcome else {
+            return XCTFail("Expected .infrastructureFailure, got \(outcome)")
+        }
+        guard case .processFailure(_, _, let stderr, let stderrTruncated) = failure else {
+            return XCTFail("Expected .processFailure, got \(failure)")
+        }
+        XCTAssertEqual(stderr, Data("boom: something went wrong".utf8))
+        XCTAssertFalse(stderrTruncated)
+        let description = failure.errorDescription ?? ""
+        XCTAssertTrue(description.contains("exit status 3"))
+        XCTAssertTrue(description.contains("boom: something went wrong"), "a short diagnostic should render in full")
+        XCTAssertFalse(description.contains("[stderr truncated]"))
     }
 
     // MARK: - Stderr truncation does not corrupt an otherwise-valid success

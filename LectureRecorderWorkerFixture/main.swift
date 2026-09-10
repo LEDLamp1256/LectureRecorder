@@ -221,6 +221,28 @@ case "large-stdout":
     writeStdout(encode(makeMatchingResponse(for: request, outputText: filler)))
     exit(0)
 
+case "short-stderr-nonzero-exit":
+    // Short, non-empty, valid stderr paired with a nonzero exit — proves
+    // ordinary short diagnostics are rendered in full, untruncated.
+    _ = readAllStdin()
+    writeStderr(Data("boom: something went wrong".utf8))
+    exit(3)
+
+case "large-stderr-nonzero-exit":
+    // Large stderr paired with a nonzero exit, so the client classifies
+    // it as .processFailure — used to prove the resulting errorDescription
+    // stays bounded regardless of how much stderr was actually captured.
+    _ = readAllStdin()
+    writeStderr(Data(largeFillerText(approximateByteCount: 1 * 1024 * 1024).utf8))
+    exit(3)
+
+case "invalid-utf8-stderr-nonzero-exit":
+    // Invalid UTF-8 bytes on stderr, paired with a nonzero exit — proves
+    // the diagnostic preview never crashes on malformed byte sequences.
+    _ = readAllStdin()
+    writeStderr(Data([0xFF, 0xFE, 0xC0, 0x80, 0x41, 0x42, 0x43]))
+    exit(3)
+
 case "large-stderr":
     let requestData = readAllStdin()
     guard let request = decodeRequest(requestData) else { exit(1) }
@@ -285,6 +307,21 @@ case "invalid-outcome-both-present":
     {"schemaVersion":\(FixtureProtocolConstants.currentSchemaVersion),"requestID":"\(request.requestID.uuidString)","attemptID":"\(request.attemptID.uuidString)","sessionID":"\(request.sessionID.uuidString)","chunkSequenceNumber":\(request.chunkSequenceNumber),"sourceIdentity":"\(request.sourceIdentity)","workerIdentifier":"\(FixtureProtocolConstants.workerIdentifier)","workerVersion":"\(FixtureProtocolConstants.workerVersion)","outcome":"success","output":{"text":"hi"},"failure":{"message":"also here"}}
     """
     writeStdout(Data(json.utf8))
+    exit(0)
+
+case "close-stdin-early-then-respond":
+    // Proves the fail-closed stdin rule at the raw process-runner layer:
+    // closes its read end immediately (never reads the real request, so
+    // it cannot know the real identity), then still writes a plausible,
+    // well-formed-looking response and exits 0. The runner must discard
+    // this — the caller supplies a large stdin payload so the write
+    // genuinely fails, and the overall outcome must be
+    // .stdinDeliveryFailed regardless of this stdout content.
+    close(0)
+    let placeholder = """
+    {"schemaVersion":1,"requestID":"00000000-0000-0000-0000-000000000000","attemptID":"00000000-0000-0000-0000-000000000000","sessionID":"00000000-0000-0000-0000-000000000000","chunkSequenceNumber":0,"sourceIdentity":"placeholder","workerIdentifier":"\(FixtureProtocolConstants.workerIdentifier)","workerVersion":"\(FixtureProtocolConstants.workerVersion)","outcome":"success","output":{"text":"should never be trusted"},"failure":null}
+    """
+    writeStdout(Data(placeholder.utf8))
     exit(0)
 
 case "self-signal":

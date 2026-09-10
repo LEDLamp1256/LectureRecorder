@@ -26,7 +26,11 @@ import Synchronization
 /// the instant an instance is constructed (i.e. at `notStarted`, before any
 /// process is even launched), because the lock has no separate "not yet
 /// listening" state to be caught in.
-nonisolated final class ProcessInvocationState: @unchecked Sendable {
+///
+/// Genuinely `Sendable`, not `@unchecked` — `Storage` (`ProcessRunFailure?`,
+/// `Bool`) is entirely `Sendable`, so `Mutex<Storage>` is `Sendable` too,
+/// and this `final` class's only stored property is that mutex.
+nonisolated final class ProcessInvocationState: Sendable {
     private struct Storage {
         var claimedFailure: ProcessRunFailure?
         var hasCommittedSuccess = false

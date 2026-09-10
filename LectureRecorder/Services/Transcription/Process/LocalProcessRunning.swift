@@ -74,10 +74,23 @@ nonisolated struct ProcessRunResult: Sendable, Equatable {
 /// `TranscriptionCoordinatorError`/`TranscriptionStoreError` — never a
 /// free-form string, never inferred from an arbitrary `Swift.Error`'s type.
 nonisolated enum ProcessRunFailure: LocalizedError, Sendable, Equatable {
-    case invalidExecutable(String)
     case requestTooLarge(byteCount: Int, limit: Int)
     case stdinPipeConfigurationFailed(errno: Int32)
     case launchFailed(underlying: String)
+    /// Fail-closed rule: if complete stdin delivery cannot be confirmed,
+    /// no response may ever be trusted — even if the child exits zero and
+    /// stdout contains apparently valid, identity-matching JSON. The
+    /// worker did not receive the complete canonical request; accepting
+    /// its response would let a prematurely-responding or protocol-
+    /// violating worker manufacture success from partial input.
+    /// `FoundationProcessRunner` enforces this unconditionally: recording
+    /// this case as the invocation's fatal intervention (via
+    /// `ProcessInvocationState.recordFatalIntervention`) permanently
+    /// blocks `tryCommitSuccess()` for the remainder of the call,
+    /// regardless of what the child later writes to stdout or which exit
+    /// status it reports. See
+    /// `FoundationProcessRunnerTests.testStdinDeliveryFailureDiscardsAnOtherwiseValidResponse`
+    /// for the deterministic proof.
     case stdinDeliveryFailed(underlying: String)
     case stdoutReadFailed(underlying: String)
     case stderrReadFailed(underlying: String)
@@ -88,8 +101,6 @@ nonisolated enum ProcessRunFailure: LocalizedError, Sendable, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .invalidExecutable(let path):
-            return "Refusing to launch: \(path) is not a valid, trusted, executable regular file."
         case .requestTooLarge(let byteCount, let limit):
             return "Encoded request is \(byteCount) bytes, exceeding the \(limit)-byte limit; not launched."
         case .stdinPipeConfigurationFailed(let errno):

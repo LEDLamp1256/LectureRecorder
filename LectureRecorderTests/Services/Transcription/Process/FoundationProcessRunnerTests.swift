@@ -143,6 +143,31 @@ final class FoundationProcessRunnerTests: XCTestCase {
         }
     }
 
+    // MARK: - Fail-closed stdin rule
+
+    /// Deterministic proof of the ratified fail-closed stdin rule: the
+    /// child closes its read end before the parent's large stdin write
+    /// can complete, causing `.stdinDeliveryFailed`, yet still writes a
+    /// fully well-formed-looking response and exits 0. The overall
+    /// outcome must remain `.stdinDeliveryFailed` — an otherwise-valid
+    /// response produced after failed/partial stdin delivery is
+    /// discarded, never returned as success.
+    func testStdinDeliveryFailureDiscardsAnOtherwiseValidResponse() async throws {
+        let largeStdin = Data(repeating: 0x44, count: 4 * 1024 * 1024)
+        let request = WorkerFixtureTestSupport.makeRequest(
+            executableURL: fixtureURL,
+            arguments: ["--mode=close-stdin-early-then-respond"],
+            stdin: largeStdin,
+            maximumStdinBytes: 8 * 1024 * 1024,
+            overallTimeout: 5.0
+        )
+
+        let outcome = await runner.run(request)
+        guard case .failure(.stdinDeliveryFailed) = outcome else {
+            return XCTFail("Expected .stdinDeliveryFailed to discard the child's response even though it exited 0 with well-formed-looking JSON, got \(outcome)")
+        }
+    }
+
     // MARK: - Raw response bytes pass through unvalidated (layer boundary)
 
     func testRunnerNeverValidatesJSONShapeItPassesRawBytesThrough() async throws {
@@ -327,7 +352,18 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Race safety (exactly one outcome, no crash from double-resume)
 
     func testNaturalExitRacingCancellationYieldsExactlyOneConsistentOutcome() async throws {
-        for _ in 0..<20 {
+        // Cancelling immediately after `Task { ... }` creation lands
+        // before the task body ever starts running, every time — the
+        // pre-launch check at the top of `performInvocation` catches it,
+        // and the process never actually launches. That only proves the
+        // pre-launch path works, not the race this test is named for.
+        // Staggering an increasing delay before each cancel (0ms up to
+        // ~38ms, comfortably past this fixture's own measured ~15ms
+        // launch-to-exit time) spreads cancellation across the whole
+        // window — some iterations still land pre-launch, others land
+        // mid-run, and others land after the process has already exited
+        // naturally, which is the actual race this test claims to cover.
+        for index in 0..<20 {
             let identity = WorkerFixtureTestSupport.makeIdentity()
             let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
             let request = WorkerFixtureTestSupport.makeRequest(
@@ -338,7 +374,8 @@ final class FoundationProcessRunnerTests: XCTestCase {
             )
 
             let task = Task { await runner.run(request) }
-            task.cancel() // races the fixture's own fast completion
+            try? await Task.sleep(nanoseconds: UInt64(index) * 2_000_000)
+            task.cancel()
             let outcome = await task.value
 
             switch outcome {

@@ -20,6 +20,20 @@ import Foundation
 /// starving Swift's deliberately size-limited cooperative thread pool with
 /// synchronous I/O.
 ///
+/// ## Process ownership
+/// The only `Foundation.Process` instance for an invocation is owned by a
+/// single `ManagedProcess`, which mediates every operation on it through
+/// its own internal `Mutex`. This type never holds or passes around a raw
+/// `Process` reference — see `ManagedProcess`'s header comment for why
+/// that matters and where the one remaining `@unchecked Sendable` in T2
+/// lives (not here).
+///
+/// ## Deadlines
+/// `overallTimeout`/`gracePeriod` are measured against `ContinuousClock`,
+/// never wall-clock `Date()` — a system clock adjustment (NTP sync,
+/// manual change, DST) cannot extend, shorten, or reverse a timeout or
+/// grace period.
+///
 /// ## Termination proof
 /// `Process.terminate()`/`SIGKILL` are requests, never proof. The only
 /// accepted proof of termination is `Process.terminationHandler` firing —
@@ -27,22 +41,39 @@ import Foundation
 /// after the process has already been reaped internally. This type never
 /// uses `kill(pid, 0)` after completion to "confirm" anything.
 ///
+/// ## Fail-closed stdin
+/// If stdin delivery cannot be confirmed complete, no response is ever
+/// trusted — see `ProcessRunFailure.stdinDeliveryFailed`'s doc comment for
+/// the full rationale. This is enforced structurally: a stdin failure is
+/// recorded via `ProcessInvocationState.recordFatalIntervention` exactly
+/// like any other fatal intervention, which unconditionally blocks
+/// `tryCommitSuccess()` for the rest of the call.
+///
 /// ## Residual PID-reuse risk
-/// The final `SIGKILL` escalation step signals `process.processIdentifier`
-/// directly. Between this type's own `process.isRunning` check and the
-/// `kill()` call that follows it, there is an inherent, unavoidable-on-
-/// Darwin race: if the process exits and is reaped by something else in
-/// that narrow window, the OS could in principle recycle the PID before
-/// the signal is delivered. No mutex or atomic flag owned by this process
-/// can close that window — POSIX simply does not expose an atomic
-/// "signal this process unless it has already exited" primitive on macOS
-/// (unlike Linux's `pidfd_send_signal`). This is documented, not denied:
-/// the window is narrow (typically microseconds, bounded by how promptly
-/// this process's own `Process` reaps its own direct child), and is an
-/// accepted, industry-standard limitation of any PID-based signaling
-/// scheme, not something a lower-level `posix_spawn`/owned-`waitpid`
-/// reimplementation would remove either.
-nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked Sendable {
+/// The final `SIGKILL` escalation step (via `ManagedProcess.forceKillIfStillRunning()`)
+/// checks `isRunning` and signals inside one critical section, which
+/// removes any race between this process's own threads — but there is an
+/// inherent, unavoidable-on-Darwin race against the *kernel*: if the
+/// process exits and is reaped by something else in the narrow window
+/// between that check and the signal reaching the kernel, the OS could in
+/// principle recycle the PID before delivery. No mutex owned by this
+/// process can close that window — POSIX exposes no atomic "signal this
+/// process unless it has already exited" primitive on macOS (unlike
+/// Linux's `pidfd_send_signal`). This is documented, not denied: the
+/// window is narrow, and is an accepted, industry-standard limitation of
+/// any PID-based signaling scheme, not something a lower-level
+/// `posix_spawn`/owned-`waitpid` reimplementation would remove either.
+///
+/// ## T3 note
+/// This type is safe *per invocation*. It has no built-in concurrency
+/// limit: `ioQueue` is a `.concurrent` `DispatchQueue`, and each
+/// invocation occupies up to three of its worker threads simultaneously
+/// for the duration of its I/O. T2 has no concurrent-invocation caller,
+/// so this is not a defect today — but T3 scheduling must explicitly
+/// bound how many worker invocations run simultaneously and account for
+/// this queue's concurrency budget before production transcription is
+/// connected.
+nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     private let ioQueue: DispatchQueue
     private let pollInterval: TimeInterval
 
@@ -86,19 +117,6 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
             return .failure(already)
         }
 
-        let process = Process()
-        process.executableURL = request.executableURL
-        process.arguments = request.arguments
-        switch request.environmentPolicy {
-        case .empty:
-            process.environment = [:]
-        case .explicit(let environment):
-            process.environment = environment
-        }
-        if let workingDirectoryURL = request.workingDirectoryURL {
-            process.currentDirectoryURL = workingDirectoryURL
-        }
-
         let stdinPipe = Pipe()
 
         // Darwin-specific, descriptor-scoped fix: without this, a write to
@@ -110,11 +128,10 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
         // before this fix was added). `F_SETNOSIGPIPE` disables signal
         // generation for this one file descriptor only — it never touches
         // process-wide `signal()`/`sigaction()` disposition, so it is not
-        // the "process-global SIGPIPE handler" this type's own header
-        // comment (and the approved architecture) prohibits. Configured
-        // immediately after creating the stdin pipe, before the stdout/
-        // stderr pipes exist, before the child is launched, and before
-        // this handle is exposed to any concurrent work or write.
+        // a process-global SIGPIPE handler. Configured immediately after
+        // creating the stdin pipe, before the stdout/stderr pipes exist,
+        // before the child is launched, and before this handle is exposed
+        // to any concurrent work or write.
         let stdinWriteDescriptor = stdinPipe.fileHandleForWriting.fileDescriptor
         guard fcntl(stdinWriteDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
             let capturedErrno = errno
@@ -125,40 +142,42 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
 
-        do {
-            try process.run()
-        } catch {
-            return .failure(.launchFailed(underlying: String(describing: error)))
+        let managedProcess = ManagedProcess { process in
+            process.executableURL = request.executableURL
+            process.arguments = request.arguments
+            switch request.environmentPolicy {
+            case .empty:
+                process.environment = [:]
+            case .explicit(let environment):
+                process.environment = environment
+            }
+            if let workingDirectoryURL = request.workingDirectoryURL {
+                process.currentDirectoryURL = workingDirectoryURL
+            }
+            process.standardInput = stdinPipe
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
         }
 
-        // Only created once launch has actually succeeded. Creating this
-        // `async let` before `process.run()` (an earlier version of this
-        // function did) is a real deadlock: if `run()` throws, returning
-        // without ever awaiting an already-created `async let` triggers
-        // Swift's implicit cancel-and-await at scope exit, which blocks
-        // forever on `waitForTerminationHandler`'s `withCheckedContinuation`
-        // — a continuation that can never resume, because no process was
-        // ever launched for `terminationHandler` to fire on, and a checked
-        // continuation has no cancellation escape hatch. Placing this only
-        // after a confirmed-successful launch removes that window
-        // entirely. (`async let` does not run its body synchronously at
-        // the declaration point — empirically confirmed the child task
-        // starts after its enclosing scope continues in the overwhelming
-        // majority of runs — but that is irrelevant to correctness here:
-        // `Foundation.Process` fires `terminationHandler` correctly even
-        // when it is assigned after the process has already exited and
-        // been reaped, which is the actual property this code depends on.)
-        async let terminationObservation = Self.waitForTerminationHandler(process)
+        switch managedProcess.launch() {
+        case .success:
+            break
+        case .failure(let error):
+            return .failure(.launchFailed(underlying: String(describing: error)))
+        }
 
         // A cancellation that landed in the narrow window between the
         // pre-launch check above and this point must still be honored.
         if state.claimedFailure != nil {
-            process.terminate()
+            managedProcess.terminate()
         }
+
+        // Only created once launch has actually succeeded — see
+        // `ManagedProcess.launch()`'s doc comment for why this ordering
+        // is what actually matters (not merely when this async let's
+        // child task happens to start).
+        async let terminationObservation = Self.waitForTermination(managedProcess)
 
         async let stdinResult = Self.deliverStdin(
             request.stdin,
@@ -172,7 +191,7 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
             ioQueue: ioQueue,
             onOverflow: {
                 state.recordFatalIntervention(.stdoutLimitExceeded(limit: request.maximumStdoutBytes))
-                process.terminate()
+                managedProcess.terminate()
             },
             makeReadFailure: { .stdoutReadFailed(underlying: $0) }
         )
@@ -184,7 +203,7 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
             makeReadFailure: { .stderrReadFailed(underlying: $0) }
         )
         async let escalation: Void = Self.watchAndEscalate(
-            process: process,
+            managedProcess: managedProcess,
             state: state,
             overallTimeout: request.overallTimeout,
             gracePeriod: request.gracePeriod,
@@ -197,6 +216,12 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
         let termination = await terminationObservation
         await escalation
 
+        // Fail-closed stdin rule: a stdin-delivery failure is recorded
+        // here exactly like any other fatal intervention, so the check
+        // below (`state.claimedFailure`) is what actually enforces "no
+        // response may be trusted without confirmed complete delivery" —
+        // it is checked before, and takes precedence over, whatever
+        // `stdout`/`stderr` ended up containing.
         if case .failure(let failure) = stdin {
             state.recordFatalIntervention(failure)
         }
@@ -237,22 +262,17 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
 
     // MARK: - Termination observation
 
-    /// Bridges `Process.terminationHandler` through a checked continuation
-    /// — the same pattern this repository's own `FailureCoordinator`
-    /// already uses for `DispatchGroup.notify` (`drainDelivery()`), chosen
-    /// there and here over a blocking wait. Per `Foundation.Process`'s
-    /// documented behavior, this handler fires only after the process has
-    /// already been reaped; observing it firing is this runner's sole
-    /// accepted proof of termination.
-    private static func waitForTerminationHandler(_ process: Process) async -> ProcessTerminationReason {
+    /// Bridges `ManagedProcess.observeTermination` through a checked
+    /// continuation — the same pattern this repository's own
+    /// `FailureCoordinator` already uses for `DispatchGroup.notify`
+    /// (`drainDelivery()`), chosen there and here over a blocking wait.
+    /// Only ever called after `ManagedProcess.launch()` has already
+    /// succeeded, so `onTermination` firing exactly once is guaranteed by
+    /// `Foundation.Process`'s own documented behavior — there is no
+    /// launch-failure path through this function at all.
+    private static func waitForTermination(_ managedProcess: ManagedProcess) async -> ProcessTerminationReason {
         await withCheckedContinuation { (continuation: CheckedContinuation<ProcessTerminationReason, Never>) in
-            process.terminationHandler = { finishedProcess in
-                let reason: ProcessTerminationReason
-                if finishedProcess.terminationReason == .exit {
-                    reason = .exited(status: finishedProcess.terminationStatus)
-                } else {
-                    reason = .uncaughtSignal(finishedProcess.terminationStatus)
-                }
+            managedProcess.observeTermination { reason in
                 continuation.resume(returning: reason)
             }
         }
@@ -261,28 +281,31 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
     /// Watches for a reason to terminate the child (an already-recorded
     /// fatal intervention, or `overallTimeout` elapsing) and, once
     /// termination is warranted, drives the graceful-then-forced
-    /// escalation sequence. Deliberately polls `process.isRunning` — a
-    /// `Foundation`-maintained, thread-safe-to-read stored property —
-    /// rather than registering a second consumer of
-    /// `terminationHandler`, since that property can only ever have one
-    /// meaningful assignment per process. This polling idiom matches this
-    /// repository's own established callback-to-async bridge pattern
+    /// escalation sequence. Deliberately polls `managedProcess.isRunning`
+    /// rather than registering a second consumer of the termination
+    /// handler, since that can only ever have one meaningful assignment
+    /// per process. This polling idiom matches this repository's own
+    /// established callback-to-async bridge pattern
     /// (`InFlightCallbackGate.drain()`: `while … { await Task.yield() }`).
+    /// All deadline arithmetic uses `ContinuousClock`, never wall-clock
+    /// `Date()`, so a system clock adjustment cannot affect timeout or
+    /// grace-period behavior.
     private static func watchAndEscalate(
-        process: Process,
+        managedProcess: ManagedProcess,
         state: ProcessInvocationState,
         overallTimeout: TimeInterval,
         gracePeriod: TimeInterval,
         pollInterval: TimeInterval
     ) async {
-        let nanoseconds = UInt64(max(pollInterval, 0.001) * 1_000_000_000)
-        let timeoutDeadline = Date().addingTimeInterval(overallTimeout)
+        let clock = ContinuousClock()
+        let pollDuration = Self.duration(fromSeconds: max(pollInterval, 0.001))
+        let timeoutDeadline = clock.now.advanced(by: Self.duration(fromSeconds: overallTimeout))
 
-        while process.isRunning, state.claimedFailure == nil, Date() < timeoutDeadline {
-            try? await Task.sleep(nanoseconds: nanoseconds)
+        while managedProcess.isRunning, state.claimedFailure == nil, clock.now < timeoutDeadline {
+            try? await clock.sleep(for: pollDuration)
         }
 
-        guard process.isRunning else {
+        guard managedProcess.isRunning else {
             return
         }
 
@@ -293,16 +316,52 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
         // A fatal intervention is now recorded (ours, or one that raced in
         // from cancellation/overflow). Graceful termination is idempotent
         // to request more than once.
-        process.terminate()
+        managedProcess.terminate()
 
-        let escalationDeadline = Date().addingTimeInterval(gracePeriod)
-        while process.isRunning, Date() < escalationDeadline {
-            try? await Task.sleep(nanoseconds: nanoseconds)
+        // `!Task.isCancelled` matters here even though `state.claimedFailure`
+        // already reflects cancellation by this point (via `run()`'s
+        // `onCancel` handler): `clock.sleep(for:)` throws immediately once
+        // this task is cancelled, and `try?` alone silently swallows that
+        // and loops right back around — a measured ~1,700x busy-spin
+        // against production's 2-second default grace period, each
+        // iteration also contending for `managedProcess`'s own mutex.
+        // Breaking out here still falls through to
+        // `forceKillIfStillRunning()` below rather than returning early,
+        // so a cancelled invocation still gets its forced-escalation
+        // attempt rather than leaving the child to the grace period alone.
+        let escalationDeadline = clock.now.advanced(by: Self.duration(fromSeconds: gracePeriod))
+        while managedProcess.isRunning, !Task.isCancelled, clock.now < escalationDeadline {
+            try? await clock.sleep(for: pollDuration)
         }
 
-        if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
+        managedProcess.forceKillIfStillRunning()
+    }
+
+    /// Converts a `TimeInterval` (seconds, `Double`) into a `Duration`
+    /// without relying on any particular `Duration.seconds` overload
+    /// existing for `Double` — deliberately explicit so this compiles
+    /// identically regardless of stdlib version. Clamps non-finite input
+    /// (`.infinity`, `.nan`) to a large-but-finite duration rather than
+    /// trapping: `Int64(seconds)` on `.infinity`/`.nan` is a runtime crash,
+    /// and the `Date()`-based arithmetic this replaced did not crash on
+    /// `.infinity` (a caller's idiomatic way to request "no timeout").
+    /// Unreachable with every current call site (all pass small finite
+    /// literals), but a public `TimeInterval` parameter with no upstream
+    /// validation should not be able to crash the process.
+    private static func duration(fromSeconds seconds: TimeInterval) -> Duration {
+        // A safe, comfortably-large-but-exactly-representable bound —
+        // roughly 31 billion years — well clear of `Int64`'s own limits
+        // (unlike `Double(Int64.max)`, which is not exactly representable
+        // as a `Double` and would itself risk a boundary conversion trap).
+        let safeMaximumSeconds: Double = 1e18
+        guard seconds.isFinite else {
+            return .seconds(Int64(safeMaximumSeconds))
         }
+        let clampedSeconds = Swift.min(Swift.max(seconds, -safeMaximumSeconds), safeMaximumSeconds)
+        let wholeSeconds = Int64(clampedSeconds)
+        let fractionalSeconds = clampedSeconds - Double(wholeSeconds)
+        let attoseconds = Int64((fractionalSeconds * 1_000_000_000_000_000_000).rounded())
+        return Duration(secondsComponent: wholeSeconds, attosecondsComponent: attoseconds)
     }
 
     // MARK: - Stdin delivery
@@ -317,6 +376,9 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, @unchecked
     /// hanging or raising `SIGPIPE` into this process. This write handle
     /// is owned exclusively by this function for the duration of the call;
     /// nothing else ever closes or writes to it concurrently.
+    ///
+    /// Any failure here is fail-closed for the whole invocation: see
+    /// `ProcessRunFailure.stdinDeliveryFailed`'s doc comment.
     private static func deliverStdin(
         _ data: Data,
         to pipe: Pipe,
