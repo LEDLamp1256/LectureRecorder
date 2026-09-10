@@ -17,7 +17,7 @@ nonisolated enum EmbeddedWorkerLocatorError: LocalizedError, Sendable, Equatable
         case .helperMissing(let url):
             return "Embedded worker helper not found at \(url.path)."
         case .helperNotARegularFile(let url):
-            return "Embedded worker helper at \(url.path) is not a regular file."
+            return "Embedded worker helper at \(url.path) is not a regular file (symbolic links, FIFOs, sockets, devices, and directories are all rejected)."
         case .helperNotExecutable(let url):
             return "Embedded worker helper at \(url.path) is not executable."
         case .helperEscapesExecutablesDirectory(let url):
@@ -56,20 +56,71 @@ nonisolated enum EmbeddedWorkerLocator {
             .appendingPathComponent(helperFileName)
             .standardizedFileURL
 
-        let directoryPrefix = executablesDirectory.path.hasSuffix("/")
-            ? executablesDirectory.path
-            : executablesDirectory.path + "/"
-        guard candidate.path.hasPrefix(directoryPrefix) else {
-            return .failure(.helperEscapesExecutablesDirectory(candidate))
-        }
+        return validate(candidate: candidate, expectedDirectory: executablesDirectory, fileManager: fileManager)
+    }
 
+    /// The independently-testable core of `resolve(bundle:fileManager:)`,
+    /// separated from `Bundle` resolution specifically so its rejection
+    /// rules (symlinks, non-regular files, directory escape, executable
+    /// permission) can be exercised directly against a temporary
+    /// directory in tests, without needing a real signed app bundle.
+    ///
+    /// Rejects:
+    /// - a missing path;
+    /// - anything that is itself a symbolic link, regardless of what it
+    ///   points to (checked via `URLResourceValues.isSymbolicLink`, which
+    ///   reflects the candidate path itself — `lstat` semantics — never
+    ///   what a symlink resolves to);
+    /// - anything that is not a regular file once symlinks are ruled out
+    ///   (`URLResourceValues.isRegularFile`) — this covers directories,
+    ///   FIFOs, sockets, and device nodes in one check, rather than only
+    ///   distinguishing "directory" from "not directory" as an earlier
+    ///   version of this type did;
+    /// - anything without the executable permission bit;
+    /// - anything whose *symlink-resolved* absolute path does not remain
+    ///   inside `expectedDirectory`'s own symlink-resolved absolute path
+    ///   — containment is checked against resolved paths, not merely
+    ///   standardized ones, as defense in depth beyond the symlink
+    ///   rejection above.
+    static func validate(
+        candidate: URL,
+        expectedDirectory: URL,
+        fileManager: FileManager = .default
+    ) -> Result<URL, EmbeddedWorkerLocatorError> {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory) else {
             return .failure(.helperMissing(candidate))
         }
-        guard isDirectory.boolValue == false else {
+
+        let resourceKeys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isRegularFileKey]
+        let resourceValues: URLResourceValues
+        do {
+            resourceValues = try candidate.resourceValues(forKeys: resourceKeys)
+        } catch {
             return .failure(.helperNotARegularFile(candidate))
         }
+
+        // `isSymbolicLink` reflects the candidate path itself (lstat-style
+        // semantics) regardless of what it points to — a symlink to a
+        // perfectly valid executable is still rejected here, before
+        // `isRegularFile` (which follows symlinks) would otherwise let it
+        // through.
+        guard resourceValues.isSymbolicLink != true else {
+            return .failure(.helperNotARegularFile(candidate))
+        }
+        guard resourceValues.isRegularFile == true else {
+            return .failure(.helperNotARegularFile(candidate))
+        }
+
+        let resolvedCandidate = candidate.resolvingSymlinksInPath()
+        let resolvedDirectory = expectedDirectory.resolvingSymlinksInPath()
+        let directoryPrefix = resolvedDirectory.path.hasSuffix("/")
+            ? resolvedDirectory.path
+            : resolvedDirectory.path + "/"
+        guard resolvedCandidate.path.hasPrefix(directoryPrefix) else {
+            return .failure(.helperEscapesExecutablesDirectory(candidate))
+        }
+
         guard fileManager.isExecutableFile(atPath: candidate.path) else {
             return .failure(.helperNotExecutable(candidate))
         }

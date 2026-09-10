@@ -5,10 +5,51 @@ import XCTest
 /// helper. Distinct from `FoundationProcessRunnerTests`/
 /// `TranscriptionWorkerClientTests`: those prove protocol and lifecycle
 /// correctness; this file specifically proves *placement*, *signing*, and
-/// *inherited-sandbox file access* — the properties the second
-/// architecture review flagged as needing direct confirmation rather than
-/// inference from build settings alone.
+/// *inherited-sandbox file access*.
+///
+/// Ordering matters here: `testHostedProcessExhibitsActiveAppSandboxContainerRedirection`
+/// must be read as the load-bearing proof that this test process is
+/// actually running under App Sandbox — without it, a positive read
+/// result from `testInheritedSandboxPermitsReadingAControlledSourceFileWithoutModifyingIt`
+/// alone would pass identically whether or not the hosted process were
+/// sandboxed at all (reading a temp file requires no sandbox-specific
+/// permission either way), so it cannot by itself distinguish "sandboxed
+/// and correctly inheriting" from "not sandboxed." This deliberately does
+/// NOT attempt a write outside the sandbox to prove denial — that would be
+/// brittle and unnecessary; instead it uses a positive, non-brittle
+/// signature of active sandbox enforcement already documented elsewhere in
+/// this repository (`FileSystemLocator.swift`'s own doc comment): a
+/// sandboxed process's `.applicationSupportDirectory` is silently
+/// redirected by the OS into `~/Library/Containers/<bundle-id>/...`,
+/// something that never happens for an unsandboxed process.
 final class EmbeddedWorkerSmokeTests: XCTestCase {
+
+    // MARK: - Sandbox positive control (must run/be read before the inheritance test below)
+
+    func testHostedProcessExhibitsActiveAppSandboxContainerRedirection() throws {
+        let fileManager = FileManager.default
+        guard let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return XCTFail("Could not resolve this process's Application Support directory")
+        }
+        guard let bundleID = Bundle.main.bundleIdentifier else {
+            return XCTFail("Could not resolve the hosting app's bundle identifier")
+        }
+
+        let expectedContainerFragment = "Library/Containers/\(bundleID)/Data/Library/Application Support"
+        XCTAssertTrue(
+            appSupportURL.path.contains(expectedContainerFragment),
+            """
+            Expected the hosted test process's Application Support directory to be \
+            sandbox-redirected to contain "\(expectedContainerFragment)", but got \
+            "\(appSupportURL.path)". This process does not appear to be running under \
+            active App Sandbox enforcement — if so, the read-only inherited-access test \
+            below is NOT valid evidence of sandbox inheritance and must not be treated \
+            as such.
+            """
+        )
+    }
+
+    // MARK: - Placement
 
     func testHelperResolvesToARealExecutableFileInsideAppBundleMacOSDirectory() throws {
         let url = try WorkerFixtureTestSupport.resolveFixtureURLOrFail()
@@ -17,37 +58,36 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
         XCTAssertEqual(url.lastPathComponent, "LectureRecorderWorkerFixture")
     }
 
+    // MARK: - Signing: exact entitlement set
+
     func testHelperCodeSignatureCarriesExactlyTheApprovedEntitlements() throws {
         let helperURL = try WorkerFixtureTestSupport.resolveFixtureURLOrFail()
-        let entitlementsXML = try runCodesignEntitlements(at: helperURL)
+        let entitlements = try readEntitlementsPlist(at: helperURL)
 
-        XCTAssertTrue(entitlementsXML.contains("com.apple.security.app-sandbox"))
-        XCTAssertTrue(entitlementsXML.contains("com.apple.security.inherit"))
-        // No other entitlement keys should be present.
-        let disallowedKeys = [
-            "com.apple.security.network",
-            "com.apple.security.device.audio-input",
-            "com.apple.security.files.user-selected",
-            "com.apple.security.get-task-allow",
-        ]
-        for key in disallowedKeys {
-            XCTAssertFalse(entitlementsXML.contains(key), "Helper entitlements unexpectedly contain \(key)")
-        }
+        XCTAssertEqual(entitlements.count, 2, "Expected exactly 2 entitlement keys, got \(entitlements.keys.sorted())")
+        XCTAssertEqual(entitlements["com.apple.security.app-sandbox"] as? Bool, true)
+        XCTAssertEqual(entitlements["com.apple.security.inherit"] as? Bool, true)
     }
 
-    func testHelperCodeSignatureTeamMatchesApp() throws {
+    // MARK: - Signing: identifier and team
+
+    func testHelperCodeSignatureIdentifierAndTeamAreExact() throws {
         let helperURL = try WorkerFixtureTestSupport.resolveFixtureURLOrFail()
-        let helperTeam = try runCodesignTeamIdentifier(at: helperURL)
+        let helperInfo = try readCodesignInfo(at: helperURL)
+
+        XCTAssertEqual(helperInfo.identifier, "LectureRecorderWorkerFixture")
+        XCTAssertFalse(helperInfo.teamIdentifier.isEmpty)
 
         guard let appExecutableURL = Bundle.main.executableURL else {
             return XCTFail("Could not resolve the hosting app's own executable URL")
         }
         let appBundleURL = appExecutableURL.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let appTeam = try runCodesignTeamIdentifier(at: appBundleURL)
+        let appInfo = try readCodesignInfo(at: appBundleURL)
 
-        XCTAssertEqual(helperTeam, appTeam)
-        XCTAssertFalse(helperTeam.isEmpty)
+        XCTAssertEqual(helperInfo.teamIdentifier, appInfo.teamIdentifier)
     }
+
+    // MARK: - Launch and inherited access (valid only given the positive control above)
 
     func testHostedProcessCanLaunchEmbeddedHelperAndReceiveAValidResponse() async throws {
         let client = TranscriptionWorkerClient(processRunner: FoundationProcessRunner())
@@ -100,33 +140,84 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func runCodesignEntitlements(at url: URL) throws -> String {
+    private struct CodesignInfo {
+        var identifier: String
+        var teamIdentifier: String
+    }
+
+    /// Runs `codesign -d --entitlements - --xml`, checks its exit status,
+    /// and parses the resulting plist into a dictionary — rather than
+    /// substring-searching the raw XML — so the caller can assert the
+    /// exact key/value set.
+    private func readEntitlementsPlist(at url: URL) throws -> [String: Any] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
         process.arguments = ["-d", "--entitlements", "-", "--xml", url.path]
         let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
-        process.standardError = Pipe()
+        process.standardError = stderrPipe
         try process.run()
-        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+
+        guard process.terminationStatus == 0 else {
+            let diagnostics = String(data: errorData, encoding: .utf8) ?? "<no diagnostics>"
+            XCTFail("codesign -d --entitlements exited \(process.terminationStatus) for \(url.path): \(diagnostics)")
+            return [:]
+        }
+
+        guard !outputData.isEmpty else {
+            XCTFail("codesign -d --entitlements produced no output for \(url.path)")
+            return [:]
+        }
+
+        let plistObject = try PropertyListSerialization.propertyList(from: outputData, options: [], format: nil)
+        guard let dictionary = plistObject as? [String: Any] else {
+            XCTFail("Entitlements plist for \(url.path) did not decode as a dictionary")
+            return [:]
+        }
+        return dictionary
     }
 
-    private func runCodesignTeamIdentifier(at url: URL) throws -> String {
+    /// Runs `codesign -dvvv`, checks its exit status, and parses out both
+    /// `Identifier=` and `TeamIdentifier=` from its diagnostic (stderr)
+    /// output.
+    private func readCodesignInfo(at url: URL) throws -> CodesignInfo {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
         process.arguments = ["-dvvv", url.path]
+        let stdoutPipe = Pipe()
         let stderrPipe = Pipe() // codesign -dvvv writes its report to stderr
-        process.standardOutput = Pipe()
+        process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         try process.run()
-        let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        for line in text.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
-            return String(line.dropFirst("TeamIdentifier=".count))
+
+        guard process.terminationStatus == 0 else {
+            let diagnostics = String(data: errorData, encoding: .utf8) ?? "<no diagnostics>"
+            XCTFail("codesign -dvvv exited \(process.terminationStatus) for \(url.path): \(diagnostics)")
+            return CodesignInfo(identifier: "", teamIdentifier: "")
         }
-        return ""
+
+        let text = String(data: errorData, encoding: .utf8) ?? ""
+        var identifier = ""
+        var teamIdentifier = ""
+        for line in text.split(separator: "\n") {
+            if line.hasPrefix("Identifier=") {
+                identifier = String(line.dropFirst("Identifier=".count))
+            } else if line.hasPrefix("TeamIdentifier=") {
+                teamIdentifier = String(line.dropFirst("TeamIdentifier=".count))
+            }
+        }
+
+        if identifier.isEmpty || teamIdentifier.isEmpty {
+            XCTFail("Could not parse Identifier/TeamIdentifier from codesign -dvvv output for \(url.path): \(text)\n\(String(data: outputData, encoding: .utf8) ?? "")")
+        }
+
+        return CodesignInfo(identifier: identifier, teamIdentifier: teamIdentifier)
     }
 }

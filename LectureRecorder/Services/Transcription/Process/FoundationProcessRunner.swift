@@ -24,9 +24,11 @@ import Foundation
 /// The only `Foundation.Process` instance for an invocation is owned by a
 /// single `ManagedProcess`, which mediates every operation on it through
 /// its own internal `Mutex`. This type never holds or passes around a raw
-/// `Process` reference — see `ManagedProcess`'s header comment for why
-/// that matters and where the one remaining `@unchecked Sendable` in T2
-/// lives (not here).
+/// `Process` reference — see `ManagedProcess`'s header comment for the
+/// full argument. T2 has no `@unchecked Sendable` anywhere at all:
+/// `Synchronization.Mutex` is unconditionally `Sendable` regardless of
+/// what it wraps, so both `ManagedProcess` and this type compile as plain
+/// `Sendable` without an escape hatch.
 ///
 /// ## Deadlines
 /// `overallTimeout`/`gracePeriod` are measured against `ContinuousClock`,
@@ -37,9 +39,13 @@ import Foundation
 /// ## Termination proof
 /// `Process.terminate()`/`SIGKILL` are requests, never proof. The only
 /// accepted proof of termination is `Process.terminationHandler` firing —
-/// per `Foundation`'s own documented behavior, that handler fires only
-/// after the process has already been reaped internally. This type never
-/// uses `kill(pid, 0)` after completion to "confirm" anything.
+/// that handler fires only after the process has already been reaped
+/// internally. Apple does not publish this as a documented contract; it is
+/// empirically verified on this project's exact supported toolchain (see
+/// `ManagedProcessTerminationHandlerTests`, which stress-tests it directly,
+/// including the specific case this design depends on — a handler
+/// installed after the process has already exited). This type never uses
+/// `kill(pid, 0)` after completion to "confirm" anything.
 ///
 /// ## Fail-closed stdin
 /// If stdin delivery cannot be confirmed complete, no response is ever
@@ -179,11 +185,32 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
         // child task happens to start).
         async let terminationObservation = Self.waitForTermination(managedProcess)
 
+        // Every discovered I/O failure (stdin delivery, stdout/stderr read)
+        // is published to `state` and triggers termination at the moment
+        // of discovery, inside these closures — not only after all four
+        // `async let`s have already been joined. Recording only after the
+        // join was a real, confirmed bug: a child that broke the stdin
+        // contract and then hung would previously wait out the *entire*
+        // `overallTimeout` before ever classifying as anything,
+        // and `watchAndEscalate`'s own timeout would win the race to
+        // `recordFatalIntervention` first, misreporting `.timedOut`
+        // instead of `.stdinDeliveryFailed`. Publishing here lets
+        // `watchAndEscalate`'s `state.claimedFailure == nil` polling loop
+        // (which it already had) observe the failure on its very next
+        // poll tick and terminate promptly instead. First-intervention-
+        // wins precedence is unaffected: `recordFatalIntervention` is
+        // still the single, idempotent, mutex-guarded arbiter — calling
+        // it earlier only changes *when* a failure can win, never
+        // *whether* an already-recorded earlier intervention can be
+        // overridden.
         async let stdinResult = Self.deliverStdin(
             request.stdin,
             to: stdinPipe,
-            state: state,
-            ioQueue: ioQueue
+            ioQueue: ioQueue,
+            onFailure: { failure in
+                state.recordFatalIntervention(failure)
+                managedProcess.terminate()
+            }
         )
         async let stdoutResult = Self.drainBounded(
             pipe: stdoutPipe,
@@ -193,6 +220,10 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
                 state.recordFatalIntervention(.stdoutLimitExceeded(limit: request.maximumStdoutBytes))
                 managedProcess.terminate()
             },
+            onReadFailure: { failure in
+                state.recordFatalIntervention(failure)
+                managedProcess.terminate()
+            },
             makeReadFailure: { .stdoutReadFailed(underlying: $0) }
         )
         async let stderrResult = Self.drainBounded(
@@ -200,6 +231,10 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
             limit: request.maximumStderrBytes,
             ioQueue: ioQueue,
             onOverflow: nil,
+            onReadFailure: { failure in
+                state.recordFatalIntervention(failure)
+                managedProcess.terminate()
+            },
             makeReadFailure: { .stderrReadFailed(underlying: $0) }
         )
         async let escalation: Void = Self.watchAndEscalate(
@@ -267,9 +302,11 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     /// `FailureCoordinator` already uses for `DispatchGroup.notify`
     /// (`drainDelivery()`), chosen there and here over a blocking wait.
     /// Only ever called after `ManagedProcess.launch()` has already
-    /// succeeded, so `onTermination` firing exactly once is guaranteed by
-    /// `Foundation.Process`'s own documented behavior — there is no
-    /// launch-failure path through this function at all.
+    /// succeeded (there is no launch-failure path through this function
+    /// at all), so `onTermination` firing exactly once is guaranteed by
+    /// `Foundation.Process`'s empirically-verified behavior on this
+    /// project's exact supported toolchain — not an Apple-published
+    /// contract; see `ManagedProcessTerminationHandlerTests`.
     private static func waitForTermination(_ managedProcess: ManagedProcess) async -> ProcessTerminationReason {
         await withCheckedContinuation { (continuation: CheckedContinuation<ProcessTerminationReason, Never>) in
             managedProcess.observeTermination { reason in
@@ -287,9 +324,14 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     /// per process. This polling idiom matches this repository's own
     /// established callback-to-async bridge pattern
     /// (`InFlightCallbackGate.drain()`: `while … { await Task.yield() }`).
-    /// All deadline arithmetic uses `ContinuousClock`, never wall-clock
-    /// `Date()`, so a system clock adjustment cannot affect timeout or
-    /// grace-period behavior.
+    /// All deadline arithmetic is monotonic — never wall-clock `Date()` —
+    /// so a system clock adjustment cannot affect timeout or grace-period
+    /// behavior. The timeout-wait phase uses `ContinuousClock` directly;
+    /// the grace-period phase deliberately switches to a
+    /// `DispatchTime`/`DispatchQueue.asyncAfter`-based wait instead — see
+    /// the comment at that call site for why `ContinuousClock.sleep`
+    /// specifically is unsafe to use once termination has already been
+    /// requested under cancellation.
     private static func watchAndEscalate(
         managedProcess: ManagedProcess,
         state: ProcessInvocationState,
@@ -318,23 +360,92 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
         // to request more than once.
         managedProcess.terminate()
 
-        // `!Task.isCancelled` matters here even though `state.claimedFailure`
-        // already reflects cancellation by this point (via `run()`'s
-        // `onCancel` handler): `clock.sleep(for:)` throws immediately once
-        // this task is cancelled, and `try?` alone silently swallows that
-        // and loops right back around — a measured ~1,700x busy-spin
-        // against production's 2-second default grace period, each
-        // iteration also contending for `managedProcess`'s own mutex.
-        // Breaking out here still falls through to
-        // `forceKillIfStillRunning()` below rather than returning early,
-        // so a cancelled invocation still gets its forced-escalation
-        // attempt rather than leaving the child to the grace period alone.
-        let escalationDeadline = clock.now.advanced(by: Self.duration(fromSeconds: gracePeriod))
-        while managedProcess.isRunning, !Task.isCancelled, clock.now < escalationDeadline {
-            try? await clock.sleep(for: pollDuration)
-        }
+        // The grace-period wait deliberately does NOT use `clock.sleep`
+        // (or any other Task-cancellation-aware sleep API) here. An
+        // earlier version did, discovered `clock.sleep(for:)` throws
+        // immediately once this task is cancelled, and "fixed" the
+        // resulting `try?`-swallowed busy-spin (measured ~1,700x against
+        // production's 2-second default grace period) by adding a
+        // `!Task.isCancelled` loop clause — which is wrong for a
+        // different reason: `watchAndEscalate` runs as a structured child
+        // of the very task `run(_:)`'s cancellation propagates through,
+        // so by the time execution reaches this point (cancellation is
+        // almost always what triggered termination in the first place),
+        // `Task.isCancelled` is already `true`, and that loop exited on
+        // its very first check — skipping the entire configured grace
+        // period rather than merely avoiding the spin. Cancelling the
+        // *caller's* interest in the outcome must never shorten this
+        // type's own internal grace-period policy: the grace period is
+        // this runner's own escalation contract, not something a caller
+        // opts out of by cancelling. `waitWhileRunningOrDeadline` below
+        // uses a `DispatchQueue.asyncAfter`-backed timer instead — a real
+        // GCD timer that is not a Swift Task cancellation checkpoint at
+        // all, so it neither spins nor observes cancellation, while still
+        // returning promptly (per-tick, bounded by `pollInterval`) if the
+        // child exits naturally partway through the wait.
+        let escalationDeadline = DispatchTime.now() + Self.dispatchTimeInterval(fromSeconds: gracePeriod)
+        await Self.waitWhileRunningOrDeadline(
+            managedProcess,
+            pollInterval: pollInterval,
+            deadline: escalationDeadline
+        )
 
         managedProcess.forceKillIfStillRunning()
+    }
+
+    /// Waits, in bounded `pollInterval`-sized ticks, until either the
+    /// process is no longer running or `deadline` passes — whichever
+    /// comes first — using `DispatchQueue.asyncAfter`, which is immune to
+    /// Swift Task cancellation (unlike `Task.sleep`/`ContinuousClock.sleep`,
+    /// which both throw the instant the calling task is cancelled). This
+    /// is what lets the grace period elapse for real, in monotonic wall
+    /// time, even when the invocation that requested termination has
+    /// itself already been cancelled — while still returning as soon as
+    /// the child actually exits, rather than always waiting out the full
+    /// period. `DispatchTime` is `mach_absolute_time`-based (monotonic),
+    /// never wall-clock `Date()`.
+    private static func waitWhileRunningOrDeadline(
+        _ managedProcess: ManagedProcess,
+        pollInterval: TimeInterval,
+        deadline: DispatchTime
+    ) async {
+        let tick = Self.dispatchTimeInterval(fromSeconds: max(pollInterval, 0.001))
+        while managedProcess.isRunning, DispatchTime.now() < deadline {
+            await Self.nonCancellableDelay(tick)
+        }
+    }
+
+    /// A suspension that is not a Swift Task cancellation checkpoint:
+    /// `withCheckedContinuation` (the non-throwing overload) never checks
+    /// or reacts to cancellation on its own — it only resumes when
+    /// `resume()` is explicitly called, which here happens strictly from
+    /// the GCD timer firing. The timer is always scheduled to fire
+    /// eventually regardless of what the caller does afterward, so this
+    /// function — and by extension `waitWhileRunningOrDeadline` and
+    /// `watchAndEscalate` — always completes and is always fully joined
+    /// before `performInvocation` returns; nothing here can outlive the
+    /// invocation.
+    private static func nonCancellableDelay(_ interval: DispatchTimeInterval) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().asyncAfter(deadline: .now() + interval) {
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Converts a `TimeInterval` (seconds) into a `DispatchTimeInterval`
+    /// for use with `DispatchTime`/`DispatchQueue.asyncAfter`. Negative or
+    /// non-finite input clamps to zero (an immediate/no-op delay) rather
+    /// than trapping or producing an unbounded wait.
+    private static func dispatchTimeInterval(fromSeconds seconds: TimeInterval) -> DispatchTimeInterval {
+        guard seconds.isFinite, seconds > 0 else {
+            return .nanoseconds(0)
+        }
+        let nanoseconds = seconds * 1_000_000_000
+        guard nanoseconds < Double(Int.max) else {
+            return .nanoseconds(Int.max)
+        }
+        return .nanoseconds(Int(nanoseconds))
     }
 
     /// Converts a `TimeInterval` (seconds, `Double`) into a `Duration`
@@ -378,12 +489,17 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     /// nothing else ever closes or writes to it concurrently.
     ///
     /// Any failure here is fail-closed for the whole invocation: see
-    /// `ProcessRunFailure.stdinDeliveryFailed`'s doc comment.
+    /// `ProcessRunFailure.stdinDeliveryFailed`'s doc comment. `onFailure`
+    /// is invoked synchronously, on `ioQueue`, at the exact moment the
+    /// write fails — before the continuation resumes — so the failure is
+    /// published to `ProcessInvocationState` (and termination requested)
+    /// at discovery time rather than only after every `async let` in
+    /// `performInvocation` has already been joined.
     private static func deliverStdin(
         _ data: Data,
         to pipe: Pipe,
-        state: ProcessInvocationState,
-        ioQueue: DispatchQueue
+        ioQueue: DispatchQueue,
+        onFailure: @Sendable @escaping (ProcessRunFailure) -> Void
     ) async -> Result<Void, ProcessRunFailure> {
         await withCheckedContinuation { (continuation: CheckedContinuation<Result<Void, ProcessRunFailure>, Never>) in
             ioQueue.async {
@@ -398,7 +514,9 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
                     do {
                         try handle.write(contentsOf: chunk)
                     } catch {
-                        continuation.resume(returning: .failure(.stdinDeliveryFailed(underlying: String(describing: error))))
+                        let failure = ProcessRunFailure.stdinDeliveryFailed(underlying: String(describing: error))
+                        onFailure(failure)
+                        continuation.resume(returning: .failure(failure))
                         return
                     }
                     offset = end
@@ -429,11 +547,20 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
     /// cannot catch, crashing the process outright. This is the same class
     /// of hazard already fixed on the stdin write side via
     /// `F_SETNOSIGPIPE`; the read side gets the equivalent treatment here.
+    ///
+    /// `onReadFailure` (distinct from `onOverflow`) is invoked
+    /// synchronously, on `ioQueue`, the moment a genuine read error is
+    /// discovered — before the continuation resumes — publishing the
+    /// failure to `ProcessInvocationState` and requesting termination at
+    /// discovery time, exactly like `onOverflow` already did for the
+    /// overflow case; a real read failure used to only be recorded after
+    /// every operation in `performInvocation` had already been joined.
     private static func drainBounded(
         pipe: Pipe,
         limit: Int,
         ioQueue: DispatchQueue,
         onOverflow: (@Sendable () -> Void)?,
+        onReadFailure: @Sendable @escaping (ProcessRunFailure) -> Void,
         makeReadFailure: @Sendable @escaping (String) -> ProcessRunFailure
     ) async -> Result<DrainOutcome, ProcessRunFailure> {
         await withCheckedContinuation { (continuation: CheckedContinuation<Result<DrainOutcome, ProcessRunFailure>, Never>) in
@@ -454,7 +581,9 @@ nonisolated final class FoundationProcessRunner: LocalProcessRunning, Sendable {
                         }
                         chunk = readChunk
                     } catch {
-                        continuation.resume(returning: .failure(makeReadFailure(String(describing: error))))
+                        let failure = makeReadFailure(String(describing: error))
+                        onReadFailure(failure)
+                        continuation.resume(returning: .failure(failure))
                         return
                     }
 

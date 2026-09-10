@@ -28,7 +28,18 @@ nonisolated struct ProcessInvocationRequest: Sendable {
     var maximumStdinBytes: Int
     var maximumStdoutBytes: Int
     var maximumStderrBytes: Int
+    /// No upstream validation is performed on this value. `.infinity` is a
+    /// supported way to request "no timeout" (the deadline is clamped to
+    /// a large-but-finite duration internally — see
+    /// `FoundationProcessRunner.duration(fromSeconds:)` — rather than
+    /// crashing); `.nan` is treated identically to `.infinity` rather than
+    /// as an error. A negative or zero value produces an already-elapsed
+    /// deadline, i.e. the invocation is treated as immediately timed out
+    /// once launched. No current call site passes anything other than a
+    /// small positive literal; this documents the contract for whatever
+    /// eventually does.
     var overallTimeout: TimeInterval
+    /// Same non-finite/negative handling as `overallTimeout` above.
     var gracePeriod: TimeInterval
 
     init(

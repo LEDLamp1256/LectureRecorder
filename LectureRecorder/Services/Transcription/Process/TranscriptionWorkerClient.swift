@@ -43,7 +43,7 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
         case .identityMismatch(let field):
             return "Worker response's \(field) did not match the request."
         case .unexpectedWorkerIdentity(let expected, let actual):
-            return "Worker response identified itself as \(actual), expected \(expected)."
+            return "Worker response identified itself as \(Self.boundedIdentityPreview(actual)), expected \(expected)."
         case .invalidOutcomeShape:
             return "Worker response's outcome/output/failure shape was inconsistent."
         }
@@ -89,6 +89,32 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
         let truncationNote = wasTruncated ? " [stderr truncated]" : ""
         return "stderr (\(stderr.count) bytes captured): \(boundedText)\(truncationNote)"
     }
+
+    /// `workerIdentifier` is a decoded JSON string field bounded only by
+    /// the invocation's overall stdout cap (default 8 MiB) — a worker
+    /// (buggy or adversarial) could return an enormous value here, and
+    /// nothing upstream of this diagnostic bounds it. Caps the rendered
+    /// preview at 256 bytes using the same scalar-walking approach as
+    /// `diagnosticPreview` (never splits a character, never crashes on
+    /// pathological input) — this is a separate, much smaller bound than
+    /// the 4 KiB stderr preview, since a worker identifier has no
+    /// legitimate reason to be long at all.
+    private static func boundedIdentityPreview(_ identity: String) -> String {
+        let byteLimit = 256
+        var bounded = ""
+        var renderedByteCount = 0
+        var wasTruncated = false
+        for scalar in identity.unicodeScalars {
+            let scalarByteCount = String(scalar).utf8.count
+            guard renderedByteCount + scalarByteCount <= byteLimit else {
+                wasTruncated = true
+                break
+            }
+            bounded.unicodeScalars.append(scalar)
+            renderedByteCount += scalarByteCount
+        }
+        return wasTruncated ? "\(bounded)… [truncated, \(identity.utf8.count) bytes total]" : bounded
+    }
 }
 
 /// The three-way outcome a real caller must distinguish, matching the
@@ -132,6 +158,25 @@ nonisolated struct WorkerInvocationLimits: Sendable {
 /// a caller — always resolves via `EmbeddedWorkerLocator`, the one trusted
 /// source. Has no production call site in T2: nothing in `SessionManager`,
 /// `AppEnvironment`, or `Transcribing` references this type.
+///
+/// ## Where the cancellation commitment point actually is
+/// `FoundationProcessRunner`'s own `ProcessInvocationState` is the
+/// authoritative commitment boundary: once it commits success, a later
+/// cancellation of the calling task cannot retroactively replace that
+/// outcome — that rule is about the *process-level* invocation (did the
+/// child run to completion under the runner's care, confirmed terminated,
+/// I/O joined). `classify`/`decodeAndValidate` below run strictly after
+/// `processRunner.run(request)` has already returned that already-
+/// committed result; they are a separate, fast, synchronous, side-effect-
+/// free computation over bytes that already fully exist — there is no
+/// `await` and no `Task.checkCancellation()` inside either, so Swift's
+/// cooperative cancellation cannot preempt them mid-computation even in
+/// principle. This is intentional, not an oversight: a caller whose own
+/// task is cancelled after the process-level commitment has already
+/// happened still receives a fully-computed, trustworthy `submit()`
+/// result reflecting bytes that were already fully and successfully
+/// obtained: rejecting or discarding that result post hoc would not make
+/// the invocation any less real, only harder to observe.
 nonisolated struct TranscriptionWorkerClient: Sendable {
     private let processRunner: any LocalProcessRunning
     private let expectedWorkerIdentifier: String

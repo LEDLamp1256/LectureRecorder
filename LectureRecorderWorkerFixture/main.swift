@@ -13,12 +13,28 @@ struct ParsedArguments {
     var mode: String
     var delayMilliseconds: Int
     var sourcePath: String?
+    var readyFilePath: String?
+}
+
+/// Signals readiness to an external test by creating an empty file at a
+/// test-supplied path — an out-of-band channel independent of stdout/
+/// stderr, which `FoundationProcessRunner` only exposes as a single,
+/// fully-captured `Data` once the pipe reaches EOF (i.e., not observable
+/// live while the child is still running). Polling for this file's
+/// existence lets a test wait for a genuine interleaving point (e.g.,
+/// "the SIGTERM-ignore handler is installed") without expanding
+/// `FoundationProcessRunner`'s production API and without substituting an
+/// arbitrary sleep as proof of the intended ordering.
+func announceReady(at path: String?) {
+    guard let path else { return }
+    FileManager.default.createFile(atPath: path, contents: Data())
 }
 
 func parseArguments() -> ParsedArguments {
     var mode = "success"
     var delayMilliseconds = 300
     var sourcePath: String?
+    var readyFilePath: String?
 
     for argument in CommandLine.arguments.dropFirst() {
         if argument.hasPrefix("--mode=") {
@@ -27,10 +43,12 @@ func parseArguments() -> ParsedArguments {
             delayMilliseconds = Int(argument.dropFirst("--delay-ms=".count)) ?? delayMilliseconds
         } else if argument.hasPrefix("--source-path=") {
             sourcePath = String(argument.dropFirst("--source-path=".count))
+        } else if argument.hasPrefix("--ready-file=") {
+            readyFilePath = String(argument.dropFirst("--ready-file=".count))
         }
     }
 
-    return ParsedArguments(mode: mode, delayMilliseconds: delayMilliseconds, sourcePath: sourcePath)
+    return ParsedArguments(mode: mode, delayMilliseconds: delayMilliseconds, sourcePath: sourcePath, readyFilePath: readyFilePath)
 }
 
 func readAllStdin() -> Data {
@@ -338,6 +356,29 @@ case "ignore-sigterm":
     Thread.sleep(forTimeInterval: 30.0)
     exit(0)
 
+case "ignore-sigterm-announce-ready":
+    // Installs the SIGTERM-ignore handler and announces readiness via the
+    // ready-file BEFORE sleeping, so a test can poll for that file and
+    // only then trigger cancellation/termination — proving the intended
+    // interleaving (handler genuinely installed before termination is
+    // requested) rather than relying on an arbitrary sleep to hope the
+    // handler is installed in time.
+    signal(SIGTERM, SIG_IGN)
+    announceReady(at: arguments.readyFilePath)
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
+case "close-stdin-then-hang":
+    // Breaks the stdin contract immediately (closes its read end without
+    // ever reading), then hangs well past any reasonable overallTimeout —
+    // proving a stdin-delivery failure is published and terminates the
+    // invocation promptly, rather than only being recorded after the
+    // full timeout has already elapsed and won the race to classify the
+    // outcome.
+    close(0)
+    Thread.sleep(forTimeInterval: 30.0)
+    exit(0)
+
 case "close-stdin-early":
     close(0)
     Thread.sleep(forTimeInterval: 0.3)
@@ -345,10 +386,68 @@ case "close-stdin-early":
 
 case "delay-read-stdin":
     writeStderr(Data("waiting\n".utf8))
+    // Announces readiness immediately before committing to the read-free
+    // delay, so a test can poll for this file and only then act — proving
+    // the child has genuinely stopped reading (and the parent's write will
+    // therefore block once the pipe buffer fills) rather than relying on
+    // an arbitrary sleep to hope that state has been reached.
+    announceReady(at: arguments.readyFilePath)
     Thread.sleep(forTimeInterval: Double(arguments.delayMilliseconds) / 1000.0)
     let requestData = readAllStdin()
     guard let request = decodeRequest(requestData) else { exit(1) }
     writeStdout(encode(makeMatchingResponse(for: request)))
+    exit(0)
+
+case "three-way-pipe-pressure":
+    // Genuinely three-directional pipe pressure: this child reads stdin
+    // and writes stdout AND stderr in the same interleaved loop, each
+    // stream comfortably exceeding an ordinary Darwin pipe's ~64KiB
+    // buffer. A parent implementation that serialized any of these three
+    // directions — e.g. fully writing stdin before reading any output, or
+    // draining stdout to completion before touching stderr — deadlocks
+    // here: this child blocks writing to a full stdout (or stderr) pipe
+    // waiting to be read, while the parent's stdin write blocks waiting
+    // for this child to keep reading, and nothing in a serialized
+    // ordering ever breaks that cycle. Stdin content is opaque filler,
+    // not protocol JSON — this mode exercises `FoundationProcessRunner`'s
+    // own concurrent-drainage machinery, not worker-protocol decoding.
+    let chunkSize = 32 * 1024
+    let outputChunkCount = 64 // 64 * 32KiB = 2MiB on stdout, 2MiB on stderr
+    let stdoutFiller = Data(repeating: 0x4F, count: chunkSize) // 'O'
+    let stderrFiller = Data(repeating: 0x45, count: chunkSize) // 'E'
+    var stdinByteCount = 0
+    var readBuffer = [UInt8](repeating: 0, count: chunkSize)
+
+    // Raw POSIX `read(2)` on fd 0 rather than `FileHandle.read(upToCount:)`:
+    // unambiguous, directly-specified blocking semantics on a pipe
+    // descriptor (0 means EOF, a positive count is genuine data, -1/EINTR
+    // is retried) that don't depend on Foundation's own throwing-optional
+    // wrapper around the same syscall.
+    func readStdinChunk() -> Int {
+        while true {
+            let bytesRead = readBuffer.withUnsafeMutableBytes { buffer -> Int in
+                Darwin.read(0, buffer.baseAddress, chunkSize)
+            }
+            if bytesRead >= 0 { return bytesRead }
+            if errno == EINTR { continue }
+            return 0
+        }
+    }
+
+    for _ in 0..<outputChunkCount {
+        writeStdout(stdoutFiller)
+        writeStderr(stderrFiller)
+        stdinByteCount += readStdinChunk()
+    }
+    // Drain whatever stdin remains to completion, confirming the
+    // parent's write was fully delivered rather than merely "enough to
+    // unstick the interleaved loop above."
+    while true {
+        let n = readStdinChunk()
+        if n == 0 { break }
+        stdinByteCount += n
+    }
+    writeStdout(Data("\nSTDIN_BYTES=\(stdinByteCount)\n".utf8))
     exit(0)
 
 case "echo-args":
