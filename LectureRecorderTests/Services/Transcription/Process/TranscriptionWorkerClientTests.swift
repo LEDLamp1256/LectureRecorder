@@ -1,18 +1,122 @@
 import XCTest
 @testable import LectureRecorder
 
-/// End-to-end tests: `TranscriptionWorkerClient` driving the real,
-/// embedded, signed `LectureRecorderWorkerFixture` through
-/// `FoundationProcessRunner`. Proves the approved exit-code decision table
-/// and identity-validation rules against a real process boundary, not a
-/// mock.
+/// Deterministic client/protocol decision-table tests. A fixed
+/// `LocalProcessRunning` implementation supplies process-layer outcomes so
+/// malformed responses, identity checks, and failure precedence remain
+/// authoritative even when Xcode mutates the hosted helper's signature.
 final class TranscriptionWorkerClientTests: XCTestCase {
+    private struct DeterministicFixtureRunner: LocalProcessRunning {
+        func run(_ request: ProcessInvocationRequest) async -> Result<ProcessRunResult, ProcessRunFailure> {
+            let mode = request.arguments.first(where: { $0.hasPrefix("--mode=") })?
+                .dropFirst("--mode=".count) ?? "success"
+
+            if mode == "delayed-response" {
+                if request.overallTimeout <= 0.2 {
+                    return .failure(.timedOut(afterSeconds: request.overallTimeout))
+                }
+                while !Task.isCancelled { await Task.yield() }
+                return .failure(.cancelled)
+            }
+            if mode == "respond-then-hang" {
+                return .failure(.timedOut(afterSeconds: request.overallTimeout))
+            }
+
+            guard let envelope = try? JSONDecoder().decode(WorkerRequestEnvelope<EmptyTestPayload>.self, from: request.stdin) else {
+                return .success(result(stdout: Data(), reason: .exited(status: 1)))
+            }
+            func response(
+                schemaVersion: Int = WorkerProtocolConstants.currentSchemaVersion,
+                requestID: UUID? = nil,
+                attemptID: UUID? = nil,
+                sessionID: UUID? = nil,
+                chunkSequenceNumber: Int? = nil,
+                sourceIdentity: String? = nil,
+                workerIdentifier: String = TrustedWorkerDescriptor.fixture.expectedWorkerIdentifier,
+                workerVersion: String = TrustedWorkerDescriptor.fixture.expectedWorkerVersion,
+                outcome: WorkerOutcome = .success,
+                output: TestFixtureOutput? = TestFixtureOutput(text: "fixture transcript"),
+                failure: WorkerDeclaredFailure? = nil
+            ) -> Data {
+                (try? JSONEncoder().encode(WorkerResponseEnvelope(
+                    schemaVersion: schemaVersion,
+                    requestID: requestID ?? envelope.requestID,
+                    attemptID: attemptID ?? envelope.attemptID,
+                    sessionID: sessionID ?? envelope.sessionID,
+                    chunkSequenceNumber: chunkSequenceNumber ?? envelope.chunkSequenceNumber,
+                    sourceIdentity: sourceIdentity ?? envelope.sourceIdentity,
+                    workerIdentifier: workerIdentifier,
+                    workerVersion: workerVersion,
+                    outcome: outcome,
+                    output: output,
+                    failure: failure
+                ))) ?? Data()
+            }
+
+            switch mode {
+            case "success": return .success(result(stdout: response()))
+            case "failure": return .success(result(stdout: response(
+                outcome: .failure,
+                output: nil,
+                failure: WorkerDeclaredFailure(message: "fixture declared failure")
+            )))
+            case "nonzero-no-response": return .success(result(stdout: Data(), reason: .exited(status: 7)))
+            case "nonzero-with-success-json": return .success(result(stdout: response(), reason: .exited(status: 7)))
+            case "self-signal": return .success(result(stdout: Data(), reason: .uncaughtSignal(5)))
+            case "empty-stdout": return .success(result(stdout: Data()))
+            case "malformed-json": return .success(result(stdout: Data("{not valid json".utf8)))
+            case "truncated-json": return .success(result(stdout: response().prefix(12)))
+            case "multiple-json-values":
+                let one = response()
+                return .success(result(stdout: one + one))
+            case "trailing-garbage": return .success(result(stdout: response() + Data(" not json garbage".utf8)))
+            case "unsupported-schema": return .success(result(stdout: response(schemaVersion: 999)))
+            case "mismatch-request-id": return .success(result(stdout: response(requestID: UUID())))
+            case "mismatch-attempt-id": return .success(result(stdout: response(attemptID: UUID())))
+            case "mismatch-session-id": return .success(result(stdout: response(sessionID: UUID())))
+            case "mismatch-chunk-sequence": return .success(result(stdout: response(chunkSequenceNumber: envelope.chunkSequenceNumber + 1)))
+            case "mismatch-source-identity": return .success(result(stdout: response(sourceIdentity: envelope.sourceIdentity + "-corrupted")))
+            case "wrong-worker-identity": return .success(result(stdout: response(workerIdentifier: "not-LectureRecorderWorkerFixture")))
+            case "invalid-outcome-success-with-no-output": return .success(result(stdout: response(output: nil)))
+            case "invalid-outcome-both-present": return .success(result(stdout: response(failure: WorkerDeclaredFailure(message: "unexpected"))))
+            case "large-stderr-nonzero-exit":
+                return .success(result(
+                    stdout: Data(),
+                    stderr: Data(repeating: 0x41, count: 1024 * 1024),
+                    stderrTruncated: true,
+                    reason: .exited(status: 3)
+                ))
+            case "invalid-utf8-stderr-nonzero-exit":
+                return .success(result(stdout: Data(), stderr: Data([0xFF, 0xFE, 0xC0, 0x80, 0x41, 0x42, 0x43]), reason: .exited(status: 3)))
+            case "short-stderr-nonzero-exit":
+                return .success(result(stdout: Data(), stderr: Data("boom: something went wrong".utf8), reason: .exited(status: 3)))
+            case "large-stderr":
+                return .success(result(stdout: response(), stderr: Data(repeating: 0x41, count: 4096), stderrTruncated: true))
+            default:
+                return .failure(.launchFailed(underlying: "Unsupported deterministic fixture mode \(mode)"))
+            }
+        }
+
+        private func result(
+            stdout: Data,
+            stderr: Data = Data(),
+            stderrTruncated: Bool = false,
+            reason: ProcessTerminationReason = .exited(status: 0)
+        ) -> ProcessRunResult {
+            ProcessRunResult(
+                stdout: stdout,
+                stderr: stderr,
+                stderrTruncated: stderrTruncated,
+                terminationReason: reason
+            )
+        }
+    }
+
     private var client: TranscriptionWorkerClient!
 
     override func setUpWithError() throws {
         try super.setUpWithError()
-        _ = try WorkerFixtureTestSupport.resolveFixtureURLOrFail() // fail fast with a clear message if missing
-        client = TranscriptionWorkerClient(processRunner: FoundationProcessRunner(pollInterval: 0.01))
+        client = TranscriptionWorkerClient(processRunner: DeterministicFixtureRunner())
     }
 
     private func submit(

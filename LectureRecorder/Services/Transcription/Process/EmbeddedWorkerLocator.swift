@@ -1,5 +1,48 @@
 import Foundation
 
+/// Closed selection of executable helpers trusted by the app. Each case
+/// owns both halves of its trust decision: the fixed embedded filename and
+/// the response identifier that executable must return. There is no raw
+/// string or URL initializer.
+nonisolated enum TrustedWorkerDescriptor: CaseIterable, Sendable, Equatable {
+    case fixture
+    case whisper
+
+    var fileName: String {
+        switch self {
+        case .fixture:
+            return "LectureRecorderWorkerFixture"
+        case .whisper:
+            return "LectureRecorderWhisperWorker"
+        }
+    }
+
+    var expectedWorkerIdentifier: String {
+        switch self {
+        case .fixture:
+            return "LectureRecorderWorkerFixture"
+        case .whisper:
+            return "LectureRecorderWhisperWorker"
+        }
+    }
+
+    var expectedWorkerVersion: String {
+        switch self {
+        case .fixture:
+            return "1.0"
+        case .whisper:
+            return WhisperCapabilityProbeConstants.workerImplementationVersion
+        }
+    }
+
+    /// Only the test fixture has an argument-driven mode surface. The
+    /// production Whisper helper's operation is selected exclusively by its
+    /// closed, versioned stdin payload.
+    var permitsCommandLineArguments: Bool {
+        self == .fixture
+    }
+}
+
 /// Every way `EmbeddedWorkerLocator` can refuse to hand back an executable
 /// URL. Distinguished from `ProcessRunFailure` because these are resolution
 /// failures that occur before any process is ever considered for launch.
@@ -36,24 +79,23 @@ nonisolated enum EmbeddedWorkerLocatorError: LocalizedError, Sendable, Equatable
 /// also standardizes a candidate URL and proves it remains beneath its
 /// intended directory before trusting it.
 nonisolated enum EmbeddedWorkerLocator {
-    /// The helper's fixed filename, exactly as produced by the "Embed
-    /// Helper Tools" Copy Files build phase into
-    /// `LectureRecorder.app/Contents/MacOS/`.
-    static let helperFileName = "LectureRecorderWorkerFixture"
-
     /// Resolves, standardizes, and validates the embedded worker helper's
     /// location. Never derives the executable directory from job, request,
     /// or environment data — always from `Bundle.main.executableURL`, the
     /// one trusted resolver for "where is this running app's own
     /// executable."
-    static func resolve(bundle: Bundle = .main, fileManager: FileManager = .default) -> Result<URL, EmbeddedWorkerLocatorError> {
+    static func resolve(
+        descriptor: TrustedWorkerDescriptor = .fixture,
+        bundle: Bundle = .main,
+        fileManager: FileManager = .default
+    ) -> Result<URL, EmbeddedWorkerLocatorError> {
         guard let executableURL = bundle.executableURL else {
             return .failure(.executablesDirectoryUnavailable)
         }
 
         let executablesDirectory = executableURL.deletingLastPathComponent().standardizedFileURL
         let candidate = executablesDirectory
-            .appendingPathComponent(helperFileName)
+            .appendingPathComponent(descriptor.fileName)
             .standardizedFileURL
 
         return validate(candidate: candidate, expectedDirectory: executablesDirectory, fileManager: fileManager)

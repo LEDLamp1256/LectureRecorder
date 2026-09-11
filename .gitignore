@@ -9,6 +9,12 @@ xcuserdata/
 build/
 DerivedData/
 
+# Explicitly prepared local whisper.cpp dependency (source, builds, binaries)
+.dependency-work/
+Generated/WhisperDependency/
+Generated/.WhisperDependency.publication-stage/
+Generated/.WhisperDependency.publication-backup/
+
 # Swift Package Manager build artifacts
 .build/
 

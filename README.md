@@ -2,6 +2,11 @@
 
 LectureRecorder is a native macOS application for lecture recording, transcription, and automated lecture note generation.
 
+> **Building from a clean checkout:** the pinned native Whisper dependency is
+> generated locally. Run `./Scripts/prepare-whisper-dependency.sh` before the
+> first app build. See [BUILDING.md](BUILDING.md) for prerequisites, offline
+> build behavior, and verified commands.
+
 The project is being built with Swift and SwiftUI, with an emphasis on recoverability and accurate transcription of technical lectures.
 
 ## Current Status

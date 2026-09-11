@@ -56,17 +56,16 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: url.path))
         XCTAssertTrue(url.path.contains("Contents/MacOS"), "Expected the helper inside Contents/MacOS, got \(url.path)")
         XCTAssertEqual(url.lastPathComponent, "LectureRecorderWorkerFixture")
+        try MachOHeaderValidator.validateThinArm64Executable(
+            Data(contentsOf: url, options: .mappedIfSafe)
+        )
     }
 
     // MARK: - Signing: exact entitlement set
 
     func testHelperCodeSignatureCarriesExactlyTheApprovedEntitlements() throws {
         let helperURL = try WorkerFixtureTestSupport.resolveFixtureURLOrFail()
-        let entitlements = try readEntitlementsPlist(at: helperURL)
-
-        XCTAssertEqual(entitlements.count, 2, "Expected exactly 2 entitlement keys, got \(entitlements.keys.sorted())")
-        XCTAssertEqual(entitlements["com.apple.security.app-sandbox"] as? Bool, true)
-        XCTAssertEqual(entitlements["com.apple.security.inherit"] as? Bool, true)
+        try WorkerEntitlementTestSupport.requireLaunchableSignature(at: helperURL)
     }
 
     // MARK: - Signing: identifier and team
@@ -90,6 +89,9 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
     // MARK: - Launch and inherited access (valid only given the positive control above)
 
     func testHostedProcessCanLaunchEmbeddedHelperAndReceiveAValidResponse() async throws {
+        try WorkerEntitlementTestSupport.requireLaunchableSignature(
+            at: WorkerFixtureTestSupport.resolveFixtureURLOrFail()
+        )
         let client = TranscriptionWorkerClient(processRunner: FoundationProcessRunner())
         let outcome = await client.submit(
             payload: EmptyTestPayload(),
@@ -105,6 +107,7 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
 
     func testInheritedSandboxPermitsReadingAControlledSourceFileWithoutModifyingIt() async throws {
         let fixtureURL = try WorkerFixtureTestSupport.resolveFixtureURLOrFail()
+        try WorkerEntitlementTestSupport.requireLaunchableSignature(at: fixtureURL)
         let sourceURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("t2-smoke-source-\(UUID().uuidString).txt")
         let originalContent = "controlled source content, must remain unmodified"
@@ -143,42 +146,6 @@ final class EmbeddedWorkerSmokeTests: XCTestCase {
     private struct CodesignInfo {
         var identifier: String
         var teamIdentifier: String
-    }
-
-    /// Runs `codesign -d --entitlements - --xml`, checks its exit status,
-    /// and parses the resulting plist into a dictionary — rather than
-    /// substring-searching the raw XML — so the caller can assert the
-    /// exact key/value set.
-    private func readEntitlementsPlist(at url: URL) throws -> [String: Any] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["-d", "--entitlements", "-", "--xml", url.path]
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        try process.run()
-        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            let diagnostics = String(data: errorData, encoding: .utf8) ?? "<no diagnostics>"
-            XCTFail("codesign -d --entitlements exited \(process.terminationStatus) for \(url.path): \(diagnostics)")
-            return [:]
-        }
-
-        guard !outputData.isEmpty else {
-            XCTFail("codesign -d --entitlements produced no output for \(url.path)")
-            return [:]
-        }
-
-        let plistObject = try PropertyListSerialization.propertyList(from: outputData, options: [], format: nil)
-        guard let dictionary = plistObject as? [String: Any] else {
-            XCTFail("Entitlements plist for \(url.path) did not decode as a dictionary")
-            return [:]
-        }
-        return dictionary
     }
 
     /// Runs `codesign -dvvv`, checks its exit status, and parses out both
