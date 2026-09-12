@@ -21,6 +21,8 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
     case unsupportedSchemaVersion(Int)
     case identityMismatch(field: String)
     case unexpectedWorkerIdentity(expected: String, actual: String)
+    case unexpectedWorkerVersion(expected: String, actual: String)
+    case commandLineArgumentsNotPermitted
     case invalidOutcomeShape
 
     var errorDescription: String? {
@@ -44,6 +46,10 @@ nonisolated enum WorkerClientFailure: LocalizedError, Sendable, Equatable {
             return "Worker response's \(field) did not match the request."
         case .unexpectedWorkerIdentity(let expected, let actual):
             return "Worker response identified itself as \(Self.boundedIdentityPreview(actual)), expected \(expected)."
+        case .unexpectedWorkerVersion(let expected, let actual):
+            return "Worker response declared implementation version \(Self.boundedIdentityPreview(actual)), expected \(expected)."
+        case .commandLineArgumentsNotPermitted:
+            return "The selected production worker does not permit command-line arguments."
         case .invalidOutcomeShape:
             return "Worker response's outcome/output/failure shape was inconsistent."
         }
@@ -179,14 +185,14 @@ nonisolated struct WorkerInvocationLimits: Sendable {
 /// the invocation any less real, only harder to observe.
 nonisolated struct TranscriptionWorkerClient: Sendable {
     private let processRunner: any LocalProcessRunning
-    private let expectedWorkerIdentifier: String
+    private let workerDescriptor: TrustedWorkerDescriptor
 
     init(
         processRunner: any LocalProcessRunning = FoundationProcessRunner(),
-        expectedWorkerIdentifier: String = "LectureRecorderWorkerFixture"
+        workerDescriptor: TrustedWorkerDescriptor = .fixture
     ) {
         self.processRunner = processRunner
-        self.expectedWorkerIdentifier = expectedWorkerIdentifier
+        self.workerDescriptor = workerDescriptor
     }
 
     func submit<Payload: Codable & Sendable, Output: Codable & Sendable>(
@@ -196,8 +202,12 @@ nonisolated struct TranscriptionWorkerClient: Sendable {
         arguments: [String] = [],
         limits: WorkerInvocationLimits
     ) async -> WorkerInvocationOutcome<Output> {
+        guard arguments.isEmpty || workerDescriptor.permitsCommandLineArguments else {
+            return .infrastructureFailure(.commandLineArgumentsNotPermitted)
+        }
+
         let executableURL: URL
-        switch EmbeddedWorkerLocator.resolve() {
+        switch EmbeddedWorkerLocator.resolve(descriptor: workerDescriptor) {
         case .success(let url):
             executableURL = url
         case .failure(let locatorError):
@@ -312,10 +322,16 @@ nonisolated struct TranscriptionWorkerClient: Sendable {
         guard response.sourceIdentity == identity.sourceIdentity else {
             return .infrastructureFailure(.identityMismatch(field: "sourceIdentity"))
         }
-        guard response.workerIdentifier == expectedWorkerIdentifier else {
+        guard response.workerIdentifier == workerDescriptor.expectedWorkerIdentifier else {
             return .infrastructureFailure(.unexpectedWorkerIdentity(
-                expected: expectedWorkerIdentifier,
+                expected: workerDescriptor.expectedWorkerIdentifier,
                 actual: response.workerIdentifier
+            ))
+        }
+        guard response.workerVersion == workerDescriptor.expectedWorkerVersion else {
+            return .infrastructureFailure(.unexpectedWorkerVersion(
+                expected: workerDescriptor.expectedWorkerVersion,
+                actual: response.workerVersion
             ))
         }
 

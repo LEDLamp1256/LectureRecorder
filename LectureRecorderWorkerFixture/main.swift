@@ -12,6 +12,7 @@ import Foundation
 struct ParsedArguments {
     var mode: String
     var delayMilliseconds: Int
+    var postConditionDelayMilliseconds: Int?
     var sourcePath: String?
     var readyFilePath: String?
 }
@@ -33,6 +34,7 @@ func announceReady(at path: String?) {
 func parseArguments() -> ParsedArguments {
     var mode = "success"
     var delayMilliseconds = 300
+    var postConditionDelayMilliseconds: Int?
     var sourcePath: String?
     var readyFilePath: String?
 
@@ -41,6 +43,8 @@ func parseArguments() -> ParsedArguments {
             mode = String(argument.dropFirst("--mode=".count))
         } else if argument.hasPrefix("--delay-ms=") {
             delayMilliseconds = Int(argument.dropFirst("--delay-ms=".count)) ?? delayMilliseconds
+        } else if argument.hasPrefix("--post-condition-delay-ms=") {
+            postConditionDelayMilliseconds = Int(argument.dropFirst("--post-condition-delay-ms=".count))
         } else if argument.hasPrefix("--source-path=") {
             sourcePath = String(argument.dropFirst("--source-path=".count))
         } else if argument.hasPrefix("--ready-file=") {
@@ -48,7 +52,13 @@ func parseArguments() -> ParsedArguments {
         }
     }
 
-    return ParsedArguments(mode: mode, delayMilliseconds: delayMilliseconds, sourcePath: sourcePath, readyFilePath: readyFilePath)
+    return ParsedArguments(
+        mode: mode,
+        delayMilliseconds: delayMilliseconds,
+        postConditionDelayMilliseconds: postConditionDelayMilliseconds,
+        sourcePath: sourcePath,
+        readyFilePath: readyFilePath
+    )
 }
 
 func readAllStdin() -> Data {
@@ -237,6 +247,9 @@ case "large-stdout":
     guard let request = decodeRequest(requestData) else { exit(1) }
     let filler = largeFillerText(approximateByteCount: 16 * 1024 * 1024)
     writeStdout(encode(makeMatchingResponse(for: request, outputText: filler)))
+    if let delayMilliseconds = arguments.postConditionDelayMilliseconds {
+        Thread.sleep(forTimeInterval: Double(delayMilliseconds) / 1000.0)
+    }
     exit(0)
 
 case "short-stderr-nonzero-exit":
@@ -381,7 +394,8 @@ case "close-stdin-then-hang":
 
 case "close-stdin-early":
     close(0)
-    Thread.sleep(forTimeInterval: 0.3)
+    let delayMilliseconds = arguments.postConditionDelayMilliseconds ?? 300
+    Thread.sleep(forTimeInterval: Double(delayMilliseconds) / 1000.0)
     exit(0)
 
 case "delay-read-stdin":

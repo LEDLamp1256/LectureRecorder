@@ -22,6 +22,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Argument transmission (no shell, literal bytes)
 
     func testLiteralArgumentTransmissionWithSpacesQuotesMetacharactersAndUnicode() async throws {
+        try requireFixtureLaunchable()
         let literalArguments = [
             "has space",
             "has\"quote",
@@ -45,6 +46,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Stdin delivery
 
     func testExactStdinBytesRoundTripUnmodified() async throws {
+        try requireFixtureLaunchable()
         var bytes = Data()
         for value: UInt8 in 0...255 {
             bytes.append(value)
@@ -62,6 +64,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testLargeStdinExceedingTypicalPipeCapacityRoundTripsWithoutDeadlock() async throws {
+        try requireFixtureLaunchable()
         let largeStdin = Data(repeating: 0x41, count: 2 * 1024 * 1024) // 2 MiB, well beyond default pipe buffer
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
@@ -75,6 +78,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testSimultaneousLargeStdoutAndStderrCompleteWithoutDeadlock() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -102,6 +106,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// `three-way-pipe-pressure` fixture mode's own comment for exactly
     /// which serialized-I/O ordering this would deadlock under.
     func testThreeDirectionPipePressureCompletesWithoutDeadlock() async throws {
+        try requireFixtureLaunchable()
         let stdinPayload = Data(repeating: 0x53, count: 4 * 1024 * 1024) // 'S', 4MiB
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
@@ -133,6 +138,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testChildClosingStdinEarlyBecomesTypedWriteFailureAndDoesNotCrashTestProcess() async throws {
+        try requireFixtureLaunchable()
         let largeStdin = Data(repeating: 0x42, count: 2 * 1024 * 1024)
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
@@ -172,6 +178,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// sleep is long enough for the write to have genuinely started
     /// blocking, letting this test assert exactly `.cancelled`.
     func testCancellationWhileStdinGenuinelyBlockedTerminatesChildAndFinishes() async throws {
+        try requireFixtureLaunchable()
         let readyFileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("t2-ready-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: readyFileURL) }
@@ -229,6 +236,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// response produced after failed/partial stdin delivery is
     /// discarded, never returned as success.
     func testStdinDeliveryFailureDiscardsAnOtherwiseValidResponse() async throws {
+        try requireFixtureLaunchable()
         let largeStdin = Data(repeating: 0x44, count: 4 * 1024 * 1024)
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
@@ -247,6 +255,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Raw response bytes pass through unvalidated (layer boundary)
 
     func testRunnerNeverValidatesJSONShapeItPassesRawBytesThrough() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -279,6 +288,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testOversizedStdoutTerminatesProcessButFinishesPromptly() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -300,6 +310,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testOversizedStderrIsTruncatedMarkedAndDoesNotInvalidateSuccess() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -319,6 +330,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Timeout, cancellation, termination escalation
 
     func testTimeoutWhileRunningTerminatesPromptlyWithoutWaitingOutTheDelay() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -362,6 +374,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testCancellationDuringOutputTerminatesPromptly() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -384,6 +397,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testGracefulTerminationAloneIsSufficientForAnOrdinaryChild() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         // No SIGTERM handler installed -> default disposition terminates immediately.
@@ -405,6 +419,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testForcedTerminationWhenSIGTERMIsIgnored() async throws {
+        try requireFixtureLaunchable()
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
             arguments: ["--mode=ignore-sigterm"],
@@ -440,6 +455,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// `.stdinDeliveryFailed`, promptly, well before the 30s hang or even
     /// the (deliberately generous) `overallTimeout` below.
     func testStdinFailsThenHangsProducesPromptStdinDeliveryFailedNotTimedOut() async throws {
+        try requireFixtureLaunchable()
         let largeStdin = Data(repeating: 0x45, count: 4 * 1024 * 1024)
         let request = WorkerFixtureTestSupport.makeRequest(
             executableURL: fixtureURL,
@@ -473,6 +489,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// — and that the child is confirmed terminated before the call
     /// returns.
     func testCancellationAgainstSIGTERMResistantChildWaitsOutRealGracePeriod() async throws {
+        try requireFixtureLaunchable()
         let readyFileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("t2-ready-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: readyFileURL) }
@@ -528,6 +545,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     /// than on an out-of-band readiness signal the way the deterministic
     /// tests elsewhere in this file do.
     func testTimeoutGraceContinuesUnaffectedByLaterCancellation() async throws {
+        try requireFixtureLaunchable()
         let gracePeriod: TimeInterval = 1.0
         let overallTimeout: TimeInterval = 0.2
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -560,6 +578,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     // MARK: - Race safety (exactly one outcome, no crash from double-resume)
 
     func testNaturalExitRacingCancellationYieldsExactlyOneConsistentOutcome() async throws {
+        try requireFixtureLaunchable()
         // Cancelling immediately after `Task { ... }` creation lands
         // before the task body ever starts running, every time — the
         // pre-launch check at the top of `performInvocation` catches it,
@@ -599,6 +618,7 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     func testNaturalExitRacingTimeoutYieldsExactlyOneConsistentOutcome() async throws {
+        try requireFixtureLaunchable()
         let identity = WorkerFixtureTestSupport.makeIdentity()
         let requestData = try WorkerFixtureTestSupport.encodeRequest(identity: identity)
         let request = WorkerFixtureTestSupport.makeRequest(
@@ -696,6 +716,10 @@ final class FoundationProcessRunnerTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func requireFixtureLaunchable() throws {
+        try WorkerEntitlementTestSupport.requireLaunchableSignature(at: fixtureURL)
+    }
 
     private func requireSuccess(
         _ outcome: Result<ProcessRunResult, ProcessRunFailure>,

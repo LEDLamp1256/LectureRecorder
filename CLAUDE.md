@@ -44,9 +44,17 @@ These override convenience, performance, or "cleaner code" arguments:
 Run from the repo root. All verified working in this environment
 (Xcode 26.6, macOS SDK 26.5) — no CI/lint config exists in the repo.
 
+Clean-checkout prerequisite (requires an arm64 Mac, Git, Xcode command-line
+tools, and CMake 3.5 or newer; verified with CMake 4.4.3):
+    ./Scripts/prepare-whisper-dependency.sh
+
+This publishes the ignored local artifact at
+`Generated/WhisperDependency/WhisperC.xcframework`. Preparation is the only
+networked step; ordinary builds and runtime worker probes are offline. See
+`BUILDING.md` for the complete developer workflow.
+
 Debug build:
-    xcodebuild -project LectureRecorder.xcodeproj -scheme LectureRecorder \
-      -configuration Debug -destination 'platform=macOS' build
+    ./Scripts/build-debug.sh
 
 Full unit test suite:
     xcodebuild -project LectureRecorder.xcodeproj -scheme LectureRecorder \

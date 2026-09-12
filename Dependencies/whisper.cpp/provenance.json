@@ -1,0 +1,27 @@
+{
+  "dependency": "whisper.cpp",
+  "upstream": "https://github.com/ggml-org/whisper.cpp.git",
+  "releaseTag": "v1.9.2",
+  "commit": "306c88f4d1286aec1bf96e544632897886af5501",
+  "license": "MIT",
+  "licenseNotice": "Dependencies/whisper.cpp/LICENSE",
+  "generatedArtifact": "Generated/WhisperDependency/WhisperC.xcframework",
+  "configuration": {
+    "platform": "macOS",
+    "architecture": "arm64",
+    "deploymentTarget": "26.5",
+    "linkage": "static",
+    "cpu": true,
+    "accelerate": true,
+    "genericBLAS": false,
+    "metal": false,
+    "coreML": false,
+    "openMP": false,
+    "nativeHostOptimization": false,
+    "examples": false,
+    "upstreamTests": false,
+    "server": false,
+    "curl": false,
+    "sharedLibraries": false
+  }
+}
