@@ -25,16 +25,41 @@ struct lr_loader_context {
     bool read_failed;
 };
 
-static void discard_log(enum ggml_log_level level, const char * text, void * user_data) {
+static void bridge_log(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
-    (void) text;
     (void) user_data;
+#if defined(LR_WHISPER_RUNTIME_DIAGNOSTICS)
+    if (text != NULL) {
+        size_t remaining = strlen(text);
+        while (remaining > 0) {
+            ssize_t written = write(STDERR_FILENO, text, remaining);
+            if (written > 0) {
+                text += written;
+                remaining -= (size_t) written;
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+#else
+    (void) text;
+#endif
+}
+
+static bool configured_use_gpu(void) {
+#if defined(LR_WHISPER_CPU_CONTROL)
+    return false;
+#else
+    return true;
+#endif
 }
 
 static struct whisper_context_params context_params(void) {
-    whisper_log_set(discard_log, NULL);
+    whisper_log_set(bridge_log, NULL);
     struct whisper_context_params params = whisper_context_default_params();
-    params.use_gpu = false;
+    params.use_gpu = configured_use_gpu();
     params.flash_attn = false;
     params.gpu_device = 0;
     params.dtw_token_timestamps = false;
@@ -343,7 +368,7 @@ static struct whisper_full_params full_params(void) {
 int lr_whisper_configuration_is_expected(void) {
     struct whisper_context_params c = context_params();
     struct whisper_full_params p = full_params();
-    return c.use_gpu == false && c.flash_attn == false &&
+    return c.use_gpu == configured_use_gpu() && c.flash_attn == false &&
         c.dtw_token_timestamps == false &&
         p.strategy == WHISPER_SAMPLING_GREEDY && p.n_threads == 4 &&
         p.translate == false && p.no_context == true &&

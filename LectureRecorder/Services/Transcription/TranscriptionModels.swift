@@ -101,6 +101,7 @@ nonisolated enum TranscriptionSamplingStrategy: String, Codable, Equatable, Send
 
 nonisolated enum TranscriptionComputeBackend: String, Codable, Equatable, Sendable {
     case cpuAccelerate = "cpu-plus-accelerate"
+    case metalPreferredWithCPUFallback = "metal-preferred-with-cpu-fallback"
 }
 
 nonisolated struct TranscriptionPrintingConfiguration: Codable, Equatable, Sendable {

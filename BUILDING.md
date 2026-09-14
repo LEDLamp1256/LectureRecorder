@@ -15,6 +15,11 @@ whisper.cpp `v1.9.2` commit
 and publishes `Generated/WhisperDependency/WhisperC.xcframework`. Ordinary app
 builds and runtime worker probes are offline and perform no downloads.
 
+The generated XCFramework contains both the CPU and Metal ggml backends. Its
+pinned Metal library is embedded in the static archive, so no separate runtime
+shader asset is required. The Whisper worker links Metal and MetalKit, prefers
+Metal execution, and retains the CPU backend as a runtime fallback.
+
 ## Preparing the T3B large-v3-turbo model
 
 Real transcription additionally requires one explicit developer preparation
@@ -158,3 +163,39 @@ The harness JSON's `totalMilliseconds` measures job processing only.
 ```sh
 /bin/bash Scripts/test-whisper-acceptance-reporting.sh
 ```
+
+## Reproducing the Metal / CPU-control diagnostic runs
+
+`WhisperBridge.c` normally discards whisper.cpp's own init/backend log lines
+and always requests GPU execution. Two compile-time defines exist to make
+that behavior observable and to reproduce the CPU-only comparison point,
+but neither is ever defined by the app, `build-debug.sh`, or dependency
+preparation: `LR_WHISPER_RUNTIME_DIAGNOSTICS` (relay whisper.cpp's log lines
+to stderr instead of discarding them) and `LR_WHISPER_CPU_CONTROL` (force
+`use_gpu = false` instead of the normal GPU-preferred default). The only
+place either define is ever set is:
+
+```sh
+./Scripts/run-whisper-metal-diagnostic-acceptance.sh
+```
+
+Run with no environment variable set to reproduce the **Metal diagnostic**
+run (`LR_WHISPER_RUNTIME_DIAGNOSTICS=1` only; GPU-preferred execution is
+unchanged from normal). Run with `LR_WHISPER_CPU_CONTROL=1` to reproduce the
+**CPU-control diagnostic** run instead:
+
+```sh
+LR_WHISPER_CPU_CONTROL=1 ./Scripts/run-whisper-metal-diagnostic-acceptance.sh
+```
+
+Each invocation builds the launch harness into its own fresh, printed
+DerivedData root via a `GCC_PREPROCESSOR_DEFINITIONS` override on that one
+`xcodebuild` command, so it never touches the DerivedData used by ordinary
+builds or tests, then runs the same staged-model `real-inference` command
+used by `run-whisper-real-inference-acceptance.sh`, with stderr folded into
+the printed `diagnostic.log` so the relayed whisper.cpp log lines are
+captured alongside the harness's own output. This requires the acceptance
+model to already be staged (see above). It is a diagnostic/benchmarking aid
+only, not part of normal build, test, or production inference; runtime
+diagnostics stay off and GPU-preferred execution stays on unless this
+script is invoked explicitly.

@@ -39,7 +39,7 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "Required tool '$1' is unavailable. Install it explicitly and rerun this script."
 }
 
-for tool in git cmake xcodebuild xcrun shasum file lipo; do
+for tool in git cmake xcodebuild xcrun shasum file lipo nm; do
     require_command "${tool}"
 done
 
@@ -99,7 +99,8 @@ cmake \
     -DGGML_CPU=ON \
     -DGGML_ACCELERATE=ON \
     -DGGML_BLAS=OFF \
-    -DGGML_METAL=OFF \
+    -DGGML_METAL=ON \
+    -DGGML_METAL_EMBED_LIBRARY=ON \
     -DGGML_OPENMP=OFF \
     -DGGML_NATIVE=OFF \
     2>&1 | tee "${CONFIGURE_LOG}"
@@ -127,7 +128,8 @@ assert_cache_value GGML_CCACHE BOOL OFF
 assert_cache_value GGML_CPU BOOL ON
 assert_cache_value GGML_ACCELERATE BOOL ON
 assert_cache_value GGML_BLAS BOOL OFF
-assert_cache_value GGML_METAL BOOL OFF
+assert_cache_value GGML_METAL BOOL ON
+assert_cache_value GGML_METAL_EMBED_LIBRARY BOOL ON
 assert_cache_value GGML_OPENMP BOOL OFF
 assert_cache_value GGML_NATIVE BOOL OFF
 
@@ -137,18 +139,43 @@ readonly WHISPER_ARCHIVE="${BUILD_DIRECTORY}/src/libwhisper.a"
 readonly GGML_ARCHIVE="${BUILD_DIRECTORY}/ggml/src/libggml.a"
 readonly GGML_BASE_ARCHIVE="${BUILD_DIRECTORY}/ggml/src/libggml-base.a"
 readonly GGML_CPU_ARCHIVE="${BUILD_DIRECTORY}/ggml/src/libggml-cpu.a"
-for archive in "${WHISPER_ARCHIVE}" "${GGML_ARCHIVE}" "${GGML_BASE_ARCHIVE}" "${GGML_CPU_ARCHIVE}"; do
+readonly GGML_METAL_ARCHIVE="${BUILD_DIRECTORY}/ggml/src/ggml-metal/libggml-metal.a"
+for archive in "${WHISPER_ARCHIVE}" "${GGML_ARCHIVE}" "${GGML_BASE_ARCHIVE}" "${GGML_CPU_ARCHIVE}" "${GGML_METAL_ARCHIVE}"; do
     [[ -f "${archive}" ]] || fail "Expected static archive was not produced: ${archive}"
     [[ "$(lipo -archs "${archive}")" == "arm64" ]] || fail "Archive is not arm64-only: ${archive}"
 done
+
+# In pinned whisper.cpp v1.9.2, static backend registration is driven by
+# unresolved references in ggml-backend-reg.cpp. Verify both sides before
+# flattening the archives so a successful build cannot silently publish a
+# worker with a dead-stripped or unregistered Metal backend.
+nm -u "${GGML_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_cpu_reg' >/dev/null || \
+    fail "ggml registry does not reference the static CPU backend."
+nm -u "${GGML_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_metal_reg' >/dev/null || \
+    fail "ggml registry does not reference the static Metal backend."
+nm -gU "${GGML_CPU_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_cpu_reg' >/dev/null || \
+    fail "CPU backend registration definition is missing."
+nm -gU "${GGML_METAL_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_metal_reg' >/dev/null || \
+    fail "Metal backend registration definition is missing."
+nm -gU "${GGML_METAL_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_metallib_start' >/dev/null || \
+    fail "Embedded Metal library start symbol is missing."
+nm -gU "${GGML_METAL_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_metallib_end' >/dev/null || \
+    fail "Embedded Metal library end symbol is missing."
 
 readonly COMBINED_ARCHIVE="${PACKAGE_DIRECTORY}/libWhisperC.a"
 xcrun libtool -static -D -o "${COMBINED_ARCHIVE}" \
     "${WHISPER_ARCHIVE}" \
     "${GGML_ARCHIVE}" \
     "${GGML_BASE_ARCHIVE}" \
-    "${GGML_CPU_ARCHIVE}"
+    "${GGML_CPU_ARCHIVE}" \
+    "${GGML_METAL_ARCHIVE}"
 [[ "$(lipo -archs "${COMBINED_ARCHIVE}")" == "arm64" ]] || fail "Combined archive is not arm64-only."
+nm -gU "${COMBINED_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_cpu_reg' >/dev/null || \
+    fail "Packaged library is missing the CPU backend."
+nm -gU "${COMBINED_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_backend_metal_reg' >/dev/null || \
+    fail "Packaged library is missing the Metal backend."
+nm -gU "${COMBINED_ARCHIVE}" | awk '{ print $NF }' | grep -Fx '_ggml_metallib_start' >/dev/null || \
+    fail "Packaged library is missing the embedded Metal source."
 
 printf '%s\n' \
     '#ifndef LECTURE_RECORDER_WHISPER_C_H' \
@@ -213,7 +240,8 @@ printf '%s\n' \
     "ggml_cpu=ON" \
     "ggml_accelerate=ON" \
     "ggml_blas=OFF" \
-    "ggml_metal=OFF" \
+    "ggml_metal=ON" \
+    "ggml_metal_embed_library=ON" \
     "ggml_openmp=OFF" \
     "ggml_native=OFF" \
     "compiler=${COMPILER_VERSION}" \

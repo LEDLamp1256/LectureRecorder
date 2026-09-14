@@ -12,6 +12,8 @@
 		C0A000000000000000000002 /* WhisperC.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000011 /* WhisperC.xcframework */; };
 		C0A000000000000000000003 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000012 /* Accelerate.framework */; };
 		C0A000000000000000000004 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000013 /* libc++.tbd */; };
+		C0A000000000000000000005 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000014 /* Metal.framework */; };
+		C0A000000000000000000006 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000015 /* MetalKit.framework */; };
 		C0A000000000000000000201 /* HarnessMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000211 /* HarnessMain.swift */; };
 		C0A000000000000000000202 /* EmbeddedWorkerLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000212 /* EmbeddedWorkerLocator.swift */; };
 		C0A000000000000000000203 /* FoundationProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000213 /* FoundationProcessRunner.swift */; };
@@ -104,6 +106,8 @@
 		C0A000000000000000000011 /* WhisperC.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Generated/WhisperDependency/WhisperC.xcframework; sourceTree = "<group>"; };
 		C0A000000000000000000012 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
 		C0A000000000000000000013 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.text-based-dylib-definition; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
+		C0A000000000000000000014 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		C0A000000000000000000015 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 		C0A000000000000000000210 /* LectureRecorderWorkerLaunchHarness */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = LectureRecorderWorkerLaunchHarness; sourceTree = BUILT_PRODUCTS_DIR; };
 		C0A000000000000000000211 /* HarnessMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorderWorkerLaunchHarness/HarnessMain.swift; sourceTree = SOURCE_ROOT; };
 		C0A000000000000000000212 /* EmbeddedWorkerLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/EmbeddedWorkerLocator.swift; sourceTree = SOURCE_ROOT; };
@@ -186,6 +190,8 @@
 			files = (
 				C0A000000000000000000002 /* WhisperC.xcframework in Frameworks */,
 				C0A000000000000000000003 /* Accelerate.framework in Frameworks */,
+				C0A000000000000000000005 /* Metal.framework in Frameworks */,
+				C0A000000000000000000006 /* MetalKit.framework in Frameworks */,
 				C0A000000000000000000004 /* libc++.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

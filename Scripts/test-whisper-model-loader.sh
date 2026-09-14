@@ -20,6 +20,9 @@ xcrun clang \
     "${SCRIPT_DIRECTORY}/WhisperModelLoaderTests.c" \
     "${LIBRARY}" \
     -framework Accelerate \
+    -framework Foundation \
+    -framework Metal \
+    -framework MetalKit \
     -lc++ \
     -o "${TEST_ROOT}/WhisperModelLoaderTests"
 mkdir "${TEST_ROOT}/files"

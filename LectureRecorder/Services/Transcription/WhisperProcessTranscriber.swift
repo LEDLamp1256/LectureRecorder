@@ -54,9 +54,14 @@ nonisolated struct WhisperProcessTranscriber: Transcribing, Sendable {
             try WhisperModelVerifier.preflight(url: $0)
         },
         timingObserver: @escaping @Sendable (WhisperInferenceTiming) -> Void = { _ in },
+        runtimeDiagnosticsObserver: @escaping @Sendable (Data) -> Void = { _ in },
         invocationGate: WhisperInvocationGate = .shared
     ) {
-        client = TranscriptionWorkerClient(processRunner: processRunner, workerDescriptor: .whisper)
+        client = TranscriptionWorkerClient(
+            processRunner: processRunner,
+            workerDescriptor: .whisper,
+            successfulStderrObserver: runtimeDiagnosticsObserver
+        )
         self.applicationSupportRoot = applicationSupportRoot
         self.preflightModel = preflightModel
         self.timingObserver = timingObserver
