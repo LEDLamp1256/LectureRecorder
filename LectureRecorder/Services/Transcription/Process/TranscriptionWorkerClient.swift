@@ -186,13 +186,16 @@ nonisolated struct WorkerInvocationLimits: Sendable {
 nonisolated struct TranscriptionWorkerClient: Sendable {
     private let processRunner: any LocalProcessRunning
     private let workerDescriptor: TrustedWorkerDescriptor
+    private let successfulStderrObserver: @Sendable (Data) -> Void
 
     init(
         processRunner: any LocalProcessRunning = FoundationProcessRunner(),
-        workerDescriptor: TrustedWorkerDescriptor = .fixture
+        workerDescriptor: TrustedWorkerDescriptor = .fixture,
+        successfulStderrObserver: @escaping @Sendable (Data) -> Void = { _ in }
     ) {
         self.processRunner = processRunner
         self.workerDescriptor = workerDescriptor
+        self.successfulStderrObserver = successfulStderrObserver
     }
 
     func submit<Payload: Codable & Sendable, Output: Codable & Sendable>(
@@ -248,6 +251,9 @@ nonisolated struct TranscriptionWorkerClient: Sendable {
         case .failure(let processFailure):
             return .infrastructureFailure(.process(processFailure))
         case .success(let result):
+            if case .exited(let status) = result.terminationReason, status == 0 {
+                successfulStderrObserver(result.stderr)
+            }
             return classify(result: result, identity: identity, outputType: outputType)
         }
     }

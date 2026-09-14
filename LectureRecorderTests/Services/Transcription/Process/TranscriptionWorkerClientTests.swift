@@ -6,6 +6,14 @@ import XCTest
 /// malformed responses, identity checks, and failure precedence remain
 /// authoritative even when Xcode mutates the hosted helper's signature.
 final class TranscriptionWorkerClientTests: XCTestCase {
+    private final class DataBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = Data()
+
+        func set(_ data: Data) { lock.withLock { value = data } }
+        func get() -> Data { lock.withLock { value } }
+    }
+
     private struct DeterministicFixtureRunner: LocalProcessRunning {
         func run(_ request: ProcessInvocationRequest) async -> Result<ProcessRunResult, ProcessRunFailure> {
             let mode = request.arguments.first(where: { $0.hasPrefix("--mode=") })?
@@ -394,6 +402,25 @@ final class TranscriptionWorkerClientTests: XCTestCase {
             return XCTFail("Verbose stderr must not invalidate an otherwise-valid success; got \(outcome)")
         }
         XCTAssertEqual(output.text, "fixture transcript")
+    }
+
+    func testSuccessfulProcessStderrObserverReceivesCapturedDiagnostics() async {
+        let observed = DataBox()
+        let observingClient = TranscriptionWorkerClient(
+            processRunner: DeterministicFixtureRunner(),
+            successfulStderrObserver: { observed.set($0) }
+        )
+        let outcome: WorkerInvocationOutcome<TestFixtureOutput> = await observingClient.submit(
+            payload: EmptyTestPayload(),
+            identity: WorkerFixtureTestSupport.makeIdentity(),
+            outputType: TestFixtureOutput.self,
+            arguments: ["--mode=large-stderr"],
+            limits: WorkerInvocationLimits(maximumStderrBytes: 4096, overallTimeout: 10.0)
+        )
+        guard case .success = outcome else {
+            return XCTFail("Expected successful diagnostic observation, got \(outcome)")
+        }
+        XCTAssertEqual(observed.get(), Data(repeating: 0x41, count: 4096))
     }
 
     // MARK: - No production call site

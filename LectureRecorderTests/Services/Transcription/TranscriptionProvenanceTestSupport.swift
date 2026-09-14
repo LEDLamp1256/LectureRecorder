@@ -18,7 +18,7 @@ func makeT3BProvenance() -> TranscriptionProvenance {
             sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
         ),
         configuration: TranscriptionInferenceConfigurationProvenance(
-            identifier: "whisper-large-v3-turbo-cpu-greedy-en-v1",
+            identifier: "whisper-large-v3-turbo-metal-greedy-en-v1",
             samplingStrategy: .greedy,
             threadCount: 4,
             language: "en",
@@ -37,7 +37,7 @@ func makeT3BProvenance() -> TranscriptionProvenance {
                 printRealtime: false,
                 printTimestamps: false
             ),
-            computeBackend: .cpuAccelerate
+            computeBackend: .metalPreferredWithCPUFallback
         )
     )
 }

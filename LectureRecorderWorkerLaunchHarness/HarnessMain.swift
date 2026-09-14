@@ -226,7 +226,10 @@ private enum LectureRecorderWorkerLaunchHarness {
         let timingBox = HarnessTimingBox()
         let transcriber = WhisperProcessTranscriber(
             applicationSupportRoot: { appRoot },
-            timingObserver: { timingBox.set($0) }
+            timingObserver: { timingBox.set($0) },
+            runtimeDiagnosticsObserver: { diagnostics in
+                FileHandle.standardError.write(diagnostics)
+            }
         )
         let store = TranscriptionStore()
         let coordinator = TranscriptionCoordinator(store: store, transcriber: transcriber)

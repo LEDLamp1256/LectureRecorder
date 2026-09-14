@@ -1,7 +1,7 @@
 import Foundation
 
 nonisolated enum WhisperT3BPolicy {
-    static let configurationIdentifier = "whisper-large-v3-turbo-cpu-greedy-en-v1"
+    static let configurationIdentifier = "whisper-large-v3-turbo-metal-greedy-en-v1"
     static let engineIdentifier = "whisper.cpp"
     static let engineVersion = "1.9.2"
     static let engineSourceRevision = "306c88f4d1286aec1bf96e544632897886af5501"
@@ -11,7 +11,7 @@ nonisolated enum WhisperT3BPolicy {
     static let maximumSegmentTextBytes = 64 * 1024
     static let maximumSegments = 10_000
     /// A finite process-wide deadline that leaves substantial headroom for
-    /// unquantized large-v3-turbo initialization and one 31-second CPU inference on the
+    /// unquantized large-v3-turbo initialization and one 31-second Metal-preferred inference on the
     /// approved M4 while retaining T2's timeout and termination guarantees.
     static let processTimeout: TimeInterval = 300
 
@@ -53,7 +53,7 @@ nonisolated enum WhisperT3BPolicy {
                     printRealtime: false,
                     printTimestamps: false
                 ),
-                computeBackend: .cpuAccelerate
+                computeBackend: .metalPreferredWithCPUFallback
             )
         )
     }
