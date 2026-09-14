@@ -23,6 +23,9 @@ nonisolated enum WorkerOutcome: String, Codable, Sendable {
 
 nonisolated struct WorkerDeclaredFailure: Codable, Sendable, Equatable {
     var message: String
+    /// Optional operation-specific closed code. Legacy/T2 fixture workers
+    /// omit it; production adapters validate any code they require.
+    var code: String? = nil
 }
 
 /// Generic response envelope. Exactly one of `output`/`failure` is
@@ -137,4 +140,40 @@ nonisolated enum WhisperCapabilityProbeConstants {
     static let currentSchemaVersion = 1
     static let workerIdentifier = "LectureRecorderWhisperWorker"
     static let workerImplementationVersion = "1.0.0"
+}
+
+nonisolated struct WhisperInferencePayload: Codable, Sendable, Equatable {
+    let schemaVersion: Int
+    let operation: String
+    let sourcePath: String
+    let source: TranscriptionSourceSnapshot
+
+    init(sourcePath: String, source: TranscriptionSourceSnapshot) {
+        schemaVersion = 1
+        operation = "transcribe"
+        self.sourcePath = sourcePath
+        self.source = source
+    }
+}
+
+nonisolated struct WhisperInferenceSegment: Codable, Sendable, Equatable {
+    let startMilliseconds: Int64
+    let endMilliseconds: Int64
+    let text: String
+}
+
+nonisolated struct WhisperInferenceTiming: Codable, Sendable, Equatable {
+    let modelInitializationMilliseconds: Int64
+    let audioConversionMilliseconds: Int64
+    let inferenceMilliseconds: Int64
+}
+
+nonisolated struct WhisperInferenceOutput: Codable, Sendable, Equatable {
+    let schemaVersion: Int
+    let transcript: String
+    let segments: [WhisperInferenceSegment]
+    let decodedDurationMilliseconds: Int64
+    let decodedSampleCount: Int
+    let provenance: TranscriptionProvenance
+    let timing: WhisperInferenceTiming
 }

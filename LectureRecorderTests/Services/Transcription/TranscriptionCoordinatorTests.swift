@@ -75,7 +75,7 @@ final class TranscriptionCoordinatorTests: XCTestCase {
 
     private func makeResult(sequenceNumber: Int, attemptID: UUID = UUID(), text: String = "hi") -> TranscriptResult {
         TranscriptResult(
-            schemaVersion: TranscriptResult.currentSchemaVersion,
+            schemaVersion: TranscriptResult.legacySchemaVersion,
             source: makeSource(sequenceNumber),
             output: TranscriptionEngineOutput(
                 text: text,
@@ -187,6 +187,29 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         let result = try await store.loadResult(sequenceNumber: 0, paths: artifactPaths)
         XCTAssertEqual(result?.output.text, "hello world")
         XCTAssertEqual(transcriber.recordedCalls.count, 1)
+    }
+
+    func testProcessJobCarriesStructuredProvenanceThroughPersistenceAndReload() async throws {
+        let store = TranscriptionStore()
+        var output = TranscriptionEngineOutput(
+            text: "technical lecture",
+            engineIdentifier: "whisper.cpp",
+            modelIdentifier: "large-v3-turbo",
+            language: "en",
+            segments: [TranscriptionTimingSegment(startSeconds: 0, endSeconds: 1, text: "technical lecture")],
+            engineVersion: "1.9.2"
+        )
+        output.provenance = makeT3BProvenance()
+        let transcriber = FakeTranscriber()
+        transcriber.setOutput(output, forSequenceNumber: 0)
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+
+        let result = try await store.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(result?.schemaVersion, 2)
+        XCTAssertEqual(result?.output.provenance, makeT3BProvenance())
     }
 
     func testProcessJobNeverModifiesSourceAudio() async throws {

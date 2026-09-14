@@ -95,6 +95,124 @@ nonisolated struct TranscriptionTimingSegment: Codable, Equatable, Sendable {
     var text: String
 }
 
+nonisolated enum TranscriptionSamplingStrategy: String, Codable, Equatable, Sendable {
+    case greedy
+}
+
+nonisolated enum TranscriptionComputeBackend: String, Codable, Equatable, Sendable {
+    case cpuAccelerate = "cpu-plus-accelerate"
+}
+
+nonisolated struct TranscriptionPrintingConfiguration: Codable, Equatable, Sendable {
+    var printSpecial: Bool
+    var printProgress: Bool
+    var printRealtime: Bool
+    var printTimestamps: Bool
+}
+
+nonisolated struct TranscriptionInferenceConfigurationProvenance: Codable, Equatable, Sendable {
+    var identifier: String
+    var samplingStrategy: TranscriptionSamplingStrategy
+    var threadCount: Int
+    var language: String
+    var automaticLanguageDetectionEnabled: Bool
+    var translationEnabled: Bool
+    var previousTextContextEnabled: Bool
+    var initialPromptUsed: Bool
+    var segmentTimestampsEnabled: Bool
+    var tokenTimestampsEnabled: Bool
+    var singleSegmentModeEnabled: Bool
+    var vadEnabled: Bool
+    var diarizationEnabled: Bool
+    var printing: TranscriptionPrintingConfiguration
+    var computeBackend: TranscriptionComputeBackend
+}
+
+nonisolated struct TranscriptionWorkerProvenance: Codable, Equatable, Sendable {
+    var identifier: String
+    var version: String
+}
+
+nonisolated struct TranscriptionEngineProvenance: Codable, Equatable, Sendable {
+    var identifier: String
+    var version: String
+    var sourceRevision: String
+}
+
+nonisolated struct TranscriptionModelProvenance: Codable, Equatable, Sendable {
+    var identifier: String
+    var filename: String
+    var byteCount: UInt64
+    var sha256: String
+}
+
+nonisolated enum TranscriptionProvenanceValidationError: LocalizedError, Sendable, Equatable {
+    case empty(field: String)
+    case oversized(field: String, maximumUTF8Bytes: Int)
+    case invalidSourceRevision
+    case invalidModelDigest
+    case invalidModelByteCount
+    case invalidThreadCount
+
+    var errorDescription: String? {
+        switch self {
+        case .empty(let field): return "Transcription provenance field \(field) is empty."
+        case .oversized(let field, let maximum): return "Transcription provenance field \(field) exceeds \(maximum) UTF-8 bytes."
+        case .invalidSourceRevision: return "Transcription engine source revision must be 40 lowercase hexadecimal characters."
+        case .invalidModelDigest: return "Transcription model SHA-256 must be 64 lowercase hexadecimal characters."
+        case .invalidModelByteCount: return "Transcription model byte count must be greater than zero."
+        case .invalidThreadCount: return "Transcription thread count must be between 1 and 64."
+        }
+    }
+}
+
+/// Structured, bounded provenance for schema-v2 transcript results. Schema-v1
+/// results have no provenance; absence there means "not recorded", never a
+/// fabricated approximation of these fields.
+nonisolated struct TranscriptionProvenance: Codable, Equatable, Sendable {
+    var worker: TranscriptionWorkerProvenance
+    var engine: TranscriptionEngineProvenance
+    var model: TranscriptionModelProvenance
+    var configuration: TranscriptionInferenceConfigurationProvenance
+
+    func validate() throws {
+        try Self.requireBounded(worker.identifier, field: "worker.identifier", maximum: 128)
+        try Self.requireBounded(worker.version, field: "worker.version", maximum: 64)
+        try Self.requireBounded(engine.identifier, field: "engine.identifier", maximum: 128)
+        try Self.requireBounded(engine.version, field: "engine.version", maximum: 64)
+        try Self.requireBounded(model.identifier, field: "model.identifier", maximum: 128)
+        try Self.requireBounded(model.filename, field: "model.filename", maximum: 255)
+        try Self.requireBounded(configuration.identifier, field: "configuration.identifier", maximum: 128)
+        try Self.requireBounded(configuration.language, field: "configuration.language", maximum: 32)
+
+        guard Self.isLowercaseHex(engine.sourceRevision, exactCount: 40) else {
+            throw TranscriptionProvenanceValidationError.invalidSourceRevision
+        }
+        guard Self.isLowercaseHex(model.sha256, exactCount: 64) else {
+            throw TranscriptionProvenanceValidationError.invalidModelDigest
+        }
+        guard model.byteCount > 0 else {
+            throw TranscriptionProvenanceValidationError.invalidModelByteCount
+        }
+        guard (1...64).contains(configuration.threadCount) else {
+            throw TranscriptionProvenanceValidationError.invalidThreadCount
+        }
+    }
+
+    private static func requireBounded(_ value: String, field: String, maximum: Int) throws {
+        guard !value.isEmpty else { throw TranscriptionProvenanceValidationError.empty(field: field) }
+        guard value.utf8.count <= maximum else {
+            throw TranscriptionProvenanceValidationError.oversized(field: field, maximumUTF8Bytes: maximum)
+        }
+    }
+
+    private static func isLowercaseHex(_ value: String, exactCount: Int) -> Bool {
+        value.utf8.count == exactCount && value.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
+}
+
 /// The structured output of one transcription attempt, as reported by a
 /// `Transcribing` conformer. `engineIdentifier`/`modelIdentifier` are
 /// always taken verbatim from the transcriber — neither
@@ -107,6 +225,27 @@ nonisolated struct TranscriptionEngineOutput: Codable, Equatable, Sendable {
     var language: String?
     var segments: [TranscriptionTimingSegment]?
     var engineVersion: String?
+    var provenance: TranscriptionProvenance? = nil
+}
+
+nonisolated enum TranscriptResultSchemaError: LocalizedError, Sendable, Equatable {
+    case provenanceNotPermittedInV1
+    case provenanceRequiredInV2
+    case legacyIdentityContradictsProvenance(field: String)
+    case invalidV2Language
+    case unsupportedVersion(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .provenanceNotPermittedInV1: return "Schema-v1 transcript results cannot contain provenance."
+        case .provenanceRequiredInV2: return "Schema-v2 transcript results require complete structured provenance."
+        case .legacyIdentityContradictsProvenance(let field):
+            return "Schema-v2 transcript field \(field) contradicts authoritative provenance."
+        case .invalidV2Language:
+            return "Schema-v2 transcript language must use the fixed canonical English identifier 'en'."
+        case .unsupportedVersion(let version): return "Unsupported transcript-result schema version \(version)."
+        }
+    }
 }
 
 /// A durable, mutable-by-replacement job record for one chunk's
@@ -170,13 +309,91 @@ nonisolated struct TranscriptionJob: Codable, Equatable, Sendable {
 ///
 /// Persisted at `Sessions/<uuid>/transcription/results/chunk_%06d.transcript.json`.
 nonisolated struct TranscriptResult: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 1
+    static let legacySchemaVersion = 1
+    static let currentSchemaVersion = 2
+
+    static func schemaVersion(for output: TranscriptionEngineOutput) -> Int {
+        output.provenance == nil ? legacySchemaVersion : currentSchemaVersion
+    }
 
     var schemaVersion: Int
     var source: TranscriptionSourceSnapshot
     var output: TranscriptionEngineOutput
     var attemptID: UUID
     var completedDate: Date
+
+    init(
+        schemaVersion: Int,
+        source: TranscriptionSourceSnapshot,
+        output: TranscriptionEngineOutput,
+        attemptID: UUID,
+        completedDate: Date
+    ) {
+        self.schemaVersion = schemaVersion
+        self.source = source
+        self.output = output
+        self.attemptID = attemptID
+        self.completedDate = completedDate
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, source, output, attemptID, completedDate
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        source = try container.decode(TranscriptionSourceSnapshot.self, forKey: .source)
+        output = try container.decode(TranscriptionEngineOutput.self, forKey: .output)
+        attemptID = try container.decode(UUID.self, forKey: .attemptID)
+        completedDate = try container.decode(Date.self, forKey: .completedDate)
+        try Self.validateVersionedOutput(schemaVersion: schemaVersion, output: output)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try Self.validateVersionedOutput(schemaVersion: schemaVersion, output: output)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(source, forKey: .source)
+        try container.encode(output, forKey: .output)
+        try container.encode(attemptID, forKey: .attemptID)
+        try container.encode(completedDate, forKey: .completedDate)
+    }
+
+    func validateSchema() throws {
+        try Self.validateVersionedOutput(schemaVersion: schemaVersion, output: output)
+    }
+
+    static func validateVersionedOutput(
+        schemaVersion: Int,
+        output: TranscriptionEngineOutput
+    ) throws {
+        switch schemaVersion {
+        case legacySchemaVersion:
+            guard output.provenance == nil else {
+                throw TranscriptResultSchemaError.provenanceNotPermittedInV1
+            }
+        case currentSchemaVersion:
+            guard let provenance = output.provenance else {
+                throw TranscriptResultSchemaError.provenanceRequiredInV2
+            }
+            try provenance.validate()
+            guard output.engineIdentifier == provenance.engine.identifier else {
+                throw TranscriptResultSchemaError.legacyIdentityContradictsProvenance(field: "engineIdentifier")
+            }
+            guard output.engineVersion == provenance.engine.version else {
+                throw TranscriptResultSchemaError.legacyIdentityContradictsProvenance(field: "engineVersion")
+            }
+            guard output.modelIdentifier == provenance.model.identifier else {
+                throw TranscriptResultSchemaError.legacyIdentityContradictsProvenance(field: "modelIdentifier")
+            }
+            guard provenance.configuration.language == "en", output.language == "en" else {
+                throw TranscriptResultSchemaError.invalidV2Language
+            }
+        default:
+            throw TranscriptResultSchemaError.unsupportedVersion(schemaVersion)
+        }
+    }
 }
 
 /// In-memory-only key identifying one attempt slot a `TranscriptionCoordinator`

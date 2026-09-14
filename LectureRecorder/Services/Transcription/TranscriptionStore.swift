@@ -99,6 +99,14 @@ actor TranscriptionStore: TranscriptionStoring {
     func commitResult(_ result: TranscriptResult, paths: TranscriptionArtifactPaths) throws -> ResultCommitOutcome {
         try ensureDirectoriesExist(paths: paths)
         let url = paths.resultURL(sequenceNumber: result.source.chunkSequenceNumber)
+        do {
+            try Self.validateResultSchema(result)
+        } catch {
+            throw TranscriptionStoreError.corrupt(
+                sequenceNumber: result.source.chunkSequenceNumber,
+                underlying: error.localizedDescription
+            )
+        }
         let data = try encoder.encode(result)
         let outcome = try exclusiveFileSystem.createExclusive(data: data, at: url)
 
@@ -278,7 +286,7 @@ actor TranscriptionStore: TranscriptionStoring {
                 message: error.localizedDescription
             ))
         }
-        guard schemaVersion == TranscriptResult.currentSchemaVersion else {
+        guard schemaVersion == TranscriptResult.legacySchemaVersion || schemaVersion == TranscriptResult.currentSchemaVersion else {
             throw InconsistencyError(inconsistency: .unsupportedResultSchema(
                 sequenceNumber: expectedSequenceNumber,
                 version: schemaVersion
@@ -301,7 +309,26 @@ actor TranscriptionStore: TranscriptionStoring {
         else {
             throw InconsistencyError(inconsistency: .jobResultIdentityMismatch(sequenceNumber: expectedSequenceNumber))
         }
+        do {
+            try Self.validateResultSchema(result)
+        } catch {
+            throw InconsistencyError(inconsistency: .corruptResult(
+                sequenceNumber: expectedSequenceNumber,
+                message: error.localizedDescription
+            ))
+        }
         return result
+    }
+
+    private static func validateResultSchema(_ result: TranscriptResult) throws {
+        guard result.schemaVersion == TranscriptResult.legacySchemaVersion ||
+                result.schemaVersion == TranscriptResult.currentSchemaVersion else {
+            throw TranscriptionStoreError.unsupportedSchemaVersion(
+                sequenceNumber: result.source.chunkSequenceNumber,
+                version: result.schemaVersion
+            )
+        }
+        try result.validateSchema()
     }
 
     private static func peekSchemaVersion(data: Data, decoder: JSONDecoder) throws -> Int {

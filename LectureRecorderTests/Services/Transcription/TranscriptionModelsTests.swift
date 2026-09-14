@@ -2,6 +2,14 @@ import XCTest
 @testable import LectureRecorder
 
 final class TranscriptionModelsTests: XCTestCase {
+    private var historicalV1FixtureURL: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/transcript-result-v1.json")
+    }
+
     private func makeSource(sequenceNumber: Int = 0) -> TranscriptionSourceSnapshot {
         TranscriptionSourceSnapshot(
             sessionID: UUID(),
@@ -46,7 +54,7 @@ final class TranscriptionModelsTests: XCTestCase {
 
     func testTranscriptResultRoundTripsThroughJSON() throws {
         let result = TranscriptResult(
-            schemaVersion: TranscriptResult.currentSchemaVersion,
+            schemaVersion: TranscriptResult.legacySchemaVersion,
             source: makeSource(),
             output: TranscriptionEngineOutput(
                 text: "hello",
@@ -71,6 +79,143 @@ final class TranscriptionModelsTests: XCTestCase {
         XCTAssertEqual(decoded.source, result.source)
         XCTAssertEqual(decoded.output, result.output)
         XCTAssertEqual(decoded.attemptID, result.attemptID)
+        XCTAssertNil(decoded.output.provenance)
+    }
+
+    func testHistoricalV1BytesDecodeWithoutProvenanceAndAreNotRewritten() throws {
+        let before = try Data(contentsOf: historicalV1FixtureURL)
+        let attributesBefore = try FileManager.default.attributesOfItem(atPath: historicalV1FixtureURL.path)
+
+        let result = try AtomicFileWriter.defaultDecoder.decode(TranscriptResult.self, from: before)
+
+        XCTAssertEqual(result.schemaVersion, TranscriptResult.legacySchemaVersion)
+        XCTAssertNil(result.output.provenance)
+        XCTAssertEqual(result.output.text, "historical transcript")
+        XCTAssertEqual(try Data(contentsOf: historicalV1FixtureURL), before)
+        let attributesAfter = try FileManager.default.attributesOfItem(atPath: historicalV1FixtureURL.path)
+        XCTAssertEqual(attributesBefore[.modificationDate] as? Date, attributesAfter[.modificationDate] as? Date)
+    }
+
+    func testCompleteProvenanceV2RoundTripsExactly() throws {
+        let provenance = makeT3BProvenance()
+        var output = TranscriptionEngineOutput(
+            text: "hello",
+            engineIdentifier: "whisper.cpp",
+            modelIdentifier: "large-v3-turbo",
+            language: "en",
+            segments: [],
+            engineVersion: "1.9.2"
+        )
+        output.provenance = provenance
+        let result = TranscriptResult(
+            schemaVersion: TranscriptResult.schemaVersion(for: output),
+            source: makeSource(),
+            output: output,
+            attemptID: UUID(),
+            completedDate: Date()
+        )
+        let data = try AtomicFileWriter.defaultEncoder.encode(result)
+        let decoded = try AtomicFileWriter.defaultDecoder.decode(TranscriptResult.self, from: data)
+        XCTAssertEqual(decoded.schemaVersion, 2)
+        XCTAssertEqual(decoded.output.provenance, provenance)
+    }
+
+    func testV2DecodeRejectsEachLegacyIdentityContradiction() throws {
+        var output = TranscriptionEngineOutput(
+            text: "hello", engineIdentifier: "whisper.cpp", modelIdentifier: "large-v3-turbo",
+            language: "en", segments: [], engineVersion: "1.9.2"
+        )
+        output.provenance = makeT3BProvenance()
+        let valid = TranscriptResult(
+            schemaVersion: 2, source: makeSource(), output: output,
+            attemptID: UUID(), completedDate: Date()
+        )
+        let validData = try AtomicFileWriter.defaultEncoder.encode(valid)
+        let contradictions: [(String, Any)] = [
+            ("engineIdentifier", "other-engine"),
+            ("engineVersion", "0.0.0"),
+            ("modelIdentifier", "other-model"),
+            ("language", "EN"),
+        ]
+        for (field, value) in contradictions {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: validData) as? [String: Any])
+            var encodedOutput = try XCTUnwrap(object["output"] as? [String: Any])
+            encodedOutput[field] = value
+            object["output"] = encodedOutput
+            let contradictoryData = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(TranscriptResult.self, from: contradictoryData), field)
+        }
+    }
+
+    func testV2WithoutProvenanceIsRejected() throws {
+        let result = TranscriptResult(
+            schemaVersion: 2,
+            source: makeSource(),
+            output: TranscriptionEngineOutput(
+                text: "hello", engineIdentifier: "fake", modelIdentifier: nil,
+                language: nil, segments: nil, engineVersion: nil
+            ),
+            attemptID: UUID(),
+            completedDate: Date()
+        )
+        XCTAssertThrowsError(try AtomicFileWriter.defaultEncoder.encode(result))
+    }
+
+    func testProvenanceRejectsInvalidCanonicalAndBoundedFields() {
+        var provenance = makeT3BProvenance()
+        provenance.engine.sourceRevision = provenance.engine.sourceRevision.uppercased()
+        XCTAssertThrowsError(try provenance.validate())
+
+        provenance = makeT3BProvenance()
+        provenance.model.sha256 = String(repeating: "a", count: 63)
+        XCTAssertThrowsError(try provenance.validate())
+
+        provenance = makeT3BProvenance()
+        provenance.model.byteCount = 0
+        XCTAssertThrowsError(try provenance.validate())
+
+        provenance = makeT3BProvenance()
+        provenance.configuration.threadCount = 65
+        XCTAssertThrowsError(try provenance.validate())
+
+        provenance = makeT3BProvenance()
+        provenance.worker.identifier = String(repeating: "x", count: 129)
+        XCTAssertThrowsError(try provenance.validate())
+    }
+
+    func testMalformedV2NumericAndEnumValuesAreRejected() throws {
+        var output = TranscriptionEngineOutput(
+            text: "hello", engineIdentifier: "whisper.cpp", modelIdentifier: "large-v3-turbo",
+            language: "en", segments: [], engineVersion: "1.9.2"
+        )
+        output.provenance = makeT3BProvenance()
+        let result = TranscriptResult(
+            schemaVersion: 2, source: makeSource(), output: output,
+            attemptID: UUID(), completedDate: Date()
+        )
+        let data = try AtomicFileWriter.defaultEncoder.encode(result)
+        let json = String(decoding: data, as: UTF8.self)
+        XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(
+            TranscriptResult.self,
+            from: Data(json.replacingOccurrences(of: "\"greedy\"", with: "\"unknown\"").utf8)
+        ))
+        XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(
+            TranscriptResult.self,
+            from: Data(json.replacingOccurrences(of: "1624555275", with: "-1").utf8)
+        ))
+        XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(
+            TranscriptResult.self,
+            from: Data(json.replacingOccurrences(of: "1624555275", with: "18446744073709551616").utf8)
+        ))
+    }
+
+    func testUnknownFutureResultVersionIsRejected() throws {
+        let historical = try Data(contentsOf: historicalV1FixtureURL)
+        let json = String(decoding: historical, as: UTF8.self)
+        XCTAssertThrowsError(try AtomicFileWriter.defaultDecoder.decode(
+            TranscriptResult.self,
+            from: Data(json.replacingOccurrences(of: "\"schemaVersion\" : 1", with: "\"schemaVersion\" : 999").utf8)
+        ))
     }
 
     func testTranscriptionFailureRoundTripsThroughJSON() throws {

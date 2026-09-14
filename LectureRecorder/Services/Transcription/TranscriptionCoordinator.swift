@@ -357,7 +357,7 @@ actor TranscriptionCoordinator {
         }
 
         let result = TranscriptResult(
-            schemaVersion: TranscriptResult.currentSchemaVersion,
+            schemaVersion: TranscriptResult.schemaVersion(for: output),
             source: job.source,
             output: output,
             attemptID: attemptID,
