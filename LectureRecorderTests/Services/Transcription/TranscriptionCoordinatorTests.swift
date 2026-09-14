@@ -815,25 +815,28 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(reconciled?.lastFailure?.retryDisposition, .retryable)
     }
 
-    func testProcessJobLeavesJobRunningOnCommitDurabilityUncertainAndReconciliationCompletesIt() async throws {
-        let spy = SpyExclusiveArtifactFileSystem()
-        let store = TranscriptionStore(exclusiveFileSystem: spy)
-        let attemptID = UUID()
-        let transcriber = FakeTranscriber()
-        let coordinator = makeCoordinator(store: store, transcriber: transcriber, makeAttemptID: { attemptID })
+    /// Shared setup for both durability-reconfirmation reconciliation
+    /// tests below: drives `processJob` through the real crash window (the
+    /// exclusive rename genuinely succeeded — a valid, attempt-matching
+    /// result really is on disk — but the containing-directory fsync could
+    /// not be confirmed at commit time), and proves the already-covered,
+    /// unchanged `processJob`-level behavior (requirements 1-3: the commit
+    /// is reported durability-uncertain, the job is left `.running`, and
+    /// the result is present and untouched) before returning control to
+    /// the caller to exercise reconciliation's *new* behavior.
+    private func setUpDurabilityUncertainCommit(
+        spy: SpyExclusiveArtifactFileSystem,
+        store: TranscriptionStore,
+        attemptID: UUID,
+        coordinator: TranscriptionCoordinator
+    ) async throws -> (resultURL: URL, precommittedData: Data) {
         _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
 
-        // Simulate the real crash window: the exclusive rename genuinely
-        // succeeded (a valid result carrying this attempt's identity
-        // really is on disk), but the containing-directory fsync could
-        // not be confirmed. The spy is forced to report
-        // `.createdDurabilityUncertain` without touching disk itself, so
-        // this pre-written file stands in for "the rename already
-        // happened."
         let resultURL = artifactPaths.resultURL(sequenceNumber: 0)
         let precommitted = makeResult(sequenceNumber: 0, attemptID: attemptID)
         try FileManager.default.createDirectory(at: artifactPaths.resultsDirectory, withIntermediateDirectories: true)
-        try AtomicFileWriter.defaultEncoder.encode(precommitted).write(to: resultURL)
+        let precommittedData = try AtomicFileWriter.defaultEncoder.encode(precommitted)
+        try precommittedData.write(to: resultURL)
         spy.forceResult(.success(.createdDurabilityUncertain), forURL: resultURL)
 
         do {
@@ -841,26 +844,234 @@ final class TranscriptionCoordinatorTests: XCTestCase {
             XCTFail("Expected commitDurabilityUncertain")
         } catch let error as TranscriptionCoordinatorError {
             guard case .commitDurabilityUncertain = error else {
-                return XCTFail("Expected commitDurabilityUncertain, got \(error)")
+                XCTFail("Expected commitDurabilityUncertain, got \(error)")
+                return (resultURL, precommittedData)
             }
         }
 
+        // Requirements 1-3: processJob does not complete the job, and the
+        // result is present and unchanged.
         let job = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)
         XCTAssertEqual(job?.state, .running)
         XCTAssertEqual(job?.currentAttemptID, attemptID)
+        XCTAssertEqual(try Data(contentsOf: resultURL), precommittedData)
 
         do {
             _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
             XCTFail("Expected jobNotClaimable (proving activeAttempts ownership was released, not leaked)")
         } catch let error as TranscriptionCoordinatorError {
             guard case .jobNotClaimable = error else {
-                return XCTFail("Expected jobNotClaimable, got \(error)")
+                XCTFail("Expected jobNotClaimable, got \(error)")
+                return (resultURL, precommittedData)
             }
         }
 
-        let freshCoordinator = makeCoordinator(store: store)
+        return (resultURL, precommittedData)
+    }
+
+    // MARK: - `alreadyCommittedIdentical` durability re-confirmation
+
+    /// Shared setup for the two `completeJob`-level `.alreadyCommittedIdentical`
+    /// tests below: leaves job #0 `.running` with `attemptID`, and durably
+    /// commits (via the real store, `.committed`) a canonical result that
+    /// is byte-for-byte what `completeJob(sequenceNumber:attemptID:output:paths:)`
+    /// will itself construct for the same `output`/`attemptID`/`fixedNow` —
+    /// so a subsequent `completeJob` call genuinely observes
+    /// `.alreadyCommittedIdentical`, not `.conflict`, without needing to
+    /// force the exclusive-create outcome itself.
+    private func setUpRunningJobWithIdenticalCommittedResult(
+        store: TranscriptionStore,
+        attemptID: UUID,
+        fixedNow: Date,
+        coordinator: TranscriptionCoordinator
+    ) async throws -> (output: TranscriptionEngineOutput, resultURL: URL, precommittedData: Data) {
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+
+        var job = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)!
+        job.state = .running
+        job.currentAttemptID = attemptID
+        job.attemptCount = 1
+        try await store.replaceJob(job, paths: artifactPaths)
+
+        let output = TranscriptionEngineOutput(
+            text: "hi",
+            engineIdentifier: "fake-v1",
+            modelIdentifier: nil,
+            language: nil,
+            segments: nil,
+            engineVersion: nil
+        )
+        let result = TranscriptResult(
+            schemaVersion: TranscriptResult.schemaVersion(for: output),
+            source: job.source,
+            output: output,
+            attemptID: attemptID,
+            completedDate: fixedNow
+        )
+        let commitOutcome = try await store.commitResult(result, paths: artifactPaths)
+        if commitOutcome != .committed {
+            XCTFail("Expected initial commit to succeed durably, got \(commitOutcome)")
+        }
+
+        let resultURL = artifactPaths.resultURL(sequenceNumber: 0)
+        let precommittedData = try Data(contentsOf: resultURL)
+        return (output, resultURL, precommittedData)
+    }
+
+    func testCompleteJobLeavesJobRunningWhenAlreadyCommittedIdenticalDurabilityReconfirmationFails() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        let attemptID = UUID()
+        let fixedNow = Date()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, now: { fixedNow }, makeAttemptID: { attemptID })
+        let (output, resultURL, precommittedData) = try await setUpRunningJobWithIdenticalCommittedResult(
+            store: store, attemptID: attemptID, fixedNow: fixedNow, coordinator: coordinator
+        )
+
+        // Fresh durability re-confirmation for the results directory fails
+        // -- the identical result's mere readability is not itself
+        // evidence that an earlier durability uncertainty was resolved.
+        spy.forceDirectorySync(false, forURL: artifactPaths.resultsDirectory)
+
+        do {
+            _ = try await coordinator.completeJob(sequenceNumber: 0, attemptID: attemptID, output: output, paths: artifactPaths)
+            XCTFail("Expected commitDurabilityUncertain")
+        } catch let error as TranscriptionCoordinatorError {
+            guard case .commitDurabilityUncertain = error else {
+                return XCTFail("Expected commitDurabilityUncertain, got \(error)")
+            }
+        }
+
+        // The job is left exactly `.running` with the same attempt --
+        // never marked failed, never rerun.
+        let job = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(job?.state, .running)
+        XCTAssertEqual(job?.currentAttemptID, attemptID)
+        // The canonical result was never rewritten, replaced, or deleted.
+        XCTAssertEqual(try Data(contentsOf: resultURL), precommittedData)
+        // completeJob itself never invokes the transcriber.
+        XCTAssertEqual(transcriber.recordedCalls.count, 0)
+    }
+
+    func testCompleteJobCompletesAlreadyCommittedIdenticalResultOnceDurabilityReconfirmationSucceeds() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        let attemptID = UUID()
+        let fixedNow = Date()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, now: { fixedNow }, makeAttemptID: { attemptID })
+        let (output, resultURL, precommittedData) = try await setUpRunningJobWithIdenticalCommittedResult(
+            store: store, attemptID: attemptID, fixedNow: fixedNow, coordinator: coordinator
+        )
+
+        // An un-forced `synchronizeDirectory` call delegates to the real
+        // filesystem, which genuinely can fsync this writable temp
+        // directory -- fresh durability confirmation succeeds.
+        let completed = try await coordinator.completeJob(
+            sequenceNumber: 0, attemptID: attemptID, output: output, paths: artifactPaths
+        )
+
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertNil(completed.currentAttemptID)
+        XCTAssertTrue(spy.recordedCalls.contains(.synchronizeDirectory(artifactPaths.resultsDirectory)))
+        // The already-identical canonical result remains exactly as it was.
+        XCTAssertEqual(try Data(contentsOf: resultURL), precommittedData)
+        // completeJob itself never invokes the transcriber.
+        XCTAssertEqual(transcriber.recordedCalls.count, 0)
+    }
+
+    func testReconciliationLeavesJobRunningWhenResultDurabilityReconfirmationStillFails() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        let attemptID = UUID()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, makeAttemptID: { attemptID })
+        let (resultURL, precommittedData) = try await setUpDurabilityUncertainCommit(
+            spy: spy, store: store, attemptID: attemptID, coordinator: coordinator
+        )
+        let sourceAudioURL = artifactPaths.chunkAudioURL(fileName: TranscriptionArtifactPaths.canonicalChunkFileName(for: 0))
+        let sourceAudioBefore = try Data(contentsOf: sourceAudioURL)
+
+        // Requirement 4: recovery's fresh directory re-confirmation still
+        // fails (the same underlying durability problem persists).
+        spy.forceDirectorySync(false, forURL: artifactPaths.resultsDirectory)
+
+        // A distinct transcriber instance, never passed to `coordinator`
+        // above, so its own call count is proof reconciliation itself
+        // invoked no inference -- not merely that the *original*
+        // transcriber wasn't called again.
+        let recoveryTranscriber = FakeTranscriber()
+        let freshCoordinator = makeCoordinator(store: store, transcriber: recoveryTranscriber)
         let report = try await freshCoordinator.reconcileState(paths: artifactPaths)
         let reconciled = report.jobs.first { $0.source.chunkSequenceNumber == 0 }
+
+        // Never presented as completed while durability remains
+        // unresolved, and never silently failed either -- the result
+        // really is there and transcription must not be rerun.
+        XCTAssertEqual(reconciled?.state, .running)
+        XCTAssertEqual(reconciled?.currentAttemptID, attemptID)
+        XCTAssertTrue(report.inconsistencies.contains(.resultDurabilityUnconfirmed(sequenceNumber: 0)))
+
+        // The immutable result was never rewritten or replaced.
+        XCTAssertEqual(try Data(contentsOf: resultURL), precommittedData)
+        // No second transcription/inference call was made during recovery.
+        XCTAssertEqual(recoveryTranscriber.recordedCalls.count, 0)
+        // The original attempt's own single transcribe call still stands.
+        XCTAssertEqual(transcriber.recordedCalls.count, 1)
+        // Source audio is untouched by the failed recovery attempt.
+        XCTAssertEqual(try Data(contentsOf: sourceAudioURL), sourceAudioBefore)
+
+        // A second reconciliation pass, still without durability restored,
+        // must behave identically -- not flip to failed or completed.
+        spy.forceDirectorySync(false, forURL: artifactPaths.resultsDirectory)
+        let secondReport = try await freshCoordinator.reconcileState(paths: artifactPaths)
+        let secondReconciled = secondReport.jobs.first { $0.source.chunkSequenceNumber == 0 }
+        XCTAssertEqual(secondReconciled?.state, .running)
+        XCTAssertEqual(recoveryTranscriber.recordedCalls.count, 0)
+    }
+
+    func testReconciliationCompletesJobOnceResultDurabilityReconfirmationSucceeds() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        let attemptID = UUID()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, makeAttemptID: { attemptID })
+        let (resultURL, precommittedData) = try await setUpDurabilityUncertainCommit(
+            spy: spy, store: store, attemptID: attemptID, coordinator: coordinator
+        )
+        let sourceAudioURL = artifactPaths.chunkAudioURL(fileName: TranscriptionArtifactPaths.canonicalChunkFileName(for: 0))
+        let sourceAudioBefore = try Data(contentsOf: sourceAudioURL)
+
+        // Requirement 5: an un-forced `synchronizeDirectory` call delegates
+        // to the real filesystem, which genuinely can fsync this writable
+        // temp directory -- fresh durability confirmation succeeds.
+        //
+        // A distinct transcriber instance, never passed to `coordinator`
+        // above, so its own call count is proof reconciliation itself
+        // invoked no inference -- not merely that the *original*
+        // transcriber wasn't called again.
+        let recoveryTranscriber = FakeTranscriber()
+        let freshCoordinator = makeCoordinator(store: store, transcriber: recoveryTranscriber)
+        let report = try await freshCoordinator.reconcileState(paths: artifactPaths)
+        let reconciled = report.jobs.first { $0.source.chunkSequenceNumber == 0 }
+
         XCTAssertEqual(reconciled?.state, .completed)
+        XCTAssertNil(reconciled?.currentAttemptID)
+        XCTAssertFalse(report.inconsistencies.contains { inconsistency in
+            if case .resultDurabilityUnconfirmed = inconsistency { return true }
+            return false
+        })
+        XCTAssertTrue(spy.recordedCalls.contains(.synchronizeDirectory(artifactPaths.resultsDirectory)))
+
+        // Requirement 6: no second transcription/inference call was made
+        // during recovery.
+        XCTAssertEqual(recoveryTranscriber.recordedCalls.count, 0)
+        // The original attempt's own single transcribe call still stands.
+        XCTAssertEqual(transcriber.recordedCalls.count, 1)
+        // Requirement 7: the canonical result was never rewritten.
+        XCTAssertEqual(try Data(contentsOf: resultURL), precommittedData)
+        // Requirement 10: source audio is untouched by recovery.
+        XCTAssertEqual(try Data(contentsOf: sourceAudioURL), sourceAudioBefore)
     }
 }

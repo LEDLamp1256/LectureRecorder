@@ -56,6 +56,17 @@ nonisolated protocol ExclusiveArtifactFileSystem: Sendable {
     /// safely possible. Never replaces or deletes an existing file at
     /// `url`.
     func createExclusive(data: Data, at url: URL) throws -> ExclusiveCreateOutcome
+
+    /// Re-synchronizes an already-existing directory's own entry to disk,
+    /// independent of any specific file inside it. Gives a caller a way to
+    /// obtain *fresh* durability evidence for a directory whose earlier
+    /// synchronization (inside a prior `createExclusive` call) could not be
+    /// confirmed — see `TranscriptionCoordinator.reconcileState`'s handling
+    /// of `.committedDurabilityUncertain`. Never throws: mirrors
+    /// `createExclusive`'s own containing-directory sync step, which
+    /// reports that same class of failure as data
+    /// (`.createdDurabilityUncertain`) rather than as a thrown error.
+    func synchronizeDirectory(at url: URL) -> Bool
 }
 
 /// Production `ExclusiveArtifactFileSystem`, backed by
@@ -110,14 +121,21 @@ nonisolated struct DarwinExclusiveArtifactFileSystem: ExclusiveArtifactFileSyste
         // readable at `url` from this point on, regardless of what
         // happens below. A directory-sync failure here must never be
         // reported as though the artifact does not exist.
+        return Self.synchronize(directory: directory) ? .created : .createdDurabilityUncertain
+    }
+
+    func synchronizeDirectory(at url: URL) -> Bool {
+        Self.synchronize(directory: url)
+    }
+
+    /// Opens `directory` and `fsync`s it, reporting whether that succeeded.
+    /// Shared by `createExclusive`'s own containing-directory sync step and
+    /// the standalone `synchronizeDirectory(at:)` re-confirmation entry
+    /// point, so both paths use exactly the same Darwin primitive.
+    private static func synchronize(directory: URL) -> Bool {
         let directoryFD = open(directory.path, O_RDONLY)
-        guard directoryFD >= 0 else {
-            return .createdDurabilityUncertain
-        }
+        guard directoryFD >= 0 else { return false }
         defer { close(directoryFD) }
-        guard fsync(directoryFD) == 0 else {
-            return .createdDurabilityUncertain
-        }
-        return .created
+        return fsync(directoryFD) == 0
     }
 }

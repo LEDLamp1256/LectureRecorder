@@ -335,12 +335,24 @@ actor TranscriptionCoordinator {
 
     /// Commits `output` as an immutable result and transitions the job to
     /// `.completed`, only if `attemptID` still matches the durably-loaded
-    /// job's `currentAttemptID`. On `.committedDurabilityUncertain`, the
-    /// job is deliberately left `.running` and
-    /// `TranscriptionCoordinatorError.commitDurabilityUncertain` is
-    /// thrown. On `.conflict`/`.integrityError`, the job is transitioned
-    /// to `.failed` via `failJob` with the corresponding category and a
-    /// `.permanent` disposition.
+    /// job's `currentAttemptID`. On `.committed`, this commit's own
+    /// containing-directory sync already succeeded, so the completed-job
+    /// transition proceeds immediately. On `.alreadyCommittedIdentical`,
+    /// the canonical result already existed and validates as identical —
+    /// but that alone is not fresh evidence that an *earlier* durability
+    /// uncertainty for this directory has since been resolved, so
+    /// `store.confirmResultsDirectoryDurable` is required first; only on
+    /// success does the completed-job transition proceed, and on failure
+    /// or a thrown error the job is left exactly as loaded (`.running`,
+    /// same `currentAttemptID`) with
+    /// `TranscriptionCoordinatorError.commitDurabilityUncertain` thrown —
+    /// the canonical result is never rewritten, replaced, or deleted, and
+    /// the job is never marked failed or re-transcribed. On
+    /// `.committedDurabilityUncertain`, the job is likewise deliberately
+    /// left `.running` and `commitDurabilityUncertain` is thrown. On
+    /// `.conflict`/`.integrityError`, the job is transitioned to `.failed`
+    /// via `failJob` with the corresponding category and a `.permanent`
+    /// disposition.
     @discardableResult
     func completeJob(
         sequenceNumber: Int,
@@ -367,28 +379,20 @@ actor TranscriptionCoordinator {
         let outcome = try await store.commitResult(result, paths: paths)
 
         switch outcome {
-        case .committed, .alreadyCommittedIdentical:
-            var completed = job
-            completed.state = .completed
-            completed.currentAttemptID = nil
-            completed.updatedDate = now()
-            do {
-                try await store.replaceJob(completed, paths: paths)
-            } catch {
-                // The result is already durably committed at this point.
-                // A failure persisting the job's own completed-state
-                // transition must not be reclassified as a transcription
-                // failure by processJob's generic catch-all — that would
-                // silently orphan an already-successful result behind a
-                // job marked `.failed(.unknown, .permanent)`. Leave the
-                // job exactly as reconciliation expects to find it —
-                // `.running` with this attempt still current — by
-                // surfacing the same durability-uncertain signal already
-                // used one case below for the sibling filesystem-level
-                // outcome.
+        case .committed:
+            return try await transitionToCompleted(job: job, sequenceNumber: sequenceNumber, paths: paths)
+        case .alreadyCommittedIdentical:
+            // Readable-and-identical is exactly what a result originally
+            // committed as `.committedDurabilityUncertain` also satisfies
+            // — so, just like `TranscriptionCoordinator.reconcileState`,
+            // fresh directory-durability evidence is required before this
+            // is treated as permission to complete the job, not the mere
+            // existence of a matching result.
+            let durabilityConfirmed = (try? await store.confirmResultsDirectoryDurable(paths: paths)) ?? false
+            guard durabilityConfirmed else {
                 throw TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: sequenceNumber)
             }
-            return completed
+            return try await transitionToCompleted(job: job, sequenceNumber: sequenceNumber, paths: paths)
         case .committedDurabilityUncertain:
             throw TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: sequenceNumber)
         case .conflict:
@@ -418,6 +422,40 @@ actor TranscriptionCoordinator {
                 paths: paths
             )
         }
+    }
+
+    /// Shared completed-job write for `completeJob`'s two success paths
+    /// (`.committed` and, once durability is confirmed,
+    /// `.alreadyCommittedIdentical`). `job` must already be the durably-
+    /// loaded `.running` job this attempt owns; this function only
+    /// performs the state transition and its durable write.
+    private func transitionToCompleted(
+        job: TranscriptionJob,
+        sequenceNumber: Int,
+        paths: TranscriptionArtifactPaths
+    ) async throws -> TranscriptionJob {
+        var completed = job
+        completed.state = .completed
+        completed.currentAttemptID = nil
+        completed.updatedDate = now()
+        do {
+            try await store.replaceJob(completed, paths: paths)
+        } catch {
+            // The result is already durably committed at this point (or
+            // was already durably committed and its directory durability
+            // has just been freshly reconfirmed). A failure persisting
+            // the job's own completed-state transition must not be
+            // reclassified as a transcription failure by processJob's
+            // generic catch-all — that would silently orphan an
+            // already-successful result behind a job marked
+            // `.failed(.unknown, .permanent)`. Leave the job exactly as
+            // reconciliation expects to find it — `.running` with this
+            // attempt still current — by surfacing the same
+            // durability-uncertain signal used for the sibling
+            // filesystem-level outcomes in `completeJob`.
+            throw TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: sequenceNumber)
+        }
+        return completed
     }
 
     /// Transitions a `.running` job to `.failed`, only if `attemptID`
@@ -453,13 +491,28 @@ actor TranscriptionCoordinator {
     /// because one file is corrupt or an unsupported schema version.
     /// Reclassifies `.running` jobs this instance does not itself own
     /// (`activeAttempts`) as either `.completed` (a matching, attempt-ID-
-    /// consistent result already exists) or `.failed(.abandonedRunningAttempt,
-    /// .retryable)` (no such result). Never auto-completes a `.queued`/
-    /// `.failed` job just because an old, superseded-attempt result file
-    /// happens to exist for it — that is reported as
-    /// `.resultWithNonTerminalJob` instead. Never deletes, overwrites, or
-    /// otherwise repairs any artifact; every finding it cannot safely
-    /// resolve is reported as a `TranscriptionInconsistency`, not fixed.
+    /// consistent result already exists *and* fresh results-directory
+    /// durability re-confirmation succeeds — see below), `.failed(.abandonedRunningAttempt,
+    /// .retryable)` (no such result), or left exactly as `.running` (a
+    /// matching result exists but durability re-confirmation still fails;
+    /// reported as `.resultDurabilityUnconfirmed`, not completed and not
+    /// failed). A `.running` job is never promoted to `.completed` merely
+    /// because its result is readable and attempt-matching: that
+    /// readability alone is exactly what a result committed with
+    /// `.committedDurabilityUncertain` already satisfies, and promoting on
+    /// that basis alone would present a session as Completed while a known
+    /// publication-durability uncertainty remained unresolved. The
+    /// re-confirmation call is made at most once per `reconcileState`
+    /// invocation (all `.running` candidates in one session share the same
+    /// `resultsDirectory`) and never mutates or re-transcribes anything —
+    /// it only gates whether the job's own completed-state transition and
+    /// write, below, is allowed to proceed.
+    /// Never auto-completes a `.queued`/`.failed` job just because an old,
+    /// superseded-attempt result file happens to exist for it — that is
+    /// reported as `.resultWithNonTerminalJob` instead. Never deletes,
+    /// overwrites, or otherwise repairs any artifact; every finding it
+    /// cannot safely resolve is reported as a `TranscriptionInconsistency`,
+    /// not fixed.
     func reconcileState(paths: TranscriptionArtifactPaths) async throws -> ReconciliationReport {
         var inconsistencies: [TranscriptionInconsistency] = []
 
@@ -484,6 +537,12 @@ actor TranscriptionCoordinator {
         }
 
         var reconciledJobs: [TranscriptionJob] = []
+        // Computed at most once per call: every `.running` candidate below
+        // shares the same session `resultsDirectory`, so one fresh
+        // re-confirmation is sufficient evidence for all of them. A thrown
+        // error is treated the same as an unconfirmed sync (`false`) rather
+        // than aborting this partial-tolerant pass.
+        var resultsDirectoryDurabilityConfirmed: Bool?
 
         for sequenceNumber in jobsBySequence.keys.sorted() {
             let job = jobsBySequence[sequenceNumber]!
@@ -498,6 +557,28 @@ actor TranscriptionCoordinator {
 
             case .running:
                 if let matchingResult, matchingResult.attemptID == job.currentAttemptID {
+                    let durabilityConfirmed: Bool
+                    if let cached = resultsDirectoryDurabilityConfirmed {
+                        durabilityConfirmed = cached
+                    } else {
+                        durabilityConfirmed = (try? await store.confirmResultsDirectoryDurable(paths: paths)) ?? false
+                        resultsDirectoryDurabilityConfirmed = durabilityConfirmed
+                    }
+
+                    guard durabilityConfirmed else {
+                        // The result is real and attempt-matching, but
+                        // fresh durability re-confirmation for its
+                        // containing directory still fails. Leave the job
+                        // exactly as-is — not completed, not failed. No
+                        // inference is re-run and the immutable result is
+                        // never touched; recovery-pending state is
+                        // reported truthfully so a later reconciliation
+                        // pass can retry once durability is restored.
+                        inconsistencies.append(.resultDurabilityUnconfirmed(sequenceNumber: sequenceNumber))
+                        reconciledJobs.append(job)
+                        continue
+                    }
+
                     var completed = job
                     completed.state = .completed
                     completed.currentAttemptID = nil

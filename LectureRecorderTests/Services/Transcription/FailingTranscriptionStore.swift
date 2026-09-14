@@ -73,6 +73,10 @@ actor FailingTranscriptionStore: TranscriptionStoring {
         return try await wrapped.commitResult(result, paths: paths)
     }
 
+    func confirmResultsDirectoryDurable(paths: TranscriptionArtifactPaths) async throws -> Bool {
+        try await wrapped.confirmResultsDirectoryDurable(paths: paths)
+    }
+
     func loadAllJobArtifacts(paths: TranscriptionArtifactPaths) async throws -> [ArtifactLoadResult<TranscriptionJob>] {
         try await wrapped.loadAllJobArtifacts(paths: paths)
     }
