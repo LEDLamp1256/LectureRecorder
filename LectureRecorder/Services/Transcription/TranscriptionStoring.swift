@@ -2,7 +2,13 @@ import Foundation
 
 /// A finding reconciliation (or a single load) can report about one
 /// artifact, without aborting processing of every other artifact in the
-/// session. Exactly the ten categories required by the approved plan.
+/// session. The original ten categories required by the approved plan,
+/// plus one reconciliation-only addition: `resultDurabilityUnconfirmed`,
+/// covering a `.running` job whose matching, attempt-consistent result is
+/// readable but whose containing results directory could not be freshly
+/// re-confirmed as durably synchronized — the job is deliberately left
+/// `.running`, neither completed nor failed. See
+/// `TranscriptionCoordinator.reconcileState`.
 /// `jobResultIdentityMismatch` is used both for a single artifact whose
 /// decoded identity doesn't match the path/context it was loaded from, and
 /// for a job/result pair whose identities disagree with each other.
@@ -17,6 +23,7 @@ nonisolated enum TranscriptionInconsistency: Sendable, Equatable {
     case resultAttemptMismatch(sequenceNumber: Int)
     case resultWithNonTerminalJob(sequenceNumber: Int, jobState: TranscriptionJobState)
     case abandonedRunningAttemptWithoutResult(sequenceNumber: Int)
+    case resultDurabilityUnconfirmed(sequenceNumber: Int)
 }
 
 /// The outcome of an exclusive, check-then-create-without-replace job
@@ -124,6 +131,17 @@ nonisolated protocol TranscriptionStoring: Sendable {
     /// for the full set of distinguishable outcomes; never overwrites an
     /// existing canonical result.
     func commitResult(_ result: TranscriptResult, paths: TranscriptionArtifactPaths) async throws -> ResultCommitOutcome
+
+    /// Re-confirms, right now, that `paths.resultsDirectory` is itself
+    /// durably synchronized — independent of any specific result file
+    /// inside it. Used by reconciliation to obtain fresh durability
+    /// evidence before promoting a `.running` job to `.completed` on the
+    /// strength of an already-readable, attempt-matching result, rather
+    /// than trusting stale evidence from whatever the original commit
+    /// attempt observed. Returns `false` (never throws) for an ordinary
+    /// sync failure; only a genuine I/O error establishing the directory
+    /// itself (e.g. it cannot be created) is thrown.
+    func confirmResultsDirectoryDurable(paths: TranscriptionArtifactPaths) async throws -> Bool
 
     /// Enumerates and independently validates every job artifact under
     /// `paths.jobsDirectory`. A malformed/unsupported-schema/identity-

@@ -10,11 +10,13 @@ import Foundation
 final class SpyExclusiveArtifactFileSystem: ExclusiveArtifactFileSystem, @unchecked Sendable {
     enum Call: Equatable {
         case createExclusive(URL)
+        case synchronizeDirectory(URL)
     }
 
     private struct State {
         var calls: [Call] = []
         var forcedResults: [URL: Result<ExclusiveCreateOutcome, TestInjectedError>] = [:]
+        var forcedDirectorySyncResults: [URL: Bool] = [:]
     }
 
     struct TestInjectedError: Error, Sendable {
@@ -42,6 +44,14 @@ final class SpyExclusiveArtifactFileSystem: ExclusiveArtifactFileSystem, @unchec
         state.forcedResults[url] = result
     }
 
+    /// Forces the *next* `synchronizeDirectory(at:)` call for this exact
+    /// `url` to return the given value instead of delegating to the real
+    /// implementation. One-shot per URL.
+    func forceDirectorySync(_ result: Bool, forURL url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        state.forcedDirectorySyncResults[url] = result
+    }
+
     func createExclusive(data: Data, at url: URL) throws -> ExclusiveCreateOutcome {
         lock.lock()
         state.calls.append(.createExclusive(url))
@@ -57,5 +67,17 @@ final class SpyExclusiveArtifactFileSystem: ExclusiveArtifactFileSystem, @unchec
             }
         }
         return try real.createExclusive(data: data, at: url)
+    }
+
+    func synchronizeDirectory(at url: URL) -> Bool {
+        lock.lock()
+        state.calls.append(.synchronizeDirectory(url))
+        let forced = state.forcedDirectorySyncResults.removeValue(forKey: url)
+        lock.unlock()
+
+        if let forced {
+            return forced
+        }
+        return real.synchronizeDirectory(at: url)
     }
 }

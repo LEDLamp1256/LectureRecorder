@@ -143,6 +143,11 @@ actor TranscriptionStore: TranscriptionStoring {
         }
     }
 
+    func confirmResultsDirectoryDurable(paths: TranscriptionArtifactPaths) throws -> Bool {
+        try ensureDirectoriesExist(paths: paths)
+        return exclusiveFileSystem.synchronizeDirectory(at: paths.resultsDirectory)
+    }
+
     // MARK: - Bulk, partial-tolerant enumeration
 
     func loadAllJobArtifacts(paths: TranscriptionArtifactPaths) throws -> [ArtifactLoadResult<TranscriptionJob>] {
@@ -350,7 +355,10 @@ actor TranscriptionStore: TranscriptionStoring {
              .completedJobMissingResult(let seq),
              .resultAttemptMismatch(let seq),
              .resultWithNonTerminalJob(let seq, _),
-             .abandonedRunningAttemptWithoutResult(let seq):
+             .abandonedRunningAttemptWithoutResult(let seq),
+             .resultDurabilityUnconfirmed(let seq):
+            // These are reconciliation-only findings; decodeJob/decodeResult
+            // (the only callers of storeError(from:)) never produce them.
             return .corrupt(sequenceNumber: seq, underlying: "Unexpected inconsistency in single-target load.")
         }
     }

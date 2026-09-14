@@ -266,6 +266,24 @@ final class TranscriptionStoreTests: XCTestCase {
         XCTAssertEqual(outcome, .committedDurabilityUncertain)
     }
 
+    func testConfirmResultsDirectoryDurableSucceedsOnRealDirectory() async throws {
+        let store = TranscriptionStore()
+        try await store.ensureDirectoriesExist(paths: paths)
+
+        let confirmed = try await store.confirmResultsDirectoryDurable(paths: paths)
+        XCTAssertTrue(confirmed)
+    }
+
+    func testConfirmResultsDirectoryDurableReportsFilesystemLevelSyncFailure() async throws {
+        let spy = SpyExclusiveArtifactFileSystem()
+        let store = TranscriptionStore(exclusiveFileSystem: spy)
+        try await store.ensureDirectoriesExist(paths: paths)
+        spy.forceDirectorySync(false, forURL: paths.resultsDirectory)
+
+        let confirmed = try await store.confirmResultsDirectoryDurable(paths: paths)
+        XCTAssertFalse(confirmed)
+    }
+
     // MARK: - Schema version rejection
 
     func testLoadJobRejectsUnsupportedSchemaVersion() async throws {
