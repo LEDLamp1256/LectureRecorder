@@ -20,6 +20,26 @@
 		C0A000000000000000000206 /* ProcessInvocationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000216 /* ProcessInvocationState.swift */; };
 		C0A000000000000000000207 /* TranscriptionWorkerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000217 /* TranscriptionWorkerClient.swift */; };
 		C0A000000000000000000208 /* WorkerProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000218 /* WorkerProtocol.swift */; };
+		C0A000000000000000000209 /* WhisperAudioDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000219 /* WhisperAudioDecoder.swift */; };
+		C0A00000000000000000020A /* WhisperTimestamp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A00000000000000000021A /* WhisperTimestamp.swift */; };
+		C0A0000000000000000002B0 /* AudioFormatDescriptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C0 /* AudioFormatDescriptor.swift */; };
+		C0A0000000000000000002B1 /* SessionManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C1 /* SessionManifest.swift */; };
+		C0A0000000000000000002B2 /* Log.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C2 /* Log.swift */; };
+		C0A0000000000000000002B3 /* FileSystemLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C3 /* FileSystemLocator.swift */; };
+		C0A0000000000000000002B4 /* AtomicFileWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C4 /* AtomicFileWriter.swift */; };
+		C0A0000000000000000002B5 /* TranscriptionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C5 /* TranscriptionModels.swift */; };
+		C0A0000000000000000002B6 /* Transcribing.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C6 /* Transcribing.swift */; };
+		C0A0000000000000000002B7 /* TranscriptionStoring.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C7 /* TranscriptionStoring.swift */; };
+		C0A0000000000000000002B8 /* TranscriptionArtifactPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C8 /* TranscriptionArtifactPaths.swift */; };
+		C0A0000000000000000002B9 /* ExclusiveArtifactFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C9 /* ExclusiveArtifactFileSystem.swift */; };
+		C0A0000000000000000002BA /* TranscriptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CA /* TranscriptionStore.swift */; };
+		C0A0000000000000000002BB /* WhisperModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CB /* WhisperModelCatalog.swift */; };
+		C0A0000000000000000002BC /* WhisperT3BPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CC /* WhisperT3BPolicy.swift */; };
+		C0A0000000000000000002BD /* WhisperProcessTranscriber.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CD /* WhisperProcessTranscriber.swift */; };
+		C0A0000000000000000002BE /* technical-speech-44100-mono.caf in Resources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CE /* technical-speech-44100-mono.caf */; };
+		C0A0000000000000000002BF /* TranscriptionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CF /* TranscriptionCoordinator.swift */; };
+		C0A0000000000000000002D0 /* WhisperBridgePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002D1 /* WhisperBridgePipeline.swift */; };
+		C0A0000000000000000002D2 /* WhisperInvocationGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002D3 /* WhisperInvocationGate.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -93,6 +113,26 @@
 		C0A000000000000000000216 /* ProcessInvocationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/ProcessInvocationState.swift; sourceTree = SOURCE_ROOT; };
 		C0A000000000000000000217 /* TranscriptionWorkerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/TranscriptionWorkerClient.swift; sourceTree = SOURCE_ROOT; };
 		C0A000000000000000000218 /* WorkerProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/WorkerProtocol.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000219 /* WhisperAudioDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperAudioDecoder.swift; sourceTree = SOURCE_ROOT; };
+		C0A00000000000000000021A /* WhisperTimestamp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperTimestamp.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C0 /* AudioFormatDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Models/AudioFormatDescriptor.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C1 /* SessionManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Models/SessionManifest.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C2 /* Log.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Support/Log.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C3 /* FileSystemLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/FileSystemLocator.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C4 /* AtomicFileWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/AtomicFileWriter.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C5 /* TranscriptionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionModels.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C6 /* Transcribing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Transcribing.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C7 /* TranscriptionStoring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionStoring.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C8 /* TranscriptionArtifactPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionArtifactPaths.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C9 /* ExclusiveArtifactFileSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/ExclusiveArtifactFileSystem.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CA /* TranscriptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionStore.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CB /* WhisperModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperModelCatalog.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CC /* WhisperT3BPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperT3BPolicy.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CD /* WhisperProcessTranscriber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperProcessTranscriber.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CE /* technical-speech-44100-mono.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = LectureRecorderTests/Fixtures/technical-speech-44100-mono.caf; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CF /* TranscriptionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002D1 /* WhisperBridgePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperBridgePipeline.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002D3 /* WhisperInvocationGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperInvocationGate.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -277,6 +317,7 @@
 			buildPhases = (
 				C0A000000000000000000241 /* Sources */,
 				C0A000000000000000000240 /* Frameworks */,
+				C0A000000000000000000242 /* Copy T3B Fixture */,
 			);
 			buildRules = (
 			);
@@ -380,6 +421,17 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C0A000000000000000000242 /* Copy T3B Fixture */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = T3BFixtures;
+			dstSubfolderSpec = 16;
+			files = (
+				C0A0000000000000000002BE /* technical-speech-44100-mono.caf in Resources */,
+			);
+			name = "Copy T3B Fixture";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -408,6 +460,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C0A000000000000000000209 /* WhisperAudioDecoder.swift in Sources */,
+				C0A00000000000000000020A /* WhisperTimestamp.swift in Sources */,
+				C0A0000000000000000002D0 /* WhisperBridgePipeline.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -423,6 +478,22 @@
 				C0A000000000000000000206 /* ProcessInvocationState.swift in Sources */,
 				C0A000000000000000000207 /* TranscriptionWorkerClient.swift in Sources */,
 				C0A000000000000000000208 /* WorkerProtocol.swift in Sources */,
+				C0A0000000000000000002B0 /* AudioFormatDescriptor.swift in Sources */,
+				C0A0000000000000000002B1 /* SessionManifest.swift in Sources */,
+				C0A0000000000000000002B2 /* Log.swift in Sources */,
+				C0A0000000000000000002B3 /* FileSystemLocator.swift in Sources */,
+				C0A0000000000000000002B4 /* AtomicFileWriter.swift in Sources */,
+				C0A0000000000000000002B5 /* TranscriptionModels.swift in Sources */,
+				C0A0000000000000000002B6 /* Transcribing.swift in Sources */,
+				C0A0000000000000000002B7 /* TranscriptionStoring.swift in Sources */,
+				C0A0000000000000000002B8 /* TranscriptionArtifactPaths.swift in Sources */,
+				C0A0000000000000000002B9 /* ExclusiveArtifactFileSystem.swift in Sources */,
+				C0A0000000000000000002BA /* TranscriptionStore.swift in Sources */,
+				C0A0000000000000000002BB /* WhisperModelCatalog.swift in Sources */,
+				C0A0000000000000000002BC /* WhisperT3BPolicy.swift in Sources */,
+				C0A0000000000000000002BD /* WhisperProcessTranscriber.swift in Sources */,
+				C0A0000000000000000002BF /* TranscriptionCoordinator.swift in Sources */,
+				C0A0000000000000000002D2 /* WhisperInvocationGate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -739,6 +810,11 @@
 				DEVELOPMENT_TEAM = 7S2J66TZ76;
 				ENABLE_TESTABILITY = NO;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/include",
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/ggml/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = LectureRecorderWhisperWorker/WhisperBridge.h;
 				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WhisperWorker;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -758,6 +834,11 @@
 				DEVELOPMENT_TEAM = 7S2J66TZ76;
 				ENABLE_TESTABILITY = NO;
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/include",
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/ggml/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = LectureRecorderWhisperWorker/WhisperBridge.h;
 				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WhisperWorker;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;

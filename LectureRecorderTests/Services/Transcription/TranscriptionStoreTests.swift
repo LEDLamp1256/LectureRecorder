@@ -73,7 +73,7 @@ final class TranscriptionStoreTests: XCTestCase {
 
     private func makeResult(sequenceNumber: Int, attemptID: UUID = UUID(), text: String = "hi") -> TranscriptResult {
         TranscriptResult(
-            schemaVersion: TranscriptResult.currentSchemaVersion,
+            schemaVersion: TranscriptResult.legacySchemaVersion,
             source: makeSource(sequenceNumber: sequenceNumber),
             output: TranscriptionEngineOutput(
                 text: text,
@@ -84,6 +84,25 @@ final class TranscriptionStoreTests: XCTestCase {
                 engineVersion: nil
             ),
             attemptID: attemptID,
+            completedDate: Date()
+        )
+    }
+
+    private func makeV2Result(sequenceNumber: Int) -> TranscriptResult {
+        var output = TranscriptionEngineOutput(
+            text: "validated transcript",
+            engineIdentifier: "whisper.cpp",
+            modelIdentifier: "large-v3-turbo",
+            language: "en",
+            segments: [TranscriptionTimingSegment(startSeconds: 0, endSeconds: 1, text: "validated transcript")],
+            engineVersion: "1.9.2"
+        )
+        output.provenance = makeT3BProvenance()
+        return TranscriptResult(
+            schemaVersion: TranscriptResult.schemaVersion(for: output),
+            source: makeSource(sequenceNumber: sequenceNumber),
+            output: output,
+            attemptID: UUID(),
             completedDate: Date()
         )
     }
@@ -156,6 +175,61 @@ final class TranscriptionStoreTests: XCTestCase {
         XCTAssertEqual(outcome, .committed)
     }
 
+    func testV2CommitAndReloadPreservesEveryProvenanceField() async throws {
+        let store = TranscriptionStore()
+        let result = makeV2Result(sequenceNumber: 0)
+        let outcome = try await store.commitResult(result, paths: paths)
+        XCTAssertEqual(outcome, .committed)
+
+        let persistedData = try Data(contentsOf: paths.resultURL(sequenceNumber: 0))
+        let persistedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: persistedData) as? [String: Any])
+        XCTAssertEqual(persistedObject["schemaVersion"] as? Int, 2)
+
+        let reloaded = try await store.loadResult(sequenceNumber: 0, paths: paths)
+        XCTAssertEqual(reloaded?.output.provenance, makeT3BProvenance())
+        XCTAssertEqual(reloaded?.schemaVersion, 2)
+    }
+
+    func testInvalidV2IsRejectedBeforeExclusivePublication() async throws {
+        var result = makeV2Result(sequenceNumber: 0)
+        result.output.provenance?.model.sha256 = String(repeating: "A", count: 64)
+        let store = TranscriptionStore()
+        do {
+            _ = try await store.commitResult(result, paths: paths)
+            XCTFail("Expected invalid provenance rejection")
+        } catch let error as TranscriptionStoreError {
+            guard case .corrupt = error else { return XCTFail("Expected corrupt, got \(error)") }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.resultURL(sequenceNumber: 0).path))
+    }
+
+    func testEachV2LegacyIdentityContradictionIsRejectedBeforeExclusivePublication() async throws {
+        let mutations: [(inout TranscriptionEngineOutput) -> Void] = [
+            { $0.engineIdentifier = "other-engine" },
+            { $0.engineVersion = "0.0.0" },
+            { $0.modelIdentifier = "other-model" },
+            { $0.language = "EN" },
+        ]
+        for (index, mutation) in mutations.enumerated() {
+            var result = makeV2Result(sequenceNumber: index)
+            mutation(&result.output)
+            let spy = SpyExclusiveArtifactFileSystem()
+            let store = TranscriptionStore(exclusiveFileSystem: spy)
+            do {
+                _ = try await store.commitResult(result, paths: self.paths)
+                XCTFail("Expected pre-publication contradiction rejection")
+            } catch {
+                guard let storeError = error as? TranscriptionStoreError,
+                      case .corrupt = storeError else {
+                    XCTFail("Expected corrupt store error, got \(error)")
+                    continue
+                }
+            }
+            XCTAssertTrue(spy.recordedCalls.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: paths.resultURL(sequenceNumber: index).path))
+        }
+    }
+
     func testDuplicateIdenticalCommitIsIdempotent() async throws {
         let store = TranscriptionStore()
         let attemptID = UUID()
@@ -216,9 +290,9 @@ final class TranscriptionStoreTests: XCTestCase {
 
     func testLoadResultRejectsUnsupportedSchemaVersion() async throws {
         try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
-        var result = makeResult(sequenceNumber: 0)
-        result.schemaVersion = 999
-        let data = try AtomicFileWriter.defaultEncoder.encode(result)
+        let validData = try AtomicFileWriter.defaultEncoder.encode(makeResult(sequenceNumber: 0))
+        let data = Data(String(decoding: validData, as: UTF8.self)
+            .replacingOccurrences(of: "\"schemaVersion\" : 1", with: "\"schemaVersion\" : 999").utf8)
         try data.write(to: paths.resultURL(sequenceNumber: 0))
 
         let store = TranscriptionStore()
@@ -361,9 +435,10 @@ final class TranscriptionStoreTests: XCTestCase {
         _ = try await store.commitResult(makeResult(sequenceNumber: 0), paths: paths)
 
         try FileManager.default.createDirectory(at: paths.resultsDirectory, withIntermediateDirectories: true)
-        var futureResult = makeResult(sequenceNumber: 1)
-        futureResult.schemaVersion = 999
-        try AtomicFileWriter.defaultEncoder.encode(futureResult).write(to: paths.resultURL(sequenceNumber: 1))
+        let validData = try AtomicFileWriter.defaultEncoder.encode(makeResult(sequenceNumber: 1))
+        let futureData = Data(String(decoding: validData, as: UTF8.self)
+            .replacingOccurrences(of: "\"schemaVersion\" : 1", with: "\"schemaVersion\" : 999").utf8)
+        try futureData.write(to: paths.resultURL(sequenceNumber: 1))
 
         _ = try await store.commitResult(makeResult(sequenceNumber: 2), paths: paths)
 

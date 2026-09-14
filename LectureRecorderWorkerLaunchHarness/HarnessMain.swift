@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 
 private struct HarnessFixturePayload: Codable, Sendable {}
@@ -12,6 +13,32 @@ private enum HarnessMode: String {
     case fixtureRead = "fixture-read"
     case whisper
     case processSuite = "process-suite"
+    case acceptanceModelPath = "acceptance-model-path"
+    case realInference = "real-inference"
+}
+
+private final class HarnessTimingBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: WhisperInferenceTiming?
+    func set(_ timing: WhisperInferenceTiming) { lock.withLock { stored = timing } }
+    func get() -> WhisperInferenceTiming? { lock.withLock { stored } }
+}
+
+private struct RealInferenceReport: Codable {
+    let sessionID: UUID
+    let transcript: String
+    let segments: [TranscriptionTimingSegment]
+    let provenance: TranscriptionProvenance
+    let persistedSchemaVersion: Int
+    let modelInitializationMilliseconds: Int64
+    let audioConversionMilliseconds: Int64
+    let inferenceMilliseconds: Int64
+    let totalMilliseconds: Int64
+    let sourceByteCount: Int
+    let sourceSHA256Before: String
+    let sourceSHA256After: String
+    let sourceModificationDateUnchanged: Bool
+    let modelPath: String
 }
 
 private enum HarnessFailure: LocalizedError {
@@ -23,11 +50,12 @@ private enum HarnessFailure: LocalizedError {
     case whisperProbe(WorkerInvocationOutcome<WhisperCapabilityProbeOutput>)
     case emptyWhisperVersion
     case processScenario(name: String, detail: String)
+    case realInference(String)
 
     var errorDescription: String? {
         switch self {
         case .usage:
-            return "Usage: LectureRecorderWorkerLaunchHarness fixture|fixture-read|whisper|process-suite"
+            return "Usage: LectureRecorderWorkerLaunchHarness fixture|fixture-read|whisper|process-suite|acceptance-model-path|real-inference"
         case .fixtureProbe(let outcome):
             return "Fixture probe failed: \(outcome)"
         case .fixtureRead(let outcome):
@@ -42,6 +70,8 @@ private enum HarnessFailure: LocalizedError {
             return "whisper_version() returned an empty upstream version."
         case .processScenario(let name, let detail):
             return "Process scenario '\(name)' failed: \(detail)"
+        case .realInference(let detail):
+            return "Real-inference acceptance failed: \(detail)"
         }
     }
 }
@@ -64,6 +94,10 @@ private enum LectureRecorderWorkerLaunchHarness {
                 try await runWhisperProbe()
             case .processSuite:
                 try await runProcessSuite()
+            case .acceptanceModelPath:
+                print(try harnessModelURL().path)
+            case .realInference:
+                try await runRealInference()
             }
         } catch {
             let diagnostic = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -147,6 +181,111 @@ private enum LectureRecorderWorkerLaunchHarness {
             throw HarnessFailure.emptyWhisperVersion
         }
         print("whisper capability: \(output.upstreamVersion)")
+    }
+
+    private static func runRealInference() async throws {
+        guard let executableURL = Bundle.main.executableURL else {
+            throw HarnessFailure.realInference("The normally signed harness executable path was unavailable.")
+        }
+        let fixtureURL = executableURL.deletingLastPathComponent()
+            .appendingPathComponent("T3BFixtures/technical-speech-44100-mono.caf")
+        guard FileManager.default.fileExists(atPath: fixtureURL.path) else {
+            throw HarnessFailure.realInference("The tracked CAF fixture was not embedded in the normally signed harness.")
+        }
+        let appRoot = try harnessApplicationSupportRoot()
+        let modelURL = WhisperModelCatalog.modelURL(applicationSupportRoot: appRoot)
+
+        let sessionID = UUID()
+        let sessionsRoot = appRoot.appendingPathComponent("Sessions", isDirectory: true)
+        let sessionPaths = try DefaultFileSystemLocator.buildPaths(rootDirectory: sessionsRoot, sessionID: sessionID)
+        let sourceURL = sessionPaths.chunksDirectory.appendingPathComponent("chunk_000000.caf")
+        guard !FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw HarnessFailure.realInference("The unique acceptance source path unexpectedly existed.")
+        }
+        try FileManager.default.copyItem(at: fixtureURL, to: sourceURL)
+        let original = try Data(contentsOf: sourceURL)
+        let originalAttributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let sourceDigest = SHA256.hash(data: original).map { String(format: "%02x", $0) }.joined()
+        guard sourceDigest == "3e533c02910303097519875d53e6e4aa3b4b45ad290c3589991daa26b7caeba4" else {
+            throw HarnessFailure.realInference("The embedded fixture digest was unexpected.")
+        }
+
+        var manifest = SessionManifest.newSession(
+            id: sessionID,
+            audioFormat: AudioFormatDescriptor(sampleRate: 44_100, channelCount: 1, bitsPerChannel: 32, formatIdentifier: "lpcm-float32"),
+            targetChunkDurationSeconds: 30
+        )
+        manifest.status = .completed
+        manifest.endedCleanly = true
+        manifest.endDate = Date()
+        manifest.chunks = [ChunkMetadata(
+            sequenceNumber: 0, fileName: "chunk_000000.caf", startOffsetSeconds: 0,
+            durationSeconds: Double(242_368) / 44_100, frameCount: 242_368, state: .completed
+        )]
+        let artifactPaths = try TranscriptionArtifactPaths.validated(manifest: manifest, sessionPaths: sessionPaths)
+        let timingBox = HarnessTimingBox()
+        let transcriber = WhisperProcessTranscriber(
+            applicationSupportRoot: { appRoot },
+            timingObserver: { timingBox.set($0) }
+        )
+        let store = TranscriptionStore()
+        let coordinator = TranscriptionCoordinator(store: store, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let job = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+        let totalMS = Int64((durationInSeconds(started.duration(to: clock.now)) * 1_000).rounded())
+        guard job.state == .completed,
+              let reloaded = try await store.loadResult(sequenceNumber: 0, paths: artifactPaths),
+              reloaded.schemaVersion == TranscriptResult.currentSchemaVersion,
+              let provenance = reloaded.output.provenance,
+              provenance == WhisperT3BPolicy.provenance,
+              let segments = reloaded.output.segments,
+              let timing = timingBox.get() else {
+            throw HarnessFailure.realInference("The adapter result did not persist and reload with exact v2 provenance.")
+        }
+        let lower = reloaded.output.text.lowercased()
+        for expected in ["lecture", "recorder", "neural", "network", "fourier", "transform", "technical", "transcription"] {
+            guard lower.contains(expected) else {
+                throw HarnessFailure.realInference("Transcript omitted expected broad word '\(expected)': \(reloaded.output.text)")
+            }
+        }
+        let after = try Data(contentsOf: sourceURL)
+        let afterDigest = SHA256.hash(data: after).map { String(format: "%02x", $0) }.joined()
+        let afterAttributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        let mtimeUnchanged = originalAttributes[.modificationDate] as? Date == afterAttributes[.modificationDate] as? Date
+        guard after == original, afterDigest == sourceDigest, mtimeUnchanged else {
+            throw HarnessFailure.sourceChanged
+        }
+        let report = RealInferenceReport(
+            sessionID: sessionID, transcript: reloaded.output.text, segments: segments, provenance: provenance,
+            persistedSchemaVersion: reloaded.schemaVersion,
+            modelInitializationMilliseconds: timing.modelInitializationMilliseconds,
+            audioConversionMilliseconds: timing.audioConversionMilliseconds,
+            inferenceMilliseconds: timing.inferenceMilliseconds, totalMilliseconds: totalMS,
+            sourceByteCount: original.count, sourceSHA256Before: sourceDigest,
+            sourceSHA256After: afterDigest,
+            sourceModificationDateUnchanged: mtimeUnchanged,
+            modelPath: modelURL.path
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        FileHandle.standardOutput.write(try encoder.encode(report))
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    private static func harnessApplicationSupportRoot() throws -> URL {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw HarnessFailure.realInference("The harness Application Support directory could not be resolved.")
+        }
+        return base.appendingPathComponent(
+            "com.dylanlee.LectureRecorder.WorkerLaunchHarness",
+            isDirectory: true
+        )
+    }
+
+    private static func harnessModelURL() throws -> URL {
+        WhisperModelCatalog.modelURL(applicationSupportRoot: try harnessApplicationSupportRoot())
     }
 
     // Authoritative normally signed coverage for OS-process behavior that
