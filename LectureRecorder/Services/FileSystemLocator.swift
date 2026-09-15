@@ -104,14 +104,22 @@ nonisolated struct DefaultFileSystemLocator: FileSystemLocating {
     /// `rootDirectory/<sessionID>/`. Shared by `DefaultFileSystemLocator`
     /// and test-only locators so the on-disk layout is defined in one place.
     static func buildPaths(rootDirectory: URL, sessionID: UUID) throws -> SessionPaths {
+        let paths = pathsWithoutCreating(rootDirectory: rootDirectory, sessionID: sessionID)
+        try ensureDirectoryExists(paths.sessionDirectory)
+        try ensureDirectoryExists(paths.chunksDirectory)
+        try ensureDirectoryExists(paths.logsDirectory)
+        return paths
+    }
+
+    /// Pure, non-creating computation of the same `chunks/`/`logs/` layout
+    /// as `buildPaths(rootDirectory:sessionID:)` — never touches the
+    /// filesystem. Read-only completed-session discovery uses this instead,
+    /// so merely browsing never creates a directory that didn't already
+    /// exist.
+    static func pathsWithoutCreating(rootDirectory: URL, sessionID: UUID) -> SessionPaths {
         let sessionDirectory = rootDirectory.appendingPathComponent(sessionID.uuidString, isDirectory: true)
         let chunksDirectory = sessionDirectory.appendingPathComponent("chunks", isDirectory: true)
         let logsDirectory = sessionDirectory.appendingPathComponent("logs", isDirectory: true)
-
-        try ensureDirectoryExists(sessionDirectory)
-        try ensureDirectoryExists(chunksDirectory)
-        try ensureDirectoryExists(logsDirectory)
-
         let manifestURL = sessionDirectory.appendingPathComponent("session.json")
         let logFileURL = logsDirectory.appendingPathComponent("recording.log")
 
@@ -122,5 +130,21 @@ nonisolated struct DefaultFileSystemLocator: FileSystemLocating {
             manifestURL: manifestURL,
             logFileURL: logFileURL
         )
+    }
+
+    /// Pure, non-creating computation of the sessions root path — mirrors
+    /// `sessionsRootDirectory()` exactly but never creates it. Read-only
+    /// completed-session discovery uses this instead, so merely opening
+    /// the browser never creates a `Sessions` directory that didn't
+    /// already exist.
+    static func resolveSessionsRootPathWithoutCreating() throws -> URL {
+        let fm = FileManager.default
+        guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw FileSystemError.unableToResolveApplicationSupportDirectory
+        }
+        let bundleID = Bundle.main.bundleIdentifier ?? "LectureRecorder"
+        return base
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent(sessionsDirectoryName, isDirectory: true)
     }
 }

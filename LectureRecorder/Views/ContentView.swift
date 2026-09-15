@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @Environment(\.openWindow) private var openWindow
     @State private var showAbandonRecoveryConfirmation = false
 
     var body: some View {
@@ -73,6 +74,13 @@ struct ContentView: View {
                 Task { await sessionManager.revealSessionsFolderInFinder() }
             } label: {
                 Label("Show Sessions Folder", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                openWindow(id: "completed-sessions")
+            } label: {
+                Label("Completed Sessions", systemImage: "list.bullet.rectangle")
             }
             .buttonStyle(.bordered)
 
