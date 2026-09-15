@@ -5,7 +5,7 @@ import Foundation
 /// specific operations to fail deterministically — mirrors
 /// `FailingSessionStore`'s pattern from `SessionManagerTests.swift`. Never
 /// uses filesystem permissions or an unwritable directory.
-actor FailingTranscriptionStore: TranscriptionStoring {
+actor FailingTranscriptionStore {
     struct TestInjectedError: Error, LocalizedError, Sendable {
         var errorDescription: String? { "Injected test failure" }
     }
@@ -137,3 +137,5 @@ actor FailingTranscriptionStore: TranscriptionStoring {
         try await wrapped.loadAllResultArtifacts(paths: paths)
     }
 }
+
+extension FailingTranscriptionStore: TranscriptionStoring {}
