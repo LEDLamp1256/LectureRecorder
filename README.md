@@ -14,11 +14,11 @@ no cloud service is involved.
 ## Using LectureRecorder
 
 LectureRecorder v0.4.0 is a pre-1.0 developer build — there is no packaged
-installer yet, so this assumes you've built the app yourself. Recording and
-browsing Completed Sessions work as soon as the app builds and runs; local
-transcription additionally needs the Whisper dependency and model prepared
-once per checkout first. See [BUILDING.md](BUILDING.md) for those exact
-setup steps — they aren't repeated here.
+installer yet, so this assumes you've built the app yourself. Before the
+first build from a clean checkout, prepare the native Whisper dependency as
+described in [BUILDING.md](BUILDING.md). Local transcription additionally
+requires the Whisper model to be installed using the setup documented
+there. The exact setup steps are not repeated here.
 
 **Recording:**
 
