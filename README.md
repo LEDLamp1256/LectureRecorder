@@ -11,6 +11,48 @@ no cloud service is involved.
 > first app build. See [BUILDING.md](BUILDING.md) for prerequisites, offline
 > build behavior, and verified commands.
 
+## Using LectureRecorder
+
+LectureRecorder v0.4.0 is a pre-1.0 developer build — there is no packaged
+installer yet, so this assumes you've built the app yourself. Recording and
+browsing Completed Sessions work as soon as the app builds and runs; local
+transcription additionally needs the Whisper dependency and model prepared
+once per checkout first. See [BUILDING.md](BUILDING.md) for those exact
+setup steps — they aren't repeated here.
+
+**Recording:**
+
+1. Launch LectureRecorder.
+2. The first time it needs the microphone, macOS will prompt for
+   permission — allow it.
+3. Click **Start Recording**. Recording only ever starts when you press
+   this button.
+4. Click **Stop Recording** when you're done. The recording is finalized
+   and durably saved, and becomes available in Completed Sessions.
+
+**Browsing and transcribing a recording:**
+
+5. Click **Completed Sessions** to open the Completed Sessions window. It
+   lists every finished recording, newest first. If you leave this window
+   open and finish another recording, it appears automatically without
+   needing to reopen the window, and whatever you had selected stays
+   selected.
+6. Select a recording from the list to see its details.
+7. Click **Transcribe** to start local, offline transcription with
+   Whisper. This runs entirely on your Mac and can take a while depending
+   on the recording's length and your hardware. Only one transcription
+   runs across the whole app at a time; you can't start a *new*
+   transcription while a recording is currently in progress, though a
+   transcription that was already running when you start a new recording
+   keeps running.
+8. If a transcription is interrupted or fails partway through, use
+   **Retry** (after an interruption) or **Continue** (to pick up where it
+   left off) — progress is saved as each chunk finishes, so neither
+   restarts from the beginning. Use **Cancel** to stop a transcription
+   that's in progress.
+9. Once a transcript is finished, selecting that session again shows the
+   saved transcript directly — it does not re-run Whisper.
+
 ## What LectureRecorder does
 
 - Records lecture audio from the microphone, starting and stopping only on
