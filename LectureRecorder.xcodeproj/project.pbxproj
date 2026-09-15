@@ -6,6 +6,44 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		CB7D0B3936F98964DCE0C655 /* LectureRecorderWorkerFixture in Embed Helper Tools */ = {isa = PBXBuildFile; fileRef = CB7D0B0FE7B7FF67151E9F01 /* LectureRecorderWorkerFixture */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		C0A000000000000000000001 /* LectureRecorderWhisperWorker in Embed Helper Tools */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000010 /* LectureRecorderWhisperWorker */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		C0A000000000000000000002 /* WhisperC.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000011 /* WhisperC.xcframework */; };
+		C0A000000000000000000003 /* Accelerate.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000012 /* Accelerate.framework */; };
+		C0A000000000000000000004 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000013 /* libc++.tbd */; };
+		C0A000000000000000000005 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000014 /* Metal.framework */; };
+		C0A000000000000000000006 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000015 /* MetalKit.framework */; };
+		C0A000000000000000000201 /* HarnessMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000211 /* HarnessMain.swift */; };
+		C0A000000000000000000202 /* EmbeddedWorkerLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000212 /* EmbeddedWorkerLocator.swift */; };
+		C0A000000000000000000203 /* FoundationProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000213 /* FoundationProcessRunner.swift */; };
+		C0A000000000000000000204 /* LocalProcessRunning.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000214 /* LocalProcessRunning.swift */; };
+		C0A000000000000000000205 /* ManagedProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000215 /* ManagedProcess.swift */; };
+		C0A000000000000000000206 /* ProcessInvocationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000216 /* ProcessInvocationState.swift */; };
+		C0A000000000000000000207 /* TranscriptionWorkerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000217 /* TranscriptionWorkerClient.swift */; };
+		C0A000000000000000000208 /* WorkerProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000218 /* WorkerProtocol.swift */; };
+		C0A000000000000000000209 /* WhisperAudioDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A000000000000000000219 /* WhisperAudioDecoder.swift */; };
+		C0A00000000000000000020A /* WhisperTimestamp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A00000000000000000021A /* WhisperTimestamp.swift */; };
+		C0A0000000000000000002B0 /* AudioFormatDescriptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C0 /* AudioFormatDescriptor.swift */; };
+		C0A0000000000000000002B1 /* SessionManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C1 /* SessionManifest.swift */; };
+		C0A0000000000000000002B2 /* Log.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C2 /* Log.swift */; };
+		C0A0000000000000000002B3 /* FileSystemLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C3 /* FileSystemLocator.swift */; };
+		C0A0000000000000000002B4 /* AtomicFileWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C4 /* AtomicFileWriter.swift */; };
+		C0A0000000000000000002B5 /* TranscriptionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C5 /* TranscriptionModels.swift */; };
+		C0A0000000000000000002B6 /* Transcribing.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C6 /* Transcribing.swift */; };
+		C0A0000000000000000002B7 /* TranscriptionStoring.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C7 /* TranscriptionStoring.swift */; };
+		C0A0000000000000000002B8 /* TranscriptionArtifactPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C8 /* TranscriptionArtifactPaths.swift */; };
+		C0A0000000000000000002B9 /* ExclusiveArtifactFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002C9 /* ExclusiveArtifactFileSystem.swift */; };
+		C0A0000000000000000002BA /* TranscriptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CA /* TranscriptionStore.swift */; };
+		C0A0000000000000000002BB /* WhisperModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CB /* WhisperModelCatalog.swift */; };
+		C0A0000000000000000002BC /* WhisperT3BPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CC /* WhisperT3BPolicy.swift */; };
+		C0A0000000000000000002BD /* WhisperProcessTranscriber.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CD /* WhisperProcessTranscriber.swift */; };
+		C0A0000000000000000002BE /* technical-speech-44100-mono.caf in Resources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CE /* technical-speech-44100-mono.caf */; };
+		C0A0000000000000000002BF /* TranscriptionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002CF /* TranscriptionCoordinator.swift */; };
+		C0A0000000000000000002D0 /* WhisperBridgePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002D1 /* WhisperBridgePipeline.swift */; };
+		C0A0000000000000000002D2 /* WhisperInvocationGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0A0000000000000000002D3 /* WhisperInvocationGate.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		CB7D0A82304480AA008522B4 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -14,12 +52,91 @@
 			remoteGlobalIDString = CB7D0A2530447E7A008522B4;
 			remoteInfo = LectureRecorder;
 		};
+		CB7D0BBF20CFA08F020FC867 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CB7D0A1E30447E7A008522B4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CB7D0B42154F3DBF137A9AA6;
+			remoteInfo = LectureRecorderWorkerFixture;
+		};
+		C0A000000000000000000020 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CB7D0A1E30447E7A008522B4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C0A000000000000000000100;
+			remoteInfo = LectureRecorderWhisperWorker;
+		};
+		C0A000000000000000000220 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CB7D0A1E30447E7A008522B4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CB7D0B42154F3DBF137A9AA6;
+			remoteInfo = LectureRecorderWorkerFixture;
+		};
+		C0A000000000000000000221 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CB7D0A1E30447E7A008522B4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C0A000000000000000000100;
+			remoteInfo = LectureRecorderWhisperWorker;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		CB7D0BCA642CA93FA9929799 /* Embed Helper Tools */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				CB7D0B3936F98964DCE0C655 /* LectureRecorderWorkerFixture in Embed Helper Tools */,
+				C0A000000000000000000001 /* LectureRecorderWhisperWorker in Embed Helper Tools */,
+			);
+			name = "Embed Helper Tools";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		CB7D0A2630447E7A008522B4 /* LectureRecorder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LectureRecorder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CB7D0A7E304480AA008522B4 /* LectureRecorderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LectureRecorderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CB7D0A9230472C34008522B4 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		CB7D0B0FE7B7FF67151E9F01 /* LectureRecorderWorkerFixture */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = LectureRecorderWorkerFixture; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0A000000000000000000010 /* LectureRecorderWhisperWorker */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = LectureRecorderWhisperWorker; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0A000000000000000000011 /* WhisperC.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = Generated/WhisperDependency/WhisperC.xcframework; sourceTree = "<group>"; };
+		C0A000000000000000000012 /* Accelerate.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Accelerate.framework; path = System/Library/Frameworks/Accelerate.framework; sourceTree = SDKROOT; };
+		C0A000000000000000000013 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.text-based-dylib-definition; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
+		C0A000000000000000000014 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		C0A000000000000000000015 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		C0A000000000000000000210 /* LectureRecorderWorkerLaunchHarness */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = LectureRecorderWorkerLaunchHarness; sourceTree = BUILT_PRODUCTS_DIR; };
+		C0A000000000000000000211 /* HarnessMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorderWorkerLaunchHarness/HarnessMain.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000212 /* EmbeddedWorkerLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/EmbeddedWorkerLocator.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000213 /* FoundationProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/FoundationProcessRunner.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000214 /* LocalProcessRunning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/LocalProcessRunning.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000215 /* ManagedProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/ManagedProcess.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000216 /* ProcessInvocationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/ProcessInvocationState.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000217 /* TranscriptionWorkerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/TranscriptionWorkerClient.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000218 /* WorkerProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Process/WorkerProtocol.swift; sourceTree = SOURCE_ROOT; };
+		C0A000000000000000000219 /* WhisperAudioDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperAudioDecoder.swift; sourceTree = SOURCE_ROOT; };
+		C0A00000000000000000021A /* WhisperTimestamp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperTimestamp.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C0 /* AudioFormatDescriptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Models/AudioFormatDescriptor.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C1 /* SessionManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Models/SessionManifest.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C2 /* Log.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Support/Log.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C3 /* FileSystemLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/FileSystemLocator.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C4 /* AtomicFileWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/AtomicFileWriter.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C5 /* TranscriptionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionModels.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C6 /* Transcribing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/Transcribing.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C7 /* TranscriptionStoring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionStoring.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C8 /* TranscriptionArtifactPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionArtifactPaths.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002C9 /* ExclusiveArtifactFileSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/ExclusiveArtifactFileSystem.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CA /* TranscriptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionStore.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CB /* WhisperModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperModelCatalog.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CC /* WhisperT3BPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperT3BPolicy.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CD /* WhisperProcessTranscriber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperProcessTranscriber.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CE /* technical-speech-44100-mono.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = LectureRecorderTests/Fixtures/technical-speech-44100-mono.caf; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002CF /* TranscriptionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/TranscriptionCoordinator.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002D1 /* WhisperBridgePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperBridgePipeline.swift; sourceTree = SOURCE_ROOT; };
+		C0A0000000000000000002D3 /* WhisperInvocationGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LectureRecorder/Services/Transcription/WhisperInvocationGate.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +148,16 @@
 		CB7D0A7F304480AA008522B4 /* LectureRecorderTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = LectureRecorderTests;
+			sourceTree = "<group>";
+		};
+		CB7D0B2253F0907FCE659BD6 /* LectureRecorderWorkerFixture */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = LectureRecorderWorkerFixture;
+			sourceTree = "<group>";
+		};
+		C0A000000000000000000030 /* LectureRecorderWhisperWorker */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = LectureRecorderWhisperWorker;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -50,6 +177,32 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CB7D0B0CC821EF68367835B6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C0A000000000000000000040 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C0A000000000000000000002 /* WhisperC.xcframework in Frameworks */,
+				C0A000000000000000000003 /* Accelerate.framework in Frameworks */,
+				C0A000000000000000000005 /* Metal.framework in Frameworks */,
+				C0A000000000000000000006 /* MetalKit.framework in Frameworks */,
+				C0A000000000000000000004 /* libc++.tbd in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C0A000000000000000000240 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -57,8 +210,12 @@
 			isa = PBXGroup;
 			children = (
 				CB7D0A9230472C34008522B4 /* README.md */,
+				C0A000000000000000000011 /* WhisperC.xcframework */,
 				CB7D0A2830447E7A008522B4 /* LectureRecorder */,
 				CB7D0A7F304480AA008522B4 /* LectureRecorderTests */,
+				CB7D0B2253F0907FCE659BD6 /* LectureRecorderWorkerFixture */,
+				C0A000000000000000000030 /* LectureRecorderWhisperWorker */,
+				C0A000000000000000000230 /* Worker Launch Harness Sources */,
 				CB7D0A2730447E7A008522B4 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -68,8 +225,26 @@
 			children = (
 				CB7D0A2630447E7A008522B4 /* LectureRecorder.app */,
 				CB7D0A7E304480AA008522B4 /* LectureRecorderTests.xctest */,
+				CB7D0B0FE7B7FF67151E9F01 /* LectureRecorderWorkerFixture */,
+				C0A000000000000000000010 /* LectureRecorderWhisperWorker */,
+				C0A000000000000000000210 /* LectureRecorderWorkerLaunchHarness */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		C0A000000000000000000230 /* Worker Launch Harness Sources */ = {
+			isa = PBXGroup;
+			children = (
+				C0A000000000000000000211 /* HarnessMain.swift */,
+				C0A000000000000000000212 /* EmbeddedWorkerLocator.swift */,
+				C0A000000000000000000213 /* FoundationProcessRunner.swift */,
+				C0A000000000000000000214 /* LocalProcessRunning.swift */,
+				C0A000000000000000000215 /* ManagedProcess.swift */,
+				C0A000000000000000000216 /* ProcessInvocationState.swift */,
+				C0A000000000000000000217 /* TranscriptionWorkerClient.swift */,
+				C0A000000000000000000218 /* WorkerProtocol.swift */,
+			);
+			name = "Worker Launch Harness Sources";
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -82,10 +257,13 @@
 				CB7D0A2230447E7A008522B4 /* Sources */,
 				CB7D0A2330447E7A008522B4 /* Frameworks */,
 				CB7D0A2430447E7A008522B4 /* Resources */,
+				CB7D0BCA642CA93FA9929799 /* Embed Helper Tools */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				CB7D0B06CD5602E8D2BFA04C /* PBXTargetDependency */,
+				C0A000000000000000000050 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				CB7D0A2830447E7A008522B4 /* LectureRecorder */,
@@ -96,6 +274,69 @@
 			productName = LectureRecorder;
 			productReference = CB7D0A2630447E7A008522B4 /* LectureRecorder.app */;
 			productType = "com.apple.product-type.application";
+		};
+		CB7D0B42154F3DBF137A9AA6 /* LectureRecorderWorkerFixture */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CB7D0BB126AF74615B01E9EC /* Build configuration list for PBXNativeTarget "LectureRecorderWorkerFixture" */;
+			buildPhases = (
+				CB7D0BD58697F78B7640CF5A /* Sources */,
+				CB7D0B0CC821EF68367835B6 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				CB7D0B2253F0907FCE659BD6 /* LectureRecorderWorkerFixture */,
+			);
+			name = LectureRecorderWorkerFixture;
+			packageProductDependencies = (
+			);
+			productName = LectureRecorderWorkerFixture;
+			productReference = CB7D0B0FE7B7FF67151E9F01 /* LectureRecorderWorkerFixture */;
+			productType = "com.apple.product-type.tool";
+		};
+		C0A000000000000000000100 /* LectureRecorderWhisperWorker */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C0A000000000000000000062 /* Build configuration list for PBXNativeTarget "LectureRecorderWhisperWorker" */;
+			buildPhases = (
+				C0A000000000000000000041 /* Sources */,
+				C0A000000000000000000040 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				C0A000000000000000000030 /* LectureRecorderWhisperWorker */,
+			);
+			name = LectureRecorderWhisperWorker;
+			packageProductDependencies = (
+			);
+			productName = LectureRecorderWhisperWorker;
+			productReference = C0A000000000000000000010 /* LectureRecorderWhisperWorker */;
+			productType = "com.apple.product-type.tool";
+		};
+		C0A000000000000000000300 /* LectureRecorderWorkerLaunchHarness */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C0A000000000000000000262 /* Build configuration list for PBXNativeTarget "LectureRecorderWorkerLaunchHarness" */;
+			buildPhases = (
+				C0A000000000000000000241 /* Sources */,
+				C0A000000000000000000240 /* Frameworks */,
+				C0A000000000000000000242 /* Copy T3B Fixture */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C0A000000000000000000250 /* PBXTargetDependency */,
+				C0A000000000000000000251 /* PBXTargetDependency */,
+			);
+			name = LectureRecorderWorkerLaunchHarness;
+			packageProductDependencies = (
+			);
+			productName = LectureRecorderWorkerLaunchHarness;
+			productReference = C0A000000000000000000210 /* LectureRecorderWorkerLaunchHarness */;
+			productType = "com.apple.product-type.tool";
 		};
 		CB7D0A7D304480AA008522B4 /* LectureRecorderTests */ = {
 			isa = PBXNativeTarget;
@@ -137,6 +378,15 @@
 						CreatedOnToolsVersion = 26.6;
 						TestTargetID = CB7D0A2530447E7A008522B4;
 					};
+					CB7D0B42154F3DBF137A9AA6 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					C0A000000000000000000100 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					C0A000000000000000000300 = {
+						CreatedOnToolsVersion = 26.6;
+					};
 				};
 			};
 			buildConfigurationList = CB7D0A2130447E7A008522B4 /* Build configuration list for PBXProject "LectureRecorder" */;
@@ -155,6 +405,9 @@
 			targets = (
 				CB7D0A2530447E7A008522B4 /* LectureRecorder */,
 				CB7D0A7D304480AA008522B4 /* LectureRecorderTests */,
+				CB7D0B42154F3DBF137A9AA6 /* LectureRecorderWorkerFixture */,
+				C0A000000000000000000100 /* LectureRecorderWhisperWorker */,
+				C0A000000000000000000300 /* LectureRecorderWorkerLaunchHarness */,
 			);
 		};
 /* End PBXProject section */
@@ -174,6 +427,17 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C0A000000000000000000242 /* Copy T3B Fixture */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = T3BFixtures;
+			dstSubfolderSpec = 16;
+			files = (
+				C0A0000000000000000002BE /* technical-speech-44100-mono.caf in Resources */,
+			);
+			name = "Copy T3B Fixture";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -191,6 +455,54 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CB7D0BD58697F78B7640CF5A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C0A000000000000000000041 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C0A000000000000000000209 /* WhisperAudioDecoder.swift in Sources */,
+				C0A00000000000000000020A /* WhisperTimestamp.swift in Sources */,
+				C0A0000000000000000002D0 /* WhisperBridgePipeline.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C0A000000000000000000241 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C0A000000000000000000201 /* HarnessMain.swift in Sources */,
+				C0A000000000000000000202 /* EmbeddedWorkerLocator.swift in Sources */,
+				C0A000000000000000000203 /* FoundationProcessRunner.swift in Sources */,
+				C0A000000000000000000204 /* LocalProcessRunning.swift in Sources */,
+				C0A000000000000000000205 /* ManagedProcess.swift in Sources */,
+				C0A000000000000000000206 /* ProcessInvocationState.swift in Sources */,
+				C0A000000000000000000207 /* TranscriptionWorkerClient.swift in Sources */,
+				C0A000000000000000000208 /* WorkerProtocol.swift in Sources */,
+				C0A0000000000000000002B0 /* AudioFormatDescriptor.swift in Sources */,
+				C0A0000000000000000002B1 /* SessionManifest.swift in Sources */,
+				C0A0000000000000000002B2 /* Log.swift in Sources */,
+				C0A0000000000000000002B3 /* FileSystemLocator.swift in Sources */,
+				C0A0000000000000000002B4 /* AtomicFileWriter.swift in Sources */,
+				C0A0000000000000000002B5 /* TranscriptionModels.swift in Sources */,
+				C0A0000000000000000002B6 /* Transcribing.swift in Sources */,
+				C0A0000000000000000002B7 /* TranscriptionStoring.swift in Sources */,
+				C0A0000000000000000002B8 /* TranscriptionArtifactPaths.swift in Sources */,
+				C0A0000000000000000002B9 /* ExclusiveArtifactFileSystem.swift in Sources */,
+				C0A0000000000000000002BA /* TranscriptionStore.swift in Sources */,
+				C0A0000000000000000002BB /* WhisperModelCatalog.swift in Sources */,
+				C0A0000000000000000002BC /* WhisperT3BPolicy.swift in Sources */,
+				C0A0000000000000000002BD /* WhisperProcessTranscriber.swift in Sources */,
+				C0A0000000000000000002BF /* TranscriptionCoordinator.swift in Sources */,
+				C0A0000000000000000002D2 /* WhisperInvocationGate.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -198,6 +510,26 @@
 			isa = PBXTargetDependency;
 			target = CB7D0A2530447E7A008522B4 /* LectureRecorder */;
 			targetProxy = CB7D0A82304480AA008522B4 /* PBXContainerItemProxy */;
+		};
+		CB7D0B06CD5602E8D2BFA04C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CB7D0B42154F3DBF137A9AA6 /* LectureRecorderWorkerFixture */;
+			targetProxy = CB7D0BBF20CFA08F020FC867 /* PBXContainerItemProxy */;
+		};
+		C0A000000000000000000050 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C0A000000000000000000100 /* LectureRecorderWhisperWorker */;
+			targetProxy = C0A000000000000000000020 /* PBXContainerItemProxy */;
+		};
+		C0A000000000000000000250 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CB7D0B42154F3DBF137A9AA6 /* LectureRecorderWorkerFixture */;
+			targetProxy = C0A000000000000000000220 /* PBXContainerItemProxy */;
+		};
+		C0A000000000000000000251 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C0A000000000000000000100 /* LectureRecorderWhisperWorker */;
+			targetProxy = C0A000000000000000000221 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -442,6 +774,132 @@
 			};
 			name = Release;
 		};
+		CB7D0BF4F46DFB9E24BFE844 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWorkerFixture/LectureRecorderWorkerFixture.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WorkerFixture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		CB7D0B213E68C59C816E7DC5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWorkerFixture/LectureRecorderWorkerFixture.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WorkerFixture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		C0A000000000000000000060 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWhisperWorker/LectureRecorderWhisperWorker.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				ENABLE_TESTABILITY = NO;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/include",
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/ggml/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = LectureRecorderWhisperWorker/WhisperBridge.h;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WhisperWorker;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		C0A000000000000000000061 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWhisperWorker/LectureRecorderWhisperWorker.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				ENABLE_TESTABILITY = NO;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/include",
+					"$(SRCROOT)/.dependency-work/whisper.cpp/source/ggml/include",
+				);
+				SWIFT_OBJC_BRIDGING_HEADER = LectureRecorderWhisperWorker/WhisperBridge.h;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WhisperWorker;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		C0A000000000000000000260 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWorkerLaunchHarness/LectureRecorderWorkerLaunchHarness.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				ENABLE_TESTABILITY = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WorkerLaunchHarness;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		C0A000000000000000000261 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_ENTITLEMENTS = LectureRecorderWorkerLaunchHarness/LectureRecorderWorkerLaunchHarness.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CREATE_INFOPLIST_SECTION_IN_BINARY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 7S2J66TZ76;
+				ENABLE_TESTABILITY = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dylanlee.LectureRecorder.WorkerLaunchHarness;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -468,6 +926,33 @@
 			buildConfigurations = (
 				CB7D0A84304480AA008522B4 /* Debug */,
 				CB7D0A85304480AA008522B4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CB7D0BB126AF74615B01E9EC /* Build configuration list for PBXNativeTarget "LectureRecorderWorkerFixture" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CB7D0BF4F46DFB9E24BFE844 /* Debug */,
+				CB7D0B213E68C59C816E7DC5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C0A000000000000000000062 /* Build configuration list for PBXNativeTarget "LectureRecorderWhisperWorker" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C0A000000000000000000060 /* Debug */,
+				C0A000000000000000000061 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C0A000000000000000000262 /* Build configuration list for PBXNativeTarget "LectureRecorderWorkerLaunchHarness" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C0A000000000000000000260 /* Debug */,
+				C0A000000000000000000261 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

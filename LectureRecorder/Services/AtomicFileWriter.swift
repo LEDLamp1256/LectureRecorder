@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import OSLog
 
-enum AtomicFileWriterError: LocalizedError, Sendable {
+nonisolated enum AtomicFileWriterError: LocalizedError, Sendable {
     case unableToCreateTemporaryFile(URL)
 
     var errorDescription: String? {
@@ -52,7 +52,7 @@ enum AtomicFileWriterError: LocalizedError, Sendable {
 /// proportionate level of durability. Do not extend this reasoning to
 /// high-frequency or large-payload writes (e.g. audio chunks) without
 /// reconsidering the approach.
-enum AtomicFileWriter {
+nonisolated enum AtomicFileWriter {
     static var defaultEncoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in

@@ -1,7 +1,9 @@
+import AVFoundation
 import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var sessionManager: SessionManager
+    @Environment(\.openWindow) private var openWindow
     @State private var showAbandonRecoveryConfirmation = false
 
     var body: some View {
@@ -72,6 +74,13 @@ struct ContentView: View {
                 Task { await sessionManager.revealSessionsFolderInFinder() }
             } label: {
                 Label("Show Sessions Folder", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                openWindow(id: "completed-sessions")
+            } label: {
+                Label("Completed Sessions", systemImage: "list.bullet.rectangle")
             }
             .buttonStyle(.bordered)
 
@@ -206,7 +215,16 @@ private struct SessionInfoView: View {
         .environmentObject(
             SessionManager(
                 store: SessionStore(),
-                permissionService: MockMicrophonePermissionService(status: .granted)
+                permissionService: MockMicrophonePermissionService(status: .granted),
+                captureService: MockAudioCaptureService(
+                    formatToPrepare: AVAudioFormat(
+                        commonFormat: .pcmFormatFloat32,
+                        sampleRate: 44_100,
+                        channels: 1,
+                        interleaved: false
+                    )!
+                ),
+                chunkWriterFactory: DefaultAudioChunkWriterFactory()
             )
         )
 }

@@ -1,179 +1,223 @@
 # LectureRecorder
 
-LectureRecorder is a native macOS application for lecture recording, transcription, and automated lecture note generation.
+LectureRecorder is a native macOS (Swift/SwiftUI) application for lecture
+recording and local, offline transcription. Recording is explicitly
+Start/Stop driven, audio is durably stored in recoverable chunks as it is
+captured, and completed recordings can be transcribed locally with Whisper —
+no cloud service is involved.
 
-The project is being built with Swift and SwiftUI, with an emphasis on recoverability and accurate transcription of technical lectures.
+> **Building from a clean checkout:** the pinned native Whisper dependency is
+> generated locally. Run `./Scripts/prepare-whisper-dependency.sh` before the
+> first app build. See [BUILDING.md](BUILDING.md) for prerequisites, offline
+> build behavior, and verified commands.
 
-## Current Status
+## Using LectureRecorder
 
-Implemented so far:
+LectureRecorder v0.4.0 is a pre-1.0 developer build — there is no packaged
+installer yet, so this assumes you've built the app yourself. Before the
+first build from a clean checkout, prepare the native Whisper dependency as
+described in [BUILDING.md](BUILDING.md). Local transcription additionally
+requires the Whisper model to be installed using the setup documented
+there. The exact setup steps are not repeated here.
 
-- Native SwiftUI macOS application
-- Explicit recording/session state machine
-- Microphone permission handling
-- App Sandbox configuration with audio input entitlement
-- Sandboxed per-session storage
-- Versioned session manifests
-- JSON persistence
+**Recording:**
 
-Real microphone audio capture has **not** been implemented yet.
+1. Launch LectureRecorder.
+2. The first time it needs the microphone, macOS will prompt for
+   permission — allow it.
+3. Click **Start Recording**. Recording only ever starts when you press
+   this button.
+4. Click **Stop Recording** when you're done. The recording is finalized
+   and durably saved, and becomes available in Completed Sessions.
 
-## Goals
+**Browsing and transcribing a recording:**
 
-LectureRecorder is intended to eventually:
+5. Click **Completed Sessions** to open the Completed Sessions window. It
+   lists every finished recording, newest first. If you leave this window
+   open and finish another recording, it appears automatically without
+   needing to reopen the window, and whatever you had selected stays
+   selected.
+6. Select a recording from the list to see its details.
+7. Click **Transcribe** to start local, offline transcription with
+   Whisper. This runs entirely on your Mac and can take a while depending
+   on the recording's length and your hardware. Only one transcription
+   runs across the whole app at a time; you can't start a *new*
+   transcription while a recording is currently in progress, though a
+   transcription that was already running when you start a new recording
+   keeps running.
+8. If a transcription is interrupted or fails partway through, use
+   **Retry** (after an interruption) or **Continue** (to pick up where it
+   left off) — progress is saved as each chunk finishes, so neither
+   restarts from the beginning. Use **Cancel** to stop a transcription
+   that's in progress.
+9. Once a transcript is finished, selecting that session again shows the
+   saved transcript directly — it does not re-run Whisper.
 
-- Continuously capture microphone audio after the user explicitly presses Start
-- Never use voice activation or VAD to decide what gets recorded
-- Save recoverable audio chunks of approximately 30 seconds
-- Continue recording even if transcription falls behind
-- Perform transcription locally where practical
-- Use Whisper / whisper.cpp for speech-to-text
-- Generate structured lecture notes from transcripts
-- Prioritize transcription accuracy over real-time speed
-- Support technical lectures such as computer science, mathematics, and physics
-- Potentially support speaker diarization and conversation recording in later versions
+## What LectureRecorder does
 
-## Architecture
+- Records lecture audio from the microphone, starting and stopping only on
+  explicit user action. Voice activity detection is never used to decide
+  what gets captured.
+- Writes audio to disk in recoverable ~30-second chunks as it records, so a
+  crash or interruption does not lose an entire session.
+- Lists finished recordings in a **Completed Sessions** window, sorted
+  newest-first by the session's actual completion time (not filesystem
+  order), with a deterministic tie-break so ordering is stable.
+- Transcribes a completed session's audio locally and offline using Whisper
+  (whisper.cpp, the project's existing large-v3-turbo model configuration).
+  Transcription never blocks or paces recording — a session in progress and
+  an already-running transcription of a different, already-completed
+  session may coexist under an accepted asymmetric admission policy.
+- Runs transcription work sequentially, with durable, resumable progress
+  persisted to disk as each audio chunk finishes, so an interruption does
+  not require starting over from the beginning.
+- Offers Continue, Retry, and Cancel for an interrupted, failed, or
+  in-progress transcription, where applicable to that session's state.
+- Reopens an already-completed transcript without rerunning inference —
+  viewing a finished transcript never re-invokes Whisper.
+- Enforces a single app-wide transcription owner: only one transcription
+  operation runs at a time across the whole app, regardless of how many
+  windows are open.
+- Automatically refreshes an already-open Completed Sessions window when a
+  new recording finishes, with no polling — the window observes the shared
+  recording lifecycle state and reloads only on a genuine new completion.
+  Each window keeps its own selection across a refresh; a newly-appearing
+  session never steals the current selection, and a selection is cleared
+  only when the session it points to has actually disappeared.
 
-The application is intentionally designed so that recording does not depend on transcription performance.
+## Current features
 
-The planned pipeline is:
+- Native SwiftUI macOS application, App Sandbox with an audio input
+  entitlement
+- Explicit recording/session state machine, with a single unified shutdown
+  path shared by explicit Stop and failure-containment shutdown
+- Real `AVAudioEngine` microphone capture, continuous once started
+- Sandboxed per-session storage with versioned, atomically-written JSON
+  session manifests
+- Recoverable ~30-second audio chunks, written via a `.partial` →
+  rename-on-finalize pattern
+- Completed Sessions browsing: newest-first ordering, live no-polling
+  refresh after finalization, window-local selection preserved across
+  refresh
+- Local, offline Whisper transcription (whisper.cpp, Metal-accelerated with
+  a CPU fallback) of completed sessions, run in a separate, normally signed
+  worker process — never in-process; a new transcription is not admitted
+  while recording is already active, while an already-running transcription
+  may continue if recording starts afterward
+- Sequential transcription processing with durable, resumable progress and
+  Continue / Retry / Cancel
+- Single app-wide transcription ownership, with an accepted asymmetric
+  policy allowing a recording session and an unrelated already-running
+  transcription to coexist
+- Reopening a completed transcript without rerunning inference
+
+## Architecture / durability guarantees
+
+- `AudioCaptureService` owns capture preparation, starting, callback
+  admission, asynchronous-failure retention, and Stop draining.
+- `SessionManager` owns the recording session lifecycle only: integrating
+  capture with chunk-writer output, session manifests, and terminal session
+  state. It does not own transcription scheduling or Completed Sessions
+  catalog access.
+- `CompletedSessionCatalog` performs a read-only, path-safety-checked scan
+  of durably completed sessions; it never depends on the in-memory
+  recording session and never creates or mutates session state.
+- `CompletedSessionTranscriptionService` is the single app-wide owner of
+  transcription work: it admits at most one active operation at a time,
+  persists durable per-chunk progress, and exposes Continue / Retry /
+  Cancel.
+- Completed Sessions windows are thin, per-window presentation state
+  (`CompletedSessionsListPresenter`) that call only the read-only catalog
+  and observe the shared recording lifecycle publisher to trigger a
+  refresh — they own no persistent background task and no polling timer.
+- Source audio preservation and recoverability outrank transcription speed
+  or UI convenience in every design tradeoff; recording never blocks on,
+  waits for, or is paced by transcription.
+
+### Session storage layout
 
 ```text
-Microphone
-    ↓
-Audio Capture
-    ↓
-Recoverable Audio Chunks
-    ↓
-Transcription Queue
-    ↓
-Whisper / whisper.cpp
-    ↓
-Persisted Transcript
-    ↓
-Lecture Note Generation
-The native macOS application owns:
-	•	Recording lifecycle
-	•	Session state
-	•	Audio files
-	•	Session metadata
-	•	Persistence
-	•	User interface
-Transcription will later run as a separate local worker/service.
-This separation ensures that slow transcription cannot interrupt or block audio capture.
-Tech Stack
-Current:
-	•	Swift
-	•	SwiftUI
-	•	Foundation
-	•	AVFoundation for microphone permission handling
-	•	XCTest
-	•	OSLog
-	•	App Sandbox
-Planned:
-	•	AVAudioEngine / AVFAudio
-	•	whisper.cpp
-	•	Local transcription queue
-	•	Transcript persistence
-	•	Lecture note generation pipeline
-Session Storage
-Each recording session receives a UUID and its own directory.
-Current layout:
 Sessions/
 └── <session-uuid>/
     ├── session.json
     ├── chunks/
     └── logs/
         └── recording.log
-session.json
-The session manifest stores information such as:
-	•	Session UUID
-	•	Creation time
-	•	End time
-	•	Session status
-	•	End reason
-	•	Audio format metadata
-	•	Target chunk duration
-	•	Chunk metadata
-	•	Failure information
-	•	Whether the session ended cleanly
-chunks/
-This directory will contain recoverable audio chunks once real microphone capture is implemented in Phase 2.
-It is intentionally empty in the current Phase 1 implementation.
-logs/
-Each session contains a recording.log file for lifecycle and persistence events.
-Development Phases
-Phase 1 — Application Foundation
-Status: Complete
-Implemented:
-	•	Recording state machine
-	•	Microphone authorization flow
-	•	Session manager
-	•	Filesystem abstraction
-	•	Session storage
-	•	Atomic manifest writes
-	•	Session logging
-	•	Failure and retry handling
-	•	SwiftUI interface
-	•	Unit tests
-Current milestone:
-26 / 26 tests passing
-Phase 2 — Real Audio Capture
-Status: Next
-Planned work:
-	•	AVAudioEngine-based microphone capture
-	•	Continuous recording
-	•	No VAD-based recording decisions
-	•	Approximately 30-second recoverable chunks
-	•	Safe chunk rotation
-	•	Final partial-chunk handling
-	•	Manifest updates for completed chunks
-	•	Audio interruption handling
-	•	Input-device change handling
-	•	Crash-recovery considerations
-The first Phase 2 milestone will focus only on reliable recording and playback of saved audio.
-Whisper integration will not be added until the recording pipeline is stable.
-Later Phases
-Planned future work includes:
-	•	Local Whisper / whisper.cpp integration
-	•	Background transcription queue
-	•	Recording while previous chunks are transcribed
-	•	Transcript persistence
-	•	Post-processing for technical lectures
-	•	Lecture note generation
-	•	Speaker diarization
-	•	Conversation recording support
-	•	In-app session management and deletion
-	•	Safe cleanup rules that prevent source audio from being deleted before transcription and note generation are complete
-Design Principles
-Recording reliability comes first
-The recorder must continue capturing audio regardless of transcription throughput.
-Accuracy over latency
-LectureRecorder is intended for situations where transcription quality is more important than immediate results.
-Transcription may continue after a lecture has ended if additional processing improves accuracy.
-Recoverability
-Sessions are persisted incrementally so that a crash or interruption should not destroy an entire lecture recording.
-Local-first processing
-Where practical, speech recognition and processing will run locally on the Mac rather than requiring continuous cloud services.
-Separation of concerns
-Recording, persistence, transcription, and note generation are being designed as separate components so that each can evolve independently.
-Testing
-The Phase 1 test suite currently covers:
-	•	Atomic JSON writing and replacement
-	•	Temporary-file cleanup
-	•	Filesystem directory creation
-	•	Session manifest encoding and decoding
-	•	Recording lifecycle transitions
-	•	Permission-denied behavior
-	•	Repeated session creation
-	•	Session preparation failures
-	•	Manifest persistence failures
-	•	Retry behavior
-	•	Stop-finalization failures
-	•	Recovery abandonment behavior
-Current result:
-Currently developed and tested for macOS using Xcode.
-Project Status
-LectureRecorder is under active development.
-The current codebase represents the completed application foundation. Real microphone audio capture and transcription are still under development.
+```
+
+`session.json` stores the session UUID, creation and end time, status, end
+reason, audio format metadata, target chunk duration, per-chunk metadata,
+failure information, and whether the session ended cleanly. Completed
+transcription artifacts (jobs, per-chunk transcript results, and durable
+progress) are persisted alongside each session under its own directory.
+
+## Tech stack
+
+- Swift, SwiftUI, Foundation, Combine
+- `AVFoundation` / `AVAudioEngine` for microphone permission and capture
+- whisper.cpp (Metal + CPU backends) via a native C bridge, run in a
+  separate, normally signed worker process
+- XCTest, OSLog, App Sandbox
+
+## Building
+
+The native Whisper dependency and the large-v3-turbo model are prepared
+locally and are not stored in Git. See [BUILDING.md](BUILDING.md) for the
+full clean-checkout preparation steps, verified build/test commands, and
+real-inference acceptance instructions.
+
+```sh
+./Scripts/prepare-whisper-dependency.sh   # once, on a clean checkout
+./Scripts/build-debug.sh                  # Debug build
+```
+
+## Testing
+
+```sh
+xcodebuild -project LectureRecorder.xcodeproj -scheme LectureRecorder \
+  -configuration Debug -destination 'platform=macOS' test
+```
+
+Targeted tests:
+
+```sh
+xcodebuild -project LectureRecorder.xcodeproj -scheme LectureRecorder \
+  -configuration Debug -destination 'platform=macOS' \
+  -only-testing:LectureRecorderTests/<ClassName>[/<testMethod>] test
+```
+
+Process/signing verification for the normally signed worker products (does
+not run real model inference):
+
+```sh
+./Scripts/verify-normal-worker-products.sh
+```
+
+Real local Whisper inference is opt-in and requires staging the acceptance
+model first; see [BUILDING.md](BUILDING.md) for
+`run-whisper-real-inference-acceptance.sh` and related scripts.
+Hardware-dependent tests (real microphone capture, real Whisper inference)
+remain opt-in and are not part of the default build/test commands above.
+
+## Current development status / limitations
+
+LectureRecorder is under active development, pre-1.0. The current milestone
+is **v0.4.0 — Completed Session Transcription**, which brings the full
+record → durable completed session → browse → local transcription → reopen
+transcript flow together end to end. This milestone is being integrated
+through the project's normal review process and will be tagged once that
+integration lands on `main`.
+
+Recording, durable session storage, Completed Sessions browsing (with
+newest-first ordering and live refresh), and local Whisper transcription
+(with sequential processing, durable progress, and Continue/Retry/Cancel)
+are implemented, with targeted unit-test coverage included in the
+repository.
+
+Lecture-note generation and speaker diarization are not yet implemented.
+
+**Known issue:** the `LectureRecorderTests` target can currently fail to
+compile in some environments due to a Swift compiler/actor-isolation
+interaction unrelated to the app's behavior (traced to a `nonisolated`
+diagnostic on a test-only double). This does not affect the built app; it
+is a test-target compilation issue under active investigation.

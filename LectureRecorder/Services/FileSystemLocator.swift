@@ -1,6 +1,6 @@
 import Foundation
 
-enum FileSystemError: LocalizedError, Sendable {
+nonisolated enum FileSystemError: LocalizedError, Sendable {
     case unableToResolveApplicationSupportDirectory
     case pathExistsButIsNotADirectory(URL)
     case unableToCreateDirectory(URL, underlyingDescription: String)
@@ -18,7 +18,7 @@ enum FileSystemError: LocalizedError, Sendable {
 }
 
 /// The resolved on-disk locations for a single session.
-struct SessionPaths: Sendable, Equatable {
+nonisolated struct SessionPaths: Sendable, Equatable {
     let sessionDirectory: URL
     let chunksDirectory: URL
     let logsDirectory: URL
@@ -29,9 +29,9 @@ struct SessionPaths: Sendable, Equatable {
 /// Abstraction over where session data lives on disk. The only purpose of
 /// this protocol is to let tests substitute a temporary directory instead
 /// of the real Application Support folder.
-protocol FileSystemLocating: Sendable {
-    func sessionsRootDirectory() throws -> URL
-    func paths(for sessionID: UUID) throws -> SessionPaths
+nonisolated protocol FileSystemLocating: Sendable {
+    nonisolated func sessionsRootDirectory() throws -> URL
+    nonisolated func paths(for sessionID: UUID) throws -> SessionPaths
 }
 
 /// Resolves session storage under:
@@ -56,7 +56,7 @@ protocol FileSystemLocating: Sendable {
 /// in the app (wired to `SessionManager.revealSessionsFolderInFinder()`),
 /// which asks the running process for the real resolved URL instead of
 /// guessing it.
-struct DefaultFileSystemLocator: FileSystemLocating {
+nonisolated struct DefaultFileSystemLocator: FileSystemLocating {
     private static let sessionsDirectoryName = "Sessions"
 
     func applicationSupportDirectory() throws -> URL {
@@ -104,14 +104,22 @@ struct DefaultFileSystemLocator: FileSystemLocating {
     /// `rootDirectory/<sessionID>/`. Shared by `DefaultFileSystemLocator`
     /// and test-only locators so the on-disk layout is defined in one place.
     static func buildPaths(rootDirectory: URL, sessionID: UUID) throws -> SessionPaths {
+        let paths = pathsWithoutCreating(rootDirectory: rootDirectory, sessionID: sessionID)
+        try ensureDirectoryExists(paths.sessionDirectory)
+        try ensureDirectoryExists(paths.chunksDirectory)
+        try ensureDirectoryExists(paths.logsDirectory)
+        return paths
+    }
+
+    /// Pure, non-creating computation of the same `chunks/`/`logs/` layout
+    /// as `buildPaths(rootDirectory:sessionID:)` — never touches the
+    /// filesystem. Read-only completed-session discovery uses this instead,
+    /// so merely browsing never creates a directory that didn't already
+    /// exist.
+    static func pathsWithoutCreating(rootDirectory: URL, sessionID: UUID) -> SessionPaths {
         let sessionDirectory = rootDirectory.appendingPathComponent(sessionID.uuidString, isDirectory: true)
         let chunksDirectory = sessionDirectory.appendingPathComponent("chunks", isDirectory: true)
         let logsDirectory = sessionDirectory.appendingPathComponent("logs", isDirectory: true)
-
-        try ensureDirectoryExists(sessionDirectory)
-        try ensureDirectoryExists(chunksDirectory)
-        try ensureDirectoryExists(logsDirectory)
-
         let manifestURL = sessionDirectory.appendingPathComponent("session.json")
         let logFileURL = logsDirectory.appendingPathComponent("recording.log")
 
@@ -122,5 +130,21 @@ struct DefaultFileSystemLocator: FileSystemLocating {
             manifestURL: manifestURL,
             logFileURL: logFileURL
         )
+    }
+
+    /// Pure, non-creating computation of the sessions root path — mirrors
+    /// `sessionsRootDirectory()` exactly but never creates it. Read-only
+    /// completed-session discovery uses this instead, so merely opening
+    /// the browser never creates a `Sessions` directory that didn't
+    /// already exist.
+    static func resolveSessionsRootPathWithoutCreating() throws -> URL {
+        let fm = FileManager.default
+        guard let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw FileSystemError.unableToResolveApplicationSupportDirectory
+        }
+        let bundleID = Bundle.main.bundleIdentifier ?? "LectureRecorder"
+        return base
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent(sessionsDirectoryName, isDirectory: true)
     }
 }

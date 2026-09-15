@@ -9,6 +9,12 @@ xcuserdata/
 build/
 DerivedData/
 
+# Explicitly prepared local whisper.cpp dependency (source, builds, binaries)
+.dependency-work/
+Generated/WhisperDependency/
+Generated/.WhisperDependency.publication-stage/
+Generated/.WhisperDependency.publication-backup/
+
 # Swift Package Manager build artifacts
 .build/
 
@@ -36,3 +42,7 @@ Secrets.xcconfig
 LocalSecrets.xcconfig
 secrets.json
 secrets.plist
+
+# Claude Code local/personal files (not for commit)
+CLAUDE.local.md
+.claude/settings.local.json

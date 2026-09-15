@@ -8,4 +8,5 @@ enum Log {
     nonisolated static let fileSystem = Logger(subsystem: subsystem, category: "filesystem")
     nonisolated static let permission = Logger(subsystem: subsystem, category: "permission")
     nonisolated static let ui = Logger(subsystem: subsystem, category: "ui")
+    nonisolated static let audio = Logger(subsystem: subsystem, category: "audio")
 }

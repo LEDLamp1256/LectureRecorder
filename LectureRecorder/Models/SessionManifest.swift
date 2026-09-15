@@ -10,7 +10,15 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
     /// that isn't purely additive-and-optional. Older manifests can be
     /// migrated by switching on this value when read. Adding
     /// `failureDescription` did NOT require a bump: it is optional, and
-    /// Codable synthesis treats a missing optional key as `nil`.
+    /// Codable synthesis treats a missing optional key as `nil`. Adding
+    /// `ChunkMetadata.frameCount` also did NOT require a bump: every
+    /// manifest Phase 1 ever persisted has an empty `chunks` array (real
+    /// chunk metadata didn't exist until Phase 2A), so there is no
+    /// existing on-disk `ChunkMetadata` payload for the new required
+    /// field to break decoding on. Adding
+    /// `observedCaptureCopyFailureCount` also did NOT require a bump:
+    /// it is optional, so a manifest written before this field existed
+    /// simply decodes it as `nil`.
     static let currentSchemaVersion = 1
 
     var schemaVersion: Int
@@ -27,6 +35,16 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
     /// `status == .failed`. Set by `SessionManager` when it persists a
     /// failure record so the reason is visible later without needing logs.
     var failureDescription: String?
+    /// Buffer copies observed failing during the most recently completed
+    /// capture cycle for this session (see `CaptureStopOutcome`). `nil`
+    /// means no capture cycle has yet produced this evidence for this
+    /// manifest (including every manifest written before this field
+    /// existed) — distinct from `0`, which means a cycle ran and observed
+    /// zero copy failures. Not present in any manifest written before
+    /// this field existed; decodes to `nil` for those. Not proof that no
+    /// other audio was lost — see `CaptureStopOutcome`'s own
+    /// documentation.
+    var observedCaptureCopyFailureCount: Int? = nil
 
     static func newSession(
         id: UUID,
@@ -44,7 +62,8 @@ nonisolated struct SessionManifest: Codable, Equatable, Sendable {
             chunks: [],
             endReason: nil,
             endedCleanly: false,
-            failureDescription: nil
+            failureDescription: nil,
+            observedCaptureCopyFailureCount: nil
         )
     }
 }
@@ -63,14 +82,19 @@ nonisolated enum SessionEndReason: String, Codable, Equatable, Sendable {
     case unknown
 }
 
-/// Metadata for a single ~30-second audio chunk within a session.
-/// Not populated until the microphone-capture step lands; included now so
-/// the manifest schema and its tests are stable up front.
+/// Metadata for a single ~30-second audio chunk within a session,
+/// produced by `AudioChunkWriter` at finalization time.
 nonisolated struct ChunkMetadata: Codable, Equatable, Sendable {
     var sequenceNumber: Int
     var fileName: String
     var startOffsetSeconds: Double
     var durationSeconds: Double
+    /// The exact frame count written to this chunk, as counted by
+    /// `AudioChunkWriter`. This is the source-of-truth integer value —
+    /// `durationSeconds` is derived from it for display/readability only
+    /// and must never be used to reconstruct an exact frame count
+    /// (floating-point division/rounding makes that lossy).
+    var frameCount: Int
     var state: ChunkState
 }
 
