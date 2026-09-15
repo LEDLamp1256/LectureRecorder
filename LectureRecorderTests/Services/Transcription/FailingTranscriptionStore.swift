@@ -13,9 +13,44 @@ actor FailingTranscriptionStore: TranscriptionStoring {
     private let wrapped: TranscriptionStore
     private var failReplaceJobQueue: [Bool] = []
     private var failNextCommitResult = false
+    private var failNextCreateJobIfAbsent = false
+    private var failNextLoadAllJobArtifacts = false
+    private var failLoadAllJobArtifactsOnCallNumber: Int?
+    private var loadAllJobArtifactsCallCount = 0
+    private var forcedConfirmResultsDirectoryDurable: Bool?
 
     init(wrapped: TranscriptionStore) {
         self.wrapped = wrapped
+    }
+
+    /// The *next* call to `createJobIfAbsent` fails outright — used to
+    /// model an enqueue-time storage failure (T4 fault injection).
+    func setFailNextCreateJobIfAbsent(_ value: Bool) {
+        failNextCreateJobIfAbsent = value
+    }
+
+    /// The *next* call to `loadAllJobArtifacts` fails outright (as opposed
+    /// to a per-artifact `ArtifactLoadResult.failure`) — used to model a
+    /// hard enumeration failure that must abort `reconcileState` entirely
+    /// (T4 fault injection).
+    func setFailNextLoadAllJobArtifacts(_ value: Bool) {
+        failNextLoadAllJobArtifacts = value
+    }
+
+    /// Fails only the Nth call (1-indexed) to `loadAllJobArtifacts`, so a
+    /// test can target a specific stage (e.g. the terminal reconciliation
+    /// call) without guessing exact call ordering by hand.
+    func setFailLoadAllJobArtifacts(onCallNumber callNumber: Int) {
+        failLoadAllJobArtifactsOnCallNumber = callNumber
+    }
+
+    /// Forces every subsequent call to `confirmResultsDirectoryDurable` to
+    /// return this exact value instead of delegating to the wrapped store —
+    /// `nil` (the default) delegates normally. Used to deterministically
+    /// simulate a durability-confirmation failure, then a later success,
+    /// without touching the real filesystem sync path.
+    func setForcedConfirmResultsDirectoryDurable(_ value: Bool?) {
+        forcedConfirmResultsDirectoryDurable = value
     }
 
     /// Each call to `replaceJob` pops one entry from the front of this
@@ -45,7 +80,11 @@ actor FailingTranscriptionStore: TranscriptionStoring {
         _ job: TranscriptionJob,
         paths: TranscriptionArtifactPaths
     ) async throws -> JobCreationOutcome {
-        try await wrapped.createJobIfAbsent(job, paths: paths)
+        if failNextCreateJobIfAbsent {
+            failNextCreateJobIfAbsent = false
+            throw TestInjectedError()
+        }
+        return try await wrapped.createJobIfAbsent(job, paths: paths)
     }
 
     func replaceJob(_ job: TranscriptionJob, paths: TranscriptionArtifactPaths) async throws {
@@ -74,11 +113,22 @@ actor FailingTranscriptionStore: TranscriptionStoring {
     }
 
     func confirmResultsDirectoryDurable(paths: TranscriptionArtifactPaths) async throws -> Bool {
-        try await wrapped.confirmResultsDirectoryDurable(paths: paths)
+        if let forced = forcedConfirmResultsDirectoryDurable {
+            return forced
+        }
+        return try await wrapped.confirmResultsDirectoryDurable(paths: paths)
     }
 
     func loadAllJobArtifacts(paths: TranscriptionArtifactPaths) async throws -> [ArtifactLoadResult<TranscriptionJob>] {
-        try await wrapped.loadAllJobArtifacts(paths: paths)
+        loadAllJobArtifactsCallCount += 1
+        if failNextLoadAllJobArtifacts {
+            failNextLoadAllJobArtifacts = false
+            throw TestInjectedError()
+        }
+        if failLoadAllJobArtifactsOnCallNumber == loadAllJobArtifactsCallCount {
+            throw TestInjectedError()
+        }
+        return try await wrapped.loadAllJobArtifacts(paths: paths)
     }
 
     func loadAllResultArtifacts(

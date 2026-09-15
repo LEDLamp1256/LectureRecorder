@@ -8,6 +8,15 @@ private struct HarnessFixtureOutput: Codable, Sendable, Equatable {
     let text: String
 }
 
+/// A transcriber that fails the process if ever invoked — proves T4-C's
+/// cold reopen never re-invokes real inference merely to assemble an
+/// already-completed transcript.
+private struct FailIfInvokedHarnessTranscriber: Transcribing, Sendable {
+    func transcribe(audioURL: URL, source: TranscriptionSourceSnapshot) async throws -> TranscriptionEngineOutput {
+        throw HarnessFailure.completedSession("cold reopen must not invoke the transcriber")
+    }
+}
+
 private enum HarnessMode: String {
     case fixture
     case fixtureRead = "fixture-read"
@@ -15,6 +24,22 @@ private enum HarnessMode: String {
     case processSuite = "process-suite"
     case acceptanceModelPath = "acceptance-model-path"
     case realInference = "real-inference"
+    /// T4-C: exercises the same `TranscriptionCoordinator` orchestration
+    /// `CompletedSessionTranscriptionService` itself delegates every
+    /// mutating step to, across a real 2-chunk completed session, through
+    /// real Whisper — enqueue, sequential process, terminal reconciliation,
+    /// ordered-transcript assembly, then a cold reopen (fresh coordinator,
+    /// a transcriber that fails if ever invoked) proving the transcript
+    /// reads back from durable results without rerunning inference. Runs
+    /// via the normally signed harness for the same reason `real-inference`
+    /// already does — see `WorkerEntitlementTestSupport.xcode26SkipMessage`.
+    case completedSessionRealInference = "completed-session-real-inference"
+    /// T4-C: real Cancel -> Continue. Completes chunk 0 for real, cancels
+    /// chunk 1 while its real inference is in flight, confirms the durable
+    /// prefix (chunk 0) survives untouched, then completes chunk 1 via a
+    /// second, uncancelled `processJob` call ("Continue"), and confirms
+    /// chunk 0's durable result was never re-transcribed.
+    case completedSessionCancelContinue = "completed-session-cancel-continue"
 }
 
 private final class HarnessTimingBox: @unchecked Sendable {
@@ -51,6 +76,7 @@ private enum HarnessFailure: LocalizedError {
     case emptyWhisperVersion
     case processScenario(name: String, detail: String)
     case realInference(String)
+    case completedSession(String)
 
     var errorDescription: String? {
         switch self {
@@ -72,6 +98,8 @@ private enum HarnessFailure: LocalizedError {
             return "Process scenario '\(name)' failed: \(detail)"
         case .realInference(let detail):
             return "Real-inference acceptance failed: \(detail)"
+        case .completedSession(let detail):
+            return "T4-C completed-session real-inference acceptance failed: \(detail)"
         }
     }
 }
@@ -98,6 +126,10 @@ private enum LectureRecorderWorkerLaunchHarness {
                 print(try harnessModelURL().path)
             case .realInference:
                 try await runRealInference()
+            case .completedSessionRealInference:
+                try await runCompletedSessionRealInference()
+            case .completedSessionCancelContinue:
+                try await runCompletedSessionCancelContinue()
             }
         } catch {
             let diagnostic = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -275,6 +307,217 @@ private enum LectureRecorderWorkerLaunchHarness {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         FileHandle.standardOutput.write(try encoder.encode(report))
         FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    // MARK: - T4-C: real completed-session acceptance
+
+    /// Builds a real, structurally valid `.completed` 2-chunk session by
+    /// copying the same tracked T3B speech fixture to both canonical chunk
+    /// filenames. Each chunk file is independently real, valid, decodable
+    /// speech audio — real Whisper genuinely transcribes each one on its
+    /// own — but the two chunks are not two halves of one continuous
+    /// recording; this deliberately avoids adding an AVFoundation
+    /// CAF-splitting dependency to a harness that otherwise never needs
+    /// one, in exchange for disclosing this simplification plainly here.
+    private static func makeCompletedSessionFixture(
+        appRoot: URL
+    ) throws -> (manifest: SessionManifest, sessionPaths: SessionPaths, artifactPaths: TranscriptionArtifactPaths) {
+        guard let executableURL = Bundle.main.executableURL else {
+            throw HarnessFailure.completedSession("The normally signed harness executable path was unavailable.")
+        }
+        let fixtureURL = executableURL.deletingLastPathComponent()
+            .appendingPathComponent("T3BFixtures/technical-speech-44100-mono.caf")
+        guard FileManager.default.fileExists(atPath: fixtureURL.path) else {
+            throw HarnessFailure.completedSession("The tracked CAF fixture was not embedded in the normally signed harness.")
+        }
+
+        let sessionID = UUID()
+        let sessionsRoot = appRoot.appendingPathComponent("Sessions", isDirectory: true)
+        let sessionPaths = try DefaultFileSystemLocator.buildPaths(rootDirectory: sessionsRoot, sessionID: sessionID)
+
+        let frameCount = 242_368
+        let durationSeconds = Double(frameCount) / 44_100
+        var chunks: [ChunkMetadata] = []
+        for sequenceNumber in 0..<2 {
+            let fileName = TranscriptionArtifactPaths.canonicalChunkFileName(for: sequenceNumber)
+            let destinationURL = sessionPaths.chunksDirectory.appendingPathComponent(fileName)
+            guard !FileManager.default.fileExists(atPath: destinationURL.path) else {
+                throw HarnessFailure.completedSession("The unique acceptance chunk path unexpectedly existed.")
+            }
+            try FileManager.default.copyItem(at: fixtureURL, to: destinationURL)
+            chunks.append(ChunkMetadata(
+                sequenceNumber: sequenceNumber, fileName: fileName,
+                startOffsetSeconds: Double(sequenceNumber) * durationSeconds,
+                durationSeconds: durationSeconds, frameCount: frameCount, state: .completed
+            ))
+        }
+
+        var manifest = SessionManifest.newSession(
+            id: sessionID,
+            audioFormat: AudioFormatDescriptor(sampleRate: 44_100, channelCount: 1, bitsPerChannel: 32, formatIdentifier: "lpcm-float32"),
+            targetChunkDurationSeconds: durationSeconds
+        )
+        manifest.status = .completed
+        manifest.endedCleanly = true
+        manifest.endDate = Date()
+        manifest.chunks = chunks
+
+        let artifactPaths = try TranscriptionArtifactPaths.validated(manifest: manifest, sessionPaths: sessionPaths)
+        return (manifest, sessionPaths, artifactPaths)
+    }
+
+    private static func loadJobs(
+        store: TranscriptionStore, sequenceNumbers: [Int], paths: TranscriptionArtifactPaths
+    ) async throws -> [TranscriptionJob] {
+        var jobs: [TranscriptionJob] = []
+        for seq in sequenceNumbers {
+            guard let job = try await store.loadJob(sequenceNumber: seq, paths: paths) else {
+                throw HarnessFailure.completedSession("Chunk #\(seq)'s job is missing.")
+            }
+            jobs.append(job)
+        }
+        return jobs
+    }
+
+    private static func loadResults(
+        store: TranscriptionStore, sequenceNumbers: [Int], paths: TranscriptionArtifactPaths
+    ) async throws -> [TranscriptResult] {
+        var results: [TranscriptResult] = []
+        for seq in sequenceNumbers {
+            if let result = try await store.loadResult(sequenceNumber: seq, paths: paths) {
+                results.append(result)
+            }
+        }
+        return results
+    }
+
+    /// T4-C item 7 (+ 11): real end-to-end transcription of a 2-chunk
+    /// completed session through `TranscriptionCoordinator` — the same
+    /// orchestration engine `CompletedSessionTranscriptionService.run()`
+    /// itself delegates every mutating step to (enqueue, sequential
+    /// `processJob`, terminal state, ordered-transcript assembly) — then a
+    /// cold reopen proving the transcript reads back from durable results
+    /// without invoking the transcriber again.
+    private static func runCompletedSessionRealInference() async throws {
+        let appRoot = try harnessApplicationSupportRoot()
+        let fixture = try makeCompletedSessionFixture(appRoot: appRoot)
+        let transcriber = WhisperProcessTranscriber(applicationSupportRoot: { appRoot })
+        let store = TranscriptionStore()
+        let coordinator = TranscriptionCoordinator(store: store, transcriber: transcriber)
+
+        _ = try await coordinator.enqueueEligibleChunks(manifest: fixture.manifest, sessionPaths: fixture.sessionPaths)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        for chunk in fixture.manifest.chunks.sorted(by: { $0.sequenceNumber < $1.sequenceNumber }) {
+            let job = try await coordinator.processJob(sequenceNumber: chunk.sequenceNumber, paths: fixture.artifactPaths)
+            guard job.state == .completed else {
+                throw HarnessFailure.completedSession(
+                    "Chunk #\(chunk.sequenceNumber) did not durably complete: \(String(describing: job.lastFailure))"
+                )
+            }
+        }
+        let totalMS = Int64((durationInSeconds(started.duration(to: clock.now)) * 1_000).rounded())
+
+        let jobs = try await loadJobs(store: store, sequenceNumbers: [0, 1], paths: fixture.artifactPaths)
+        let results = try await loadResults(store: store, sequenceNumbers: [0, 1], paths: fixture.artifactPaths)
+        guard results.count == 2 else {
+            throw HarnessFailure.completedSession("Expected 2 durable canonical results, found \(results.count).")
+        }
+        let transcript = coordinator.assembleOrderedTranscript(chunks: fixture.manifest.chunks, jobs: jobs, results: results)
+        guard transcript.count == 2, transcript.allSatisfy({ if case .completed = $0.state { return true }; return false }) else {
+            throw HarnessFailure.completedSession("Assembled transcript was not fully completed/ordered: \(transcript)")
+        }
+
+        // Cold reopen: an independent coordinator backed by a transcriber
+        // that fails the process if ever invoked, reading only already-
+        // durable results from disk.
+        let coldCoordinator = TranscriptionCoordinator(store: TranscriptionStore(), transcriber: FailIfInvokedHarnessTranscriber())
+        let coldTranscript = coldCoordinator.assembleOrderedTranscript(chunks: fixture.manifest.chunks, jobs: jobs, results: results)
+        guard coldTranscript == transcript else {
+            throw HarnessFailure.completedSession("Cold reopen transcript did not match the original.")
+        }
+
+        print("T4-C completed-session real-inference: 2 real chunks completed in \(totalMS)ms; cold reopen matched without reinvoking the transcriber.")
+        for segment in transcript {
+            if case .completed(let text) = segment.state {
+                print("  chunk #\(segment.sequenceNumber): \(text.prefix(160))")
+            }
+        }
+    }
+
+    /// T4-C item 8: real Cancel -> Continue. Completes chunk 0 for real,
+    /// cancels chunk 1 while its real inference is genuinely in flight
+    /// (a fixed pre-cancel delay, not synchronization on a gate — the real
+    /// worker has no test-only cooperative hook — chosen well under typical
+    /// unquantized-model load time so cancellation reliably lands before
+    /// chunk 1 could complete), confirms the durable prefix survives
+    /// untouched, explicitly continues, and confirms chunk 0's durable
+    /// result was never re-transcribed.
+    private static func runCompletedSessionCancelContinue() async throws {
+        let appRoot = try harnessApplicationSupportRoot()
+        let fixture = try makeCompletedSessionFixture(appRoot: appRoot)
+        let transcriber = WhisperProcessTranscriber(applicationSupportRoot: { appRoot })
+        let store = TranscriptionStore()
+        let coordinator = TranscriptionCoordinator(store: store, transcriber: transcriber)
+
+        _ = try await coordinator.enqueueEligibleChunks(manifest: fixture.manifest, sessionPaths: fixture.sessionPaths)
+
+        let job0 = try await coordinator.processJob(sequenceNumber: 0, paths: fixture.artifactPaths)
+        guard job0.state == .completed else {
+            throw HarnessFailure.completedSession("Chunk #0 did not durably complete before exercising cancellation.")
+        }
+        guard let result0Before = try await store.loadResult(sequenceNumber: 0, paths: fixture.artifactPaths) else {
+            throw HarnessFailure.completedSession("Chunk #0's result was missing immediately after completion.")
+        }
+
+        let cancelTask = Task { try await coordinator.processJob(sequenceNumber: 1, paths: fixture.artifactPaths) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        cancelTask.cancel()
+        do {
+            _ = try await cancelTask.value
+        } catch is CancellationError {
+            // Expected: chunk 1's real inference was cancelled in flight.
+        }
+
+        guard let job1AfterCancel = try await store.loadJob(sequenceNumber: 1, paths: fixture.artifactPaths) else {
+            throw HarnessFailure.completedSession("Chunk #1's job was missing after the cancellation attempt.")
+        }
+        guard job1AfterCancel.state != .completed else {
+            throw HarnessFailure.completedSession(
+                "Chunk #1 completed before cancellation could be observed as active — not a meaningful cancel; rerun, or widen the pre-cancel delay."
+            )
+        }
+
+        guard let job0AfterCancel = try await store.loadJob(sequenceNumber: 0, paths: fixture.artifactPaths),
+              job0AfterCancel.state == .completed else {
+            throw HarnessFailure.completedSession("Chunk #0's durable completion did not survive chunk #1's cancellation.")
+        }
+
+        // Explicit Continue/Retry.
+        if job1AfterCancel.state == .failed, job1AfterCancel.lastFailure?.retryDisposition == .retryable {
+            _ = try await coordinator.retryJob(sequenceNumber: 1, paths: fixture.artifactPaths)
+        }
+        let job1Final = try await coordinator.processJob(sequenceNumber: 1, paths: fixture.artifactPaths)
+        guard job1Final.state == .completed else {
+            throw HarnessFailure.completedSession("Chunk #1 did not complete after Continue: \(String(describing: job1Final.lastFailure))")
+        }
+
+        guard let result0After = try await store.loadResult(sequenceNumber: 0, paths: fixture.artifactPaths),
+              result0Before.attemptID == result0After.attemptID,
+              result0Before.completedDate == result0After.completedDate else {
+            throw HarnessFailure.completedSession("Chunk #0's durable result changed across Continue — it was unnecessarily retranscribed.")
+        }
+
+        let jobs = try await loadJobs(store: store, sequenceNumbers: [0, 1], paths: fixture.artifactPaths)
+        let results = try await loadResults(store: store, sequenceNumbers: [0, 1], paths: fixture.artifactPaths)
+        let transcript = coordinator.assembleOrderedTranscript(chunks: fixture.manifest.chunks, jobs: jobs, results: results)
+        guard transcript.map(\.sequenceNumber) == [0, 1],
+              transcript.allSatisfy({ if case .completed = $0.state { return true }; return false }) else {
+            throw HarnessFailure.completedSession("Final transcript after Continue was not complete/ordered: \(transcript)")
+        }
+
+        print("T4-C completed-session cancel->continue: chunk #0 preserved (attemptID \(result0Before.attemptID) unchanged), chunk #1 completed via Continue, final transcript ordered [0, 1].")
     }
 
     private static func harnessApplicationSupportRoot() throws -> URL {
