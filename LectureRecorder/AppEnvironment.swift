@@ -19,6 +19,7 @@ final class AppEnvironment: ObservableObject {
     let sessionManager: SessionManager
     let completedSessionCatalog: CompletedSessionCatalog
     let completedSessionTranscriptionService: CompletedSessionTranscriptionService
+    let lectureNotesGenerationService: LectureNotesGenerationService
 
     init() {
         let store = SessionStore()
@@ -33,11 +34,33 @@ final class AppEnvironment: ObservableObject {
         )
         self.sessionManager = sessionManager
 
+        let transcriptionStore = TranscriptionStore()
         self.completedSessionCatalog = CompletedSessionCatalog()
         self.completedSessionTranscriptionService = CompletedSessionTranscriptionService(
             sessionManager: sessionManager,
-            transcriptionStore: TranscriptionStore(),
+            transcriptionStore: transcriptionStore,
             transcriber: WhisperProcessTranscriber()
+        )
+
+        let notesConfiguration = OpenAINotesConfigurationSource.processEnvironment()
+        let notesGenerator = OpenAILectureNotesGenerator(
+            configurationSource: notesConfiguration,
+            transport: URLSessionNotesHTTPTransport()
+        )
+        // Deterministic, conservative grouping: at most ~48 KB of transcript
+        // text or 24 canonical chunks (roughly 12 minutes) per provider call.
+        // The orchestration service persists this exact plan per generation.
+        let notesWindowBudget = try! NotesWindowBudget(
+            maxUTF8BytesPerWindow: 48_000,
+            maxUnitsPerWindow: 24
+        )
+        self.lectureNotesGenerationService = LectureNotesGenerationService(
+            sourceLoader: NotesTranscriptSourceLoader(transcriptionStore: transcriptionStore),
+            notesStore: LectureNotesStore(),
+            operationStateStore: LectureNotesOperationStateStore(),
+            generator: notesGenerator,
+            windowBudget: notesWindowBudget,
+            generationProvenance: notesConfiguration.generationProvenance
         )
     }
 }

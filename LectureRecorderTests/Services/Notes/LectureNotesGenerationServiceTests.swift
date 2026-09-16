@@ -125,6 +125,7 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         notesStore: (any LectureNotesStoring)? = nil,
         operationStateStore: (any LectureNotesOperationStateStoring)? = nil,
         windowBudget: NotesWindowBudget,
+        generationProvenance: LectureNotesGenerationProvenance = LectureNotesGenerationProvenance(recipeVersion: "t5-notes-v1"),
         generationIDProvider: (@Sendable () -> UUID)? = nil,
         sourceLoader: (any NotesTranscriptSourceLoading)? = nil
     ) -> LectureNotesGenerationService {
@@ -135,6 +136,7 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
             operationStateStore: operationStateStore ?? self.operationStateStore,
             generator: generator,
             windowBudget: windowBudget,
+            generationProvenance: generationProvenance,
             sessionsRootResolver: { root },
             generationIDProvider: generationIDProvider ?? { UUID() }
         )
@@ -245,6 +247,90 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
 
         let firstPaths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: firstID)
         XCTAssertNotNil(try notesStore.loadDocument(paths: firstPaths))
+    }
+
+    func testGenerateFreezesConfiguredProviderAndModelProvenance() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 1)
+        let provenance = LectureNotesGenerationProvenance(
+            recipeVersion: "recipe-a",
+            generatorIdentifier: "openai-responses-api",
+            generatorVersion: "gpt-5.6-sol",
+            backendIdentifier: "openai"
+        )
+        let service = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            windowBudget: try oneUnitPerWindowBudget(),
+            generationProvenance: provenance
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        _ = await waitUntilFinished(service)
+
+        let generationID = try onlyGenerationID()
+        let paths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generationID)
+        XCTAssertEqual(try notesStore.loadGeneration(paths: paths)?.provenance, provenance)
+        XCTAssertEqual(try notesStore.loadDocument(paths: paths)?.provenance, provenance)
+    }
+
+    func testContinuePreservesStoredProvenanceWhenCurrentConfigurationChanges() async throws {
+        try await assertResumePreservesStoredProvenance(useRetry: false)
+    }
+
+    func testRetryPreservesStoredProvenanceWhenCurrentConfigurationChanges() async throws {
+        try await assertResumePreservesStoredProvenance(useRetry: true)
+    }
+
+    private func assertResumePreservesStoredProvenance(useRetry: Bool) async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 2)
+        let original = LectureNotesGenerationProvenance(
+            recipeVersion: "recipe-a",
+            generatorIdentifier: "openai-responses-api",
+            generatorVersion: "gpt-5.6-sol",
+            backendIdentifier: "openai"
+        )
+        let changed = LectureNotesGenerationProvenance(
+            recipeVersion: "recipe-b",
+            generatorIdentifier: "different-generator",
+            generatorVersion: "different-model",
+            backendIdentifier: "different-backend"
+        )
+        let firstGenerator = ControllableFakeLectureNotesGenerator()
+        if useRetry {
+            await firstGenerator.setFailure(FakeGeneratorFailure(message: "retry me"), forWindowIndex: 1)
+        } else {
+            await firstGenerator.armGate(beforeWindowIndex: 1)
+        }
+        let firstService = makeService(
+            generator: firstGenerator,
+            windowBudget: try oneUnitPerWindowBudget(),
+            generationProvenance: original
+        )
+        XCTAssertEqual(firstService.generate(sessionID: sessionID), .admitted)
+        if useRetry {
+            _ = await waitUntilFinished(firstService)
+        } else {
+            await waitUntil { await firstGenerator.hasEnteredGate(forWindowIndex: 1) }
+            firstService.cancel(sessionID: sessionID)
+            _ = await waitUntilFinished(firstService)
+        }
+
+        let generationID = try onlyGenerationID()
+        let secondService = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            windowBudget: try oneUnitPerWindowBudget(),
+            generationProvenance: changed
+        )
+        let admission = useRetry
+            ? secondService.retry(sessionID: sessionID, generationID: generationID)
+            : secondService.continueGeneration(sessionID: sessionID, generationID: generationID)
+        XCTAssertEqual(admission, .admitted)
+        guard case .finished(.completed) = await waitUntilFinished(secondService) else {
+            return XCTFail("expected resumed generation to complete")
+        }
+
+        let paths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generationID)
+        XCTAssertEqual(try notesStore.loadGeneration(paths: paths)?.provenance, original)
+        XCTAssertEqual(try notesStore.loadDocument(paths: paths)?.provenance, original)
     }
 
     func testGenerationPlanRemainsFixedAcrossContinue() async throws {

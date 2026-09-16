@@ -67,7 +67,9 @@ final class LectureNotesGenerationService: ObservableObject {
     private let operationStateStore: any LectureNotesOperationStateStoring
     private let generator: any LectureNotesGenerating
     private let windowBudget: NotesWindowBudget
-    private let recipeVersion: String
+    /// Frozen into each new immutable generation record. Continue/Retry load
+    /// the already-persisted record and therefore never consult this value.
+    private let generationProvenance: LectureNotesGenerationProvenance
     private let sessionsRootResolver: @Sendable () throws -> URL
     /// Mints the identity for a brand-new generation (Generate only —
     /// Continue/Retry always reuse a caller-supplied `generationID` and
@@ -85,7 +87,7 @@ final class LectureNotesGenerationService: ObservableObject {
         operationStateStore: any LectureNotesOperationStateStoring,
         generator: any LectureNotesGenerating,
         windowBudget: NotesWindowBudget,
-        recipeVersion: String = "t5-notes-v1",
+        generationProvenance: LectureNotesGenerationProvenance = LectureNotesGenerationProvenance(recipeVersion: "t5-notes-v1"),
         sessionsRootResolver: @escaping @Sendable () throws -> URL = {
             try DefaultFileSystemLocator.resolveSessionsRootPathWithoutCreating()
         },
@@ -97,7 +99,7 @@ final class LectureNotesGenerationService: ObservableObject {
         self.operationStateStore = operationStateStore
         self.generator = generator
         self.windowBudget = windowBudget
-        self.recipeVersion = recipeVersion
+        self.generationProvenance = generationProvenance
         self.sessionsRootResolver = sessionsRootResolver
         self.generationIDProvider = generationIDProvider
         self.shutdownPollInterval = shutdownPollInterval
@@ -257,7 +259,7 @@ final class LectureNotesGenerationService: ObservableObject {
                 sessionID: sessionID,
                 transcriptFingerprint: sourceSnapshot.fingerprint,
                 windowPlan: plan,
-                provenance: LectureNotesGenerationProvenance(recipeVersion: recipeVersion)
+                provenance: generationProvenance
             )
             let paths: NotesArtifactPaths
             do {

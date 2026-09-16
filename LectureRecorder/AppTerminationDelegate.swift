@@ -6,20 +6,21 @@ import AppKit
 /// constructs and retains exactly one instance of this type for the app's
 /// entire lifetime, before `LectureRecorderApp.body` is ever evaluated —
 /// so there is never more than one `AppEnvironment` and never any ambiguity
-/// about who may call `CompletedSessionTranscriptionService.shutdown()`.
+/// about who may call the app-wide transcription and Notes services'
+/// shutdown entry points.
 /// `SessionManager` and every SwiftUI view remain unaware this type exists.
 ///
 /// All of the actual shutdown contract — closing admission, requesting
 /// cancellation, and bounding the wait — lives on, and is unit-tested on,
-/// `CompletedSessionTranscriptionService` itself (see `beginShutdown()` and
+/// the two app-wide services themselves (see `beginShutdown()` and
 /// `shutdown(timeout:)`). This class is deliberately too thin to need its
 /// own tests: it only bridges AppKit's termination callback to those two
 /// calls using the standard `.terminateLater` / `reply(toApplicationShouldTerminate:)`
 /// pattern, so that quitting while no transcription is active proceeds
 /// immediately (macOS's own default `.terminateNow` behavior would also be
-/// correct there, but returning `.terminateLater` unconditionally and
-/// replying as soon as the bounded wait resolves keeps a single, uniform
-/// path for both cases rather than two).
+/// correct when both are idle, but returning `.terminateLater`
+/// unconditionally and replying as soon as the bounded wait resolves keeps
+/// a single, uniform path for both cases rather than two).
 ///
 /// `@MainActor` (not just individually-isolated methods): AppKit always
 /// calls `applicationShouldTerminate(_:)` on the main thread, and marking
@@ -40,12 +41,15 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
         // another window could still be admitted for a new
         // Transcribe/Continue/Retry after termination had already begun.
         environment.completedSessionTranscriptionService.beginShutdown()
+        environment.lectureNotesGenerationService.beginShutdown()
 
         Task { @MainActor in
             // `beginShutdown()` already ran above; this call's own
             // internal `beginShutdown()` is a no-op (idempotent) and it
             // proceeds straight to the bounded wait.
-            _ = await self.environment.completedSessionTranscriptionService.shutdown()
+            async let transcriptionShutdown = self.environment.completedSessionTranscriptionService.shutdown()
+            async let notesShutdown = self.environment.lectureNotesGenerationService.shutdown()
+            _ = await (transcriptionShutdown, notesShutdown)
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
