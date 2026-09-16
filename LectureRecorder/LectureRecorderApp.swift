@@ -20,6 +20,10 @@ struct LectureRecorderApp: App {
             CompletedSessionsView(
                 catalog: appDelegate.environment.completedSessionCatalog,
                 service: appDelegate.environment.completedSessionTranscriptionService,
+                notesService: appDelegate.environment.lectureNotesGenerationService,
+                notesStore: appDelegate.environment.notesStore,
+                notesOperationStateStore: appDelegate.environment.notesOperationStateStore,
+                notesSourceLoader: appDelegate.environment.notesTranscriptSourceLoader,
                 sessionManager: appDelegate.environment.sessionManager
             )
         }

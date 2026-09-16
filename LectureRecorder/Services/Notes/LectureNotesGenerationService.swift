@@ -57,7 +57,37 @@ final class LectureNotesGenerationService: ObservableObject {
 
     @Published private(set) var activeSessionID: UUID?
     @Published private(set) var activeGenerationID: UUID?
-    @Published private(set) var phase: OperationPhase = .idle
+    @Published private(set) var phase: OperationPhase = .idle {
+        didSet {
+            // Single centralized interception point for every
+            // `.finished(.failed(...))` transition anywhere in `run()` —
+            // deliberately not duplicated at each of its many individual
+            // failure branches. `activeSessionID` is guaranteed to still
+            // be this run's own session at this exact point: every
+            // `phase = .finished(...)` assignment happens inside `run()`,
+            // strictly before `releaseOperation(epoch:)` (which only ever
+            // runs after `run()` has already returned) clears it. Every
+            // assignment here was also already epoch-validated by the
+            // `publish` closure that made it, so a superseded/stale run
+            // can never reach this at all.
+            guard case .finished(.failed(let description)) = phase, let activeSessionID else { return }
+            lastFailureDescriptionBySessionID[activeSessionID] = description
+        }
+    }
+    /// Transient, memory-only, session-keyed record of the most recent
+    /// `.failed(description:)` terminal outcome for each session — the
+    /// only terminal case that can otherwise leave no new durable evidence
+    /// behind (an early failure, e.g. reloading the transcript source,
+    /// can occur before any generation record or operation-state update
+    /// was ever persisted). Every other terminal case is fully
+    /// reconstructable from canonical artifacts by
+    /// `NotesGenerationRecoveryClassifier`, so this deliberately never
+    /// grows into a general terminal-history subsystem: each session ever
+    /// retains at most its own single most recent failure, cleared the
+    /// instant a new operation is admitted for that same session (see
+    /// `beginOperation`). Never persisted; not part of `SessionManifest`
+    /// or any Notes storage format.
+    @Published private(set) var lastFailureDescriptionBySessionID: [UUID: String] = [:]
 
     private(set) var isShuttingDown = false
     private(set) var operationEpoch = 0
@@ -140,6 +170,16 @@ final class LectureNotesGenerationService: ObservableObject {
         currentTask?.cancel()
     }
 
+    /// The most recent `.failed(description:)` terminal outcome recorded
+    /// for `sessionID`, if any — see `lastFailureDescriptionBySessionID`'s
+    /// own header comment. Survives independently of any particular view's
+    /// lifetime: this reads directly from the service's own retained
+    /// state, never requiring an observer to have been alive at the
+    /// moment the failure occurred.
+    func lastFailureDescription(forSessionID sessionID: UUID) -> String? {
+        lastFailureDescriptionBySessionID[sessionID]
+    }
+
     // MARK: - Shutdown
 
     func beginShutdown() {
@@ -174,6 +214,12 @@ final class LectureNotesGenerationService: ObservableObject {
     private func beginOperation(sessionID: UUID, generationID: UUID?) -> AdmissionResult {
         guard !isShuttingDown else { return .shuttingDown }
         guard currentTask == nil else { return .busy }
+
+        // A new attempt for this session always supersedes whatever
+        // terminal failure a prior attempt for it may have left behind —
+        // cleared synchronously, before this new run can possibly produce
+        // its own outcome.
+        lastFailureDescriptionBySessionID[sessionID] = nil
 
         operationEpoch += 1
         let myEpoch = operationEpoch
