@@ -6,11 +6,27 @@ import SwiftUI
 /// environment — this view never becomes a second task/scheduler owner.
 struct CompletedSessionsView: View {
     let service: CompletedSessionTranscriptionService
+    let notesService: LectureNotesGenerationService
+    let notesStore: any LectureNotesStoring
+    let notesOperationStateStore: any LectureNotesOperationStateStoring
+    let notesSourceLoader: any NotesTranscriptSourceLoading
     @ObservedObject var sessionManager: SessionManager
     @StateObject private var presenter: CompletedSessionsListPresenter
 
-    init(catalog: CompletedSessionCatalog, service: CompletedSessionTranscriptionService, sessionManager: SessionManager) {
+    init(
+        catalog: CompletedSessionCatalog,
+        service: CompletedSessionTranscriptionService,
+        notesService: LectureNotesGenerationService,
+        notesStore: any LectureNotesStoring,
+        notesOperationStateStore: any LectureNotesOperationStateStoring,
+        notesSourceLoader: any NotesTranscriptSourceLoading,
+        sessionManager: SessionManager
+    ) {
         self.service = service
+        self.notesService = notesService
+        self.notesStore = notesStore
+        self.notesOperationStateStore = notesOperationStateStore
+        self.notesSourceLoader = notesSourceLoader
         self.sessionManager = sessionManager
         _presenter = StateObject(wrappedValue: CompletedSessionsListPresenter(catalog: catalog))
     }
@@ -51,8 +67,15 @@ struct CompletedSessionsView: View {
             }
         } detail: {
             if let selectedEntry {
-                SessionTranscriptView(entry: selectedEntry, service: service)
-                    .id(selectedEntry.manifest.sessionID)
+                CompletedSessionDetailView(
+                    entry: selectedEntry,
+                    transcriptionService: service,
+                    notesService: notesService,
+                    notesStore: notesStore,
+                    notesOperationStateStore: notesOperationStateStore,
+                    notesSourceLoader: notesSourceLoader
+                )
+                .id(selectedEntry.manifest.sessionID)
             } else {
                 Text("Select a completed session")
                     .foregroundStyle(.secondary)

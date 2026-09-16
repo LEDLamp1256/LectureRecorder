@@ -28,6 +28,27 @@ private final class SwitchableSourceSnapshotLoader: NotesTranscriptSourceLoading
     }
 }
 
+/// Always throws — used to deterministically force `run()`'s very first
+/// step (reloading the transcript source) to fail, before any generation
+/// record could possibly be created or loaded. Session-keyed so a test
+/// exercising two different sessions on the same shared service can give
+/// each its own distinct failure text.
+private struct ThrowingSourceLoader: NotesTranscriptSourceLoading {
+    let messagesBySessionID: [UUID: String]
+
+    init(message: String, forSessionID sessionID: UUID) {
+        self.messagesBySessionID = [sessionID: message]
+    }
+
+    init(messagesBySessionID: [UUID: String]) {
+        self.messagesBySessionID = messagesBySessionID
+    }
+
+    func loadCurrentSnapshot(sessionID: UUID) async throws -> NotesTranscriptSourceSnapshot {
+        throw NotesTranscriptSourceLoadError.sourceBuildFailed(messagesBySessionID[sessionID] ?? "unexpected session \(sessionID)")
+    }
+}
+
 @MainActor
 final class LectureNotesGenerationServiceTests: XCTestCase {
     private var tempDirectory: URL!
@@ -1023,5 +1044,111 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         let retryPhase = await waitUntilFinished(service)
         guard case .finished(.failed(let description)) = retryPhase else { return XCTFail("expected failed, got \(retryPhase)") }
         XCTAssertTrue(description.contains("No generation record"), "expected a 'no generation record' failure, got: \(description)")
+    }
+
+    // MARK: - Transient session-keyed terminal-failure surface
+
+    /// A fresh Generate whose very first step (reloading the transcript
+    /// source) fails leaves no new durable evidence anywhere — no
+    /// generation record is ever created. The service's own transient,
+    /// session-keyed `lastFailureDescriptionBySessionID` is the only
+    /// place this description is recoverable, and it must be available
+    /// with no observer (view or otherwise) having been alive at the
+    /// moment the failure occurred — this test reads it directly from the
+    /// service with nothing else ever having observed it.
+    func testFreshGenerateEarlyFailureIsRetainedForCorrectSessionWithNoDurableEvidence() async throws {
+        let service = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            windowBudget: try oneUnitPerWindowBudget(),
+            sourceLoader: ThrowingSourceLoader(message: "boom for session A", forSessionID: sessionID)
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        let finalPhase = await waitUntilFinished(service)
+        guard case .finished(.failed) = finalPhase else {
+            return XCTFail("expected a controlled failed outcome, got \(finalPhase)")
+        }
+
+        // No generation record was ever created — the failure happened
+        // before any durable artifact could possibly exist.
+        XCTAssertEqual(try notesStore.listGenerationIDs(sessionPaths: sessionPaths), [])
+
+        let recorded = service.lastFailureDescription(forSessionID: sessionID)
+        XCTAssertNotNil(recorded)
+        XCTAssertTrue(recorded?.contains("boom for session A") ?? false, "got: \(recorded ?? "nil")")
+    }
+
+    /// Session B being subsequently admitted and changing the shared,
+    /// mutable `phase` must never overwrite or remove session A's
+    /// already-recorded failure, and session B must never itself display
+    /// session A's failure as its own. Both sessions run on the *same*
+    /// shared service instance, mirroring the real single-service-
+    /// instance-per-app topology. Each session is given its own distinct
+    /// failure text so the isolation assertions below are meaningful.
+    func testAnotherSessionsOperationCannotOverwriteOrLeakIntoAPriorSessionsFailure() async throws {
+        let sessionA: UUID = sessionID
+        let sessionB = UUID()
+        let service = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            windowBudget: try oneUnitPerWindowBudget(),
+            sourceLoader: ThrowingSourceLoader(messagesBySessionID: [
+                sessionA: "boom for session A",
+                sessionB: "boom for session B",
+            ])
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionA), .admitted)
+        _ = await waitUntilFinished(service)
+        // Wait for full release (not merely `phase == .finished`) before
+        // admitting a second, unrelated session's operation on this same
+        // shared service instance.
+        await waitUntil { service.activeSessionID == nil }
+        XCTAssertEqual(service.lastFailureDescription(forSessionID: sessionA)?.contains("boom for session A"), true)
+
+        XCTAssertEqual(service.generate(sessionID: sessionB), .admitted)
+        _ = await waitUntilFinished(service)
+
+        // Session A's failure survives session B's operation entirely,
+        // regardless of session B's own outcome.
+        XCTAssertEqual(
+            service.lastFailureDescription(forSessionID: sessionA)?.contains("boom for session A"), true,
+            "session B's operation must never overwrite session A's recorded failure"
+        )
+        // Session B has its own distinct failure, never session A's.
+        XCTAssertEqual(service.lastFailureDescription(forSessionID: sessionB)?.contains("boom for session B"), true)
+        XCTAssertNotEqual(
+            service.lastFailureDescription(forSessionID: sessionB),
+            service.lastFailureDescription(forSessionID: sessionA)
+        )
+    }
+
+    /// A new attempt admitted for the same session must clear that
+    /// session's own previously recorded failure immediately on
+    /// admission — before the new attempt has even had a chance to
+    /// produce its own outcome — so a stale prior failure can never
+    /// linger and be mistaken for the new attempt's result.
+    func testNewAttemptForSameSessionClearsItsOwnStaleFailureOnAdmission() async throws {
+        let service = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            windowBudget: try oneUnitPerWindowBudget(),
+            sourceLoader: ThrowingSourceLoader(message: "first failure", forSessionID: sessionID)
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        _ = await waitUntilFinished(service)
+        await waitUntil { service.activeSessionID == nil }
+        XCTAssertNotNil(service.lastFailureDescription(forSessionID: sessionID))
+
+        // A second attempt is admitted for the same session — clearing
+        // happens synchronously inside admission, before any async work
+        // (including this attempt's own eventual outcome) can run.
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        XCTAssertNil(
+            service.lastFailureDescription(forSessionID: sessionID),
+            "admitting a new attempt must clear the prior stale failure immediately"
+        )
+
+        // Let the second attempt finish too, leaving the service idle.
+        _ = await waitUntilFinished(service)
     }
 }

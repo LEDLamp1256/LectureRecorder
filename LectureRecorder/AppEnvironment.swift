@@ -20,6 +20,16 @@ final class AppEnvironment: ObservableObject {
     let completedSessionCatalog: CompletedSessionCatalog
     let completedSessionTranscriptionService: CompletedSessionTranscriptionService
     let lectureNotesGenerationService: LectureNotesGenerationService
+    /// The same read-only Notes durable-state collaborators wired into
+    /// `lectureNotesGenerationService` above, exposed separately so
+    /// `SessionNotesPresenter` can perform its own read-only durable-state
+    /// reconstruction (T5-D) without the generation service needing to
+    /// expose its private stores. All three are stateless filesystem
+    /// wrappers, so sharing these exact instances is equivalent to
+    /// constructing fresh ones — this just avoids the redundant construction.
+    let notesStore: LectureNotesStore
+    let notesOperationStateStore: LectureNotesOperationStateStore
+    let notesTranscriptSourceLoader: NotesTranscriptSourceLoader
 
     init() {
         let store = SessionStore()
@@ -54,10 +64,17 @@ final class AppEnvironment: ObservableObject {
             maxUTF8BytesPerWindow: 48_000,
             maxUnitsPerWindow: 24
         )
+        let notesStore = LectureNotesStore()
+        let notesOperationStateStore = LectureNotesOperationStateStore()
+        let notesTranscriptSourceLoader = NotesTranscriptSourceLoader(transcriptionStore: transcriptionStore)
+        self.notesStore = notesStore
+        self.notesOperationStateStore = notesOperationStateStore
+        self.notesTranscriptSourceLoader = notesTranscriptSourceLoader
+
         self.lectureNotesGenerationService = LectureNotesGenerationService(
-            sourceLoader: NotesTranscriptSourceLoader(transcriptionStore: transcriptionStore),
-            notesStore: LectureNotesStore(),
-            operationStateStore: LectureNotesOperationStateStore(),
+            sourceLoader: notesTranscriptSourceLoader,
+            notesStore: notesStore,
+            operationStateStore: notesOperationStateStore,
             generator: notesGenerator,
             windowBudget: notesWindowBudget,
             generationProvenance: notesConfiguration.generationProvenance
