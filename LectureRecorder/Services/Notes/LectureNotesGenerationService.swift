@@ -37,6 +37,13 @@ final class LectureNotesGenerationService: ObservableObject {
         case staleSource
         case damaged(reason: NotesGenerationDamageReason)
         case failed(description: String)
+        /// The backend a brand-new generation would use is not ready right
+        /// now (e.g. Apple Intelligence disabled, model assets not ready).
+        /// Reached only for `generate(sessionID:)`, always before any
+        /// generation record is created and before any generator or network
+        /// call — see the availability check at the top of the new-
+        /// generation branch of `run()`.
+        case backendUnavailable(description: String)
     }
 
     enum AdmissionResult: Sendable, Equatable {
@@ -60,9 +67,10 @@ final class LectureNotesGenerationService: ObservableObject {
     @Published private(set) var phase: OperationPhase = .idle {
         didSet {
             // Single centralized interception point for every
-            // `.finished(.failed(...))` transition anywhere in `run()` —
-            // deliberately not duplicated at each of its many individual
-            // failure branches. `activeSessionID` is guaranteed to still
+            // `.finished(.failed(...))`/`.finished(.backendUnavailable(...))`
+            // transition anywhere in `run()` — deliberately not duplicated
+            // at each of its many individual failure branches.
+            // `activeSessionID` is guaranteed to still
             // be this run's own session at this exact point: every
             // `phase = .finished(...)` assignment happens inside `run()`,
             // strictly before `releaseOperation(epoch:)` (which only ever
@@ -70,7 +78,16 @@ final class LectureNotesGenerationService: ObservableObject {
             // assignment here was also already epoch-validated by the
             // `publish` closure that made it, so a superseded/stale run
             // can never reach this at all.
-            guard case .finished(.failed(let description)) = phase, let activeSessionID else { return }
+            let description: String?
+            switch phase {
+            case .finished(.failed(let value)):
+                description = value
+            case .finished(.backendUnavailable(let value)):
+                description = value
+            default:
+                description = nil
+            }
+            guard let description, let activeSessionID else { return }
             lastFailureDescriptionBySessionID[activeSessionID] = description
         }
     }
@@ -96,6 +113,11 @@ final class LectureNotesGenerationService: ObservableObject {
     private let notesStore: any LectureNotesStoring
     private let operationStateStore: any LectureNotesOperationStateStoring
     private let generator: any LectureNotesGenerating
+    /// Consulted only when `generate(sessionID:)` is about to create a
+    /// brand-new generation (never for Continue/Retry, which always resume
+    /// an already-persisted generation) — see the availability check at the
+    /// top of the new-generation branch of `run()`.
+    private let newGenerationAvailabilityChecker: any NewLectureNotesGenerationAvailabilityChecking
     private let windowBudget: NotesWindowBudget
     /// Frozen into each new immutable generation record. Continue/Retry load
     /// the already-persisted record and therefore never consult this value.
@@ -116,6 +138,7 @@ final class LectureNotesGenerationService: ObservableObject {
         notesStore: any LectureNotesStoring,
         operationStateStore: any LectureNotesOperationStateStoring,
         generator: any LectureNotesGenerating,
+        newGenerationAvailabilityChecker: any NewLectureNotesGenerationAvailabilityChecking = AlwaysAvailableNewGenerationChecker(),
         windowBudget: NotesWindowBudget,
         generationProvenance: LectureNotesGenerationProvenance = LectureNotesGenerationProvenance(recipeVersion: "t5-notes-v1"),
         sessionsRootResolver: @escaping @Sendable () throws -> URL = {
@@ -128,6 +151,7 @@ final class LectureNotesGenerationService: ObservableObject {
         self.notesStore = notesStore
         self.operationStateStore = operationStateStore
         self.generator = generator
+        self.newGenerationAvailabilityChecker = newGenerationAvailabilityChecker
         self.windowBudget = windowBudget
         self.generationProvenance = generationProvenance
         self.sessionsRootResolver = sessionsRootResolver
@@ -298,6 +322,19 @@ final class LectureNotesGenerationService: ObservableObject {
                 return
             }
         } else {
+            // Admission-time availability precondition for a brand-new
+            // generation only — Continue/Retry (the `if let generationID`
+            // branch above) always resume an already-persisted generation
+            // and never reach here. Checked before minting an ID, before
+            // touching `notesStore`, and before any generator/network call.
+            switch newGenerationAvailabilityChecker.availabilityForNewGeneration() {
+            case .available:
+                break
+            case .unavailable(let description):
+                publish { self.phase = .finished(.backendUnavailable(description: description)) }
+                return
+            }
+
             resolvedGenerationID = generationIDProvider()
             let plan = NotesWindowPlan(windows: NotesWindowPlanner.plan(units: sourceSnapshot.units, budget: windowBudget))
             let newRecord = LectureNotesGenerationRecord.newGeneration(
