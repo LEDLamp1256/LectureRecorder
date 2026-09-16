@@ -52,18 +52,29 @@ final class AppEnvironment: ObservableObject {
             transcriber: WhisperProcessTranscriber()
         )
 
-        let notesConfiguration = OpenAINotesConfigurationSource.processEnvironment()
-        let notesGenerator = OpenAILectureNotesGenerator(
-            configurationSource: notesConfiguration,
+        // Legacy backend, retained only for Continue/Retry of pre-existing
+        // OpenAI generations (and possible future explicit opt-in) — no
+        // longer the default for brand-new generations. Constructing it
+        // never reads OPENAI_API_KEY; that is resolved lazily per explicitly
+        // admitted operation, same as before.
+        let openAINotesConfiguration = OpenAINotesConfigurationSource.processEnvironment()
+        let openAINotesGenerator = OpenAILectureNotesGenerator(
+            configurationSource: openAINotesConfiguration,
             transport: URLSessionNotesHTTPTransport()
         )
-        // Deterministic, conservative grouping: at most ~48 KB of transcript
-        // text or 24 canonical chunks (roughly 12 minutes) per provider call.
-        // The orchestration service persists this exact plan per generation.
-        let notesWindowBudget = try! NotesWindowBudget(
-            maxUTF8BytesPerWindow: 48_000,
-            maxUnitsPerWindow: 24
+        // Local, $0 default backend for every brand-new generation. All
+        // real FoundationModels/LanguageModelSession calls stay inside
+        // `RealFoundationModelsSessionDriver`.
+        let appleNotesGenerator = FoundationModelsLectureNotesGenerator()
+        let notesGeneratorRouter = LectureNotesGeneratorRouter(
+            appleGenerator: appleNotesGenerator,
+            openAIGenerator: openAINotesGenerator
         )
+        // Apple's on-device session context is far smaller than OpenAI's —
+        // this budget only ever governs planning a *brand-new* generation;
+        // already-persisted generations (OpenAI or Apple) keep their own
+        // frozen `NotesWindowPlan` regardless of this value.
+        let notesWindowBudget = FoundationModelsNotesConfiguration.windowBudget
         let notesStore = LectureNotesStore()
         let notesOperationStateStore = LectureNotesOperationStateStore()
         let notesTranscriptSourceLoader = NotesTranscriptSourceLoader(transcriptionStore: transcriptionStore)
@@ -75,9 +86,10 @@ final class AppEnvironment: ObservableObject {
             sourceLoader: notesTranscriptSourceLoader,
             notesStore: notesStore,
             operationStateStore: notesOperationStateStore,
-            generator: notesGenerator,
+            generator: notesGeneratorRouter,
+            newGenerationAvailabilityChecker: notesGeneratorRouter,
             windowBudget: notesWindowBudget,
-            generationProvenance: notesConfiguration.generationProvenance
+            generationProvenance: FoundationModelsNotesConfiguration.generationProvenance
         )
     }
 }

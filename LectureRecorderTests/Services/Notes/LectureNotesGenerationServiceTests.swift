@@ -28,6 +28,15 @@ private final class SwitchableSourceSnapshotLoader: NotesTranscriptSourceLoading
     }
 }
 
+/// Deterministic, scriptable `NewLectureNotesGenerationAvailabilityChecking`
+/// fake — test-only. Defaults to `.available` so tests that don't care
+/// about admission-time availability are unaffected.
+private struct FakeNewGenerationAvailabilityChecker: NewLectureNotesGenerationAvailabilityChecking {
+    var result: LectureNotesGenerationAvailability = .available
+
+    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability { result }
+}
+
 /// Always throws — used to deterministically force `run()`'s very first
 /// step (reloading the transcript source) to fail, before any generation
 /// record could possibly be created or loaded. Session-keyed so a test
@@ -145,6 +154,7 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         generator: any LectureNotesGenerating,
         notesStore: (any LectureNotesStoring)? = nil,
         operationStateStore: (any LectureNotesOperationStateStoring)? = nil,
+        newGenerationAvailabilityChecker: (any NewLectureNotesGenerationAvailabilityChecking)? = nil,
         windowBudget: NotesWindowBudget,
         generationProvenance: LectureNotesGenerationProvenance = LectureNotesGenerationProvenance(recipeVersion: "t5-notes-v1"),
         generationIDProvider: (@Sendable () -> UUID)? = nil,
@@ -156,6 +166,7 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
             notesStore: notesStore ?? self.notesStore,
             operationStateStore: operationStateStore ?? self.operationStateStore,
             generator: generator,
+            newGenerationAvailabilityChecker: newGenerationAvailabilityChecker ?? AlwaysAvailableNewGenerationChecker(),
             windowBudget: windowBudget,
             generationProvenance: generationProvenance,
             sessionsRootResolver: { root },
@@ -1044,6 +1055,67 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         let retryPhase = await waitUntilFinished(service)
         guard case .finished(.failed(let description)) = retryPhase else { return XCTFail("expected failed, got \(retryPhase)") }
         XCTAssertTrue(description.contains("No generation record"), "expected a 'no generation record' failure, got: \(description)")
+    }
+
+    // MARK: - New-generation backend availability admission
+
+    /// A backend reporting `.unavailable` for a brand-new `generate(...)`
+    /// call must produce an explicit `.backendUnavailable` outcome, create
+    /// no generation record, and never invoke the generator at all —
+    /// T5-E contract §8.
+    func testUnavailableBackendPreventsNewGenerationAndCreatesNoRecord() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 1)
+        let generator = ControllableFakeLectureNotesGenerator()
+        let service = makeService(
+            generator: generator,
+            newGenerationAvailabilityChecker: FakeNewGenerationAvailabilityChecker(
+                result: .unavailable(description: "Apple Intelligence is turned off.")
+            ),
+            windowBudget: try oneUnitPerWindowBudget()
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        let finalPhase = await waitUntilFinished(service)
+        guard case .finished(.backendUnavailable(let description)) = finalPhase else {
+            return XCTFail("expected .backendUnavailable, got \(finalPhase)")
+        }
+        XCTAssertEqual(description, "Apple Intelligence is turned off.")
+
+        let analyzeCalls = await generator.analyzeCalls
+        let synthCount = await generator.synthesizeCallCount
+        XCTAssertEqual(analyzeCalls, [], "an unavailable backend must never be invoked for analysis")
+        XCTAssertEqual(synthCount, 0, "an unavailable backend must never be invoked for synthesis")
+        XCTAssertEqual(try notesStore.listGenerationIDs(sessionPaths: sessionPaths), [], "no generation record may be created when the backend is unavailable")
+
+        // The transient session-keyed surface (the only place a fresh
+        // Generate's failure is recoverable with no durable evidence, same
+        // rationale as `.failed`) reports the same description.
+        XCTAssertEqual(service.lastFailureDescription(forSessionID: sessionID), "Apple Intelligence is turned off.")
+    }
+
+    /// Continue/Retry always resume an already-persisted generation and
+    /// must never consult admission-time backend availability — only
+    /// `generate(sessionID:)` (a brand-new generation) does.
+    func testUnavailableBackendNeverBlocksContinueOfAnExistingGeneration() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 1)
+        let alwaysAvailableGenerator = ControllableFakeLectureNotesGenerator()
+        let bootstrapService = makeService(generator: alwaysAvailableGenerator, windowBudget: try oneUnitPerWindowBudget())
+        XCTAssertEqual(bootstrapService.generate(sessionID: sessionID), .admitted)
+        _ = await waitUntilFinished(bootstrapService)
+        let generationID = try XCTUnwrap(notesStore.listGenerationIDs(sessionPaths: sessionPaths).first)
+
+        let resumeGenerator = ControllableFakeLectureNotesGenerator()
+        let resumeService = makeService(
+            generator: resumeGenerator,
+            newGenerationAvailabilityChecker: FakeNewGenerationAvailabilityChecker(result: .unavailable(description: "unavailable")),
+            windowBudget: try oneUnitPerWindowBudget()
+        )
+
+        XCTAssertEqual(resumeService.continueGeneration(sessionID: sessionID, generationID: generationID), .admitted)
+        let finalPhase = await waitUntilFinished(resumeService)
+        guard case .finished(.completed) = finalPhase else {
+            return XCTFail("expected Continue to complete despite an unavailable new-generation checker, got \(finalPhase)")
+        }
     }
 
     // MARK: - Transient session-keyed terminal-failure surface
