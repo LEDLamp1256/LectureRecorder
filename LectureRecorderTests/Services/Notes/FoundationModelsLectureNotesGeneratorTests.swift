@@ -57,7 +57,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         fidelity: String = "transcriptSupported",
         first: Int,
         last: Int? = nil,
-        uncertaintyNote: String? = nil
+        uncertaintyNote: String = ""
     ) -> AppleNoteItemDTO {
         AppleNoteItemDTO(
             kind: kind,
@@ -117,7 +117,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
 
     func testAnalyzeWindowRequiresUncertaintyNoteForNonTranscriptSupportedFidelity() async throws {
         let driver = FakeFoundationModelsSessionDriver()
-        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: nil)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: "")]))
         let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
         let window = singleUnitWindow(0)
         let generationRecord = makeGenerationRecord(windows: [window])
@@ -146,6 +146,61 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
 
         XCTAssertEqual(analysis.items[0].fidelity, .uncertain)
         XCTAssertEqual(analysis.items[0].uncertaintyNote, "Notation was normalized from spoken description.")
+    }
+
+    // MARK: - Required uncertaintyNote semantics (schema field is a
+    // required, non-optional String — never an escape hatch to omit it)
+
+    private func mapSingleItem(_ dto: AppleNoteItemDTO) async throws -> LectureNoteItem {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueue(AppleNoteItemsDTO(items: [dto]))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+        let analysis = try await generator.analyzeWindow(units: [unit(0)], window: window, generation: generationRecord)
+        return analysis.items[0]
+    }
+
+    func testReconstructedWithNonEmptyUncertaintyNoteIsAccepted() async throws {
+        let item = try await mapSingleItem(makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: "equation was reformatted from spoken description"))
+        XCTAssertEqual(item.fidelity, .reconstructed)
+        XCTAssertEqual(item.uncertaintyNote, "equation was reformatted from spoken description")
+    }
+
+    func testUncertainWithNonEmptyUncertaintyNoteIsAccepted() async throws {
+        let item = try await mapSingleItem(makeItemDTO(fidelity: "uncertain", first: 0, uncertaintyNote: "instructor's wording was ambiguous"))
+        XCTAssertEqual(item.fidelity, .uncertain)
+        XCTAssertEqual(item.uncertaintyNote, "instructor's wording was ambiguous")
+    }
+
+    func testReconstructedWithEmptyUncertaintyNoteIsRejected() async throws {
+        do {
+            _ = try await mapSingleItem(makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: ""))
+            XCTFail("expected rejection for reconstructed with an empty uncertainty note")
+        } catch let error as FoundationModelsNotesBackendError {
+            guard case .malformedResponse = error else {
+                XCTFail("expected .malformedResponse, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testUncertainWithWhitespaceOnlyUncertaintyNoteIsRejected() async throws {
+        do {
+            _ = try await mapSingleItem(makeItemDTO(fidelity: "uncertain", first: 0, uncertaintyNote: "   "))
+            XCTFail("expected rejection for uncertain with a whitespace-only uncertainty note")
+        } catch let error as FoundationModelsNotesBackendError {
+            guard case .malformedResponse = error else {
+                XCTFail("expected .malformedResponse, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testTranscriptSupportedWithEmptyUncertaintyNoteMapsToDomainNil() async throws {
+        let item = try await mapSingleItem(makeItemDTO(fidelity: "transcriptSupported", first: 0, uncertaintyNote: ""))
+        XCTAssertEqual(item.fidelity, .transcriptSupported)
+        XCTAssertNil(item.uncertaintyNote)
     }
 
     func testAnalyzeWindowCancellationCommitsNoResult() async throws {

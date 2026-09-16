@@ -118,7 +118,7 @@ nonisolated struct FoundationModelsResponseReserves: Sendable, Equatable {
 /// meant to be brief.
 nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating, NewLectureNotesGenerationAvailabilityChecking {
     static let analysisInstructions = """
-    You write grounded technical college-lecture notes from ONLY the numbered transcript lines given, formatted "[sequenceNumber] text". Preserve concepts, definitions, explanations, formulas, code, examples, warnings, and instructor emphasis; do not reduce to a generic summary. Every item's sourceReferences must use only sequenceNumber values that appear in the given lines — never invent, guess, or reuse numbers from outside them. Use fidelity "transcriptSupported" only when directly supported; use "reconstructed" for normalized notation/code/equations, or "uncertain" for genuinely ambiguous reconstructions, and give a short uncertaintyNote for either.
+    You write grounded technical college-lecture notes from ONLY the numbered transcript lines given, formatted "[sequenceNumber] text". Preserve concepts, definitions, explanations, formulas, code, examples, warnings, and instructor emphasis; do not reduce to a generic summary. Every item's sourceReferences must use only sequenceNumber values that appear in the given lines — never invent, guess, or reuse numbers from outside them. Use fidelity "transcriptSupported" only when directly supported, "reconstructed" for normalized notation/code/equations, or "uncertain" for genuinely ambiguous reconstructions. Every item must populate uncertaintyNote: an empty string for transcriptSupported; for reconstructed, briefly state what was reconstructed or normalized; for uncertain, briefly state the ambiguity.
     """
 
     /// Used only to condense material for the short document overview —
@@ -640,10 +640,19 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         guard let fidelity = LectureNoteContentFidelity(rawValue: dto.fidelity) else {
             throw FoundationModelsNotesBackendError.malformedResponse("unrecognized fidelity \(dto.fidelity)")
         }
-        if fidelity != .transcriptSupported {
-            guard let note = dto.uncertaintyNote, !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let trimmedUncertaintyNote = dto.uncertaintyNote.trimmingCharacters(in: .whitespacesAndNewlines)
+        let uncertaintyNote: String?
+        if fidelity == .transcriptSupported {
+            // Never required; the schema's documented empty-string
+            // convention for this case maps to domain `nil` rather than
+            // being stored as an empty string. Never forced to `nil` if
+            // the model volunteered a non-empty note anyway.
+            uncertaintyNote = trimmedUncertaintyNote.isEmpty ? nil : dto.uncertaintyNote
+        } else {
+            guard !trimmedUncertaintyNote.isEmpty else {
                 throw FoundationModelsNotesBackendError.malformedResponse("reconstructed or uncertain item omitted uncertainty context")
             }
+            uncertaintyNote = dto.uncertaintyNote
         }
         return LectureNoteItem(
             kind: kind,
@@ -651,7 +660,7 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
             body: dto.body,
             fidelity: fidelity,
             sourceReferences: references,
-            uncertaintyNote: dto.uncertaintyNote
+            uncertaintyNote: uncertaintyNote
         )
     }
 
@@ -722,7 +731,12 @@ struct AppleNoteItemDTO {
     @Guide(.anyOf(FoundationModelsNoteVocabulary.fidelities))
     var fidelity: String
     var sourceReferences: [AppleSourceReferenceDTO]
-    var uncertaintyNote: String?
+    /// Required (not optional) so guided generation cannot simply omit it
+    /// for reconstructed/uncertain content — `mapItem` still independently
+    /// enforces non-emptiness for those fidelities; this only removes the
+    /// schema-level escape hatch of leaving the field out entirely.
+    @Guide(description: "Empty string for transcriptSupported. For reconstructed, briefly state what notation/code/equation/representation was reconstructed or normalized from the transcript. For uncertain, briefly state the ambiguity.")
+    var uncertaintyNote: String
 }
 
 /// Used for analysis and reduction, where the model genuinely produces
