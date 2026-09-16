@@ -36,6 +36,13 @@ nonisolated struct NotesArtifactPaths: Sendable, Equatable {
     let generationRecordURL: URL
     let windowAnalysesDirectory: URL
     let documentURL: URL
+    /// The advisory, mutable notes-generation operation-state record for
+    /// this generation (see `NotesGenerationOperationState`) — the one
+    /// artifact in this subtree that is overwritten in place rather than
+    /// committed once. Lives directly under `generationDirectory`, so it
+    /// shares that directory's ancestry-safety checks with every canonical
+    /// artifact here.
+    let operationStateURL: URL
 
     /// The full root-to-leaf ancestor chain notes persistence owns for
     /// this generation, in order — every level a path-safety check must
@@ -76,7 +83,8 @@ nonisolated struct NotesArtifactPaths: Sendable, Equatable {
             generationDirectory: generationDirectory,
             generationRecordURL: generationDirectory.appendingPathComponent("generation.json"),
             windowAnalysesDirectory: generationDirectory.appendingPathComponent("window_analyses", isDirectory: true),
-            documentURL: generationDirectory.appendingPathComponent("document.json")
+            documentURL: generationDirectory.appendingPathComponent("document.json"),
+            operationStateURL: generationDirectory.appendingPathComponent("operation-state.json")
         )
     }
 
