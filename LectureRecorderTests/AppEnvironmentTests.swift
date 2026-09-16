@@ -13,7 +13,7 @@ import XCTest
 /// deliberately avoids.
 @MainActor
 final class AppEnvironmentTests: XCTestCase {
-    func testExactlyOneSharedCatalogAndTranscriptionServiceInstance() {
+    func testExactlyOneSharedCatalogTranscriptionAndNotesServiceInstance() {
         let environment = AppEnvironment()
 
         // Both are `let` properties assigned exactly once in `init` — this
@@ -26,6 +26,10 @@ final class AppEnvironmentTests: XCTestCase {
         let serviceA = environment.completedSessionTranscriptionService
         let serviceB = environment.completedSessionTranscriptionService
         XCTAssertTrue(serviceA === serviceB)
+
+        let notesServiceA = environment.lectureNotesGenerationService
+        let notesServiceB = environment.lectureNotesGenerationService
+        XCTAssertTrue(notesServiceA === notesServiceB)
     }
 
     /// This does **not** prove `CompletedSessionTranscriptionService` reads

@@ -1,5 +1,20 @@
 # Building LectureRecorder
 
+## Development Notes API configuration
+
+Real Notes generation uses the OpenAI Responses API with model
+`gpt-5.6-sol`. Provide the development credential to the LectureRecorder app
+process as the `OPENAI_API_KEY` environment variable (for example, in the
+active Xcode scheme's Run environment). An unset or empty value causes an
+explicit configuration error when a user starts Notes generation.
+
+LectureRecorder does not persist this credential, copy it into Notes
+artifacts, or read it until an explicit Generate, Continue, or Retry operation
+reaches the provider backend. Do not add the credential to a source-controlled
+scheme, configuration file, or generated file. T5-C intentionally has no
+Keychain integration. Responses API requests explicitly disable API-side
+response storage with `store: false`.
+
 ## First build from a clean checkout
 
 The native Whisper dependency is intentionally generated locally and is not
