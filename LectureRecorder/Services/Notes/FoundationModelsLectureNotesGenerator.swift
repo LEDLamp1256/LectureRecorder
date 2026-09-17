@@ -117,6 +117,14 @@ nonisolated struct FoundationModelsResponseReserves: Sendable, Equatable {
 /// intentionally goes through lossy hierarchical reduction, since it is
 /// meant to be brief.
 nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating, NewLectureNotesGenerationAvailabilityChecking {
+    private static let maximumGeneratedOutputAttempts = 2
+
+    private struct SectionPlanRequest {
+        var batch: [LectureNoteItem]
+        var prompt: String
+        var schema: GenerationSchema
+    }
+
     static let analysisInstructions = """
     You write grounded technical college-lecture notes from ONLY the numbered transcript lines given, formatted "[sequenceNumber] text". Preserve concepts, definitions, explanations, formulas, code, examples, warnings, and instructor emphasis; do not reduce to a generic summary. Every item's sourceReferences must use only sequenceNumber values that appear in the given lines — never invent, guess, or reuse numbers from outside them. Use fidelity "transcriptSupported" only when directly supported, "reconstructed" for normalized notation/code/equations, or "uncertain" for genuinely ambiguous reconstructions. Every item must populate uncertaintyNote: an empty string for transcriptSupported; for reconstructed, briefly state what was reconstructed or normalized; for uncertain, briefly state the ambiguity.
     """
@@ -211,16 +219,25 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
             throw FoundationModelsNotesBackendError.contextBudgetExceeded("\(FoundationModelsCallStage.windowAnalysis.description) (window #\(window.windowIndex))")
         }
         let allowedSequences = Set(units.map(\.sequenceNumber))
-        let dto = try await sessionDriver.respond(
-            instructions: Self.analysisInstructions,
-            prompt: prompt,
-            generating: AppleNoteItemsDTO.self
-        )
-        let items = try dto.items.map {
-            try Self.mapItem($0, sessionID: generation.sessionID, allowedSequences: allowedSequences)
-        }
-        guard !items.isEmpty else {
-            throw FoundationModelsNotesBackendError.malformedResponse("window analysis contained no note items")
+        let items: [LectureNoteItem] = try await withGeneratedOutputRetry {
+            let dto = try await sessionDriver.respond(
+                instructions: Self.analysisInstructions,
+                prompt: prompt,
+                generating: AppleNoteItemsDTO.self
+            )
+            let mapped = try dto.items.map {
+                try Self.mapItem(
+                    $0,
+                    sessionID: generation.sessionID,
+                    allowedSequences: allowedSequences
+                )
+            }
+            guard !mapped.isEmpty else {
+                throw FoundationModelsNotesBackendError.malformedResponse(
+                    "window analysis contained no note items"
+                )
+            }
+            return mapped
         }
         return LectureNotesWindowAnalysis(
             generationID: generation.generationID,
@@ -301,6 +318,32 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         }
     }
 
+    private func withGeneratedOutputRetry<Output>(
+        _ operation: () async throws -> Output
+    ) async throws -> Output {
+        for attempt in 1...Self.maximumGeneratedOutputAttempts {
+            try Task.checkCancellation()
+            do {
+                return try await operation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as FoundationModelsNotesBackendError {
+                let isRetryable: Bool
+                switch error {
+                case .malformedResponse, .invalidSourceReference:
+                    isRetryable = true
+                case .incompatibleProvenance, .contextBudgetExceeded:
+                    isRetryable = false
+                }
+                guard attempt < Self.maximumGeneratedOutputAttempts, isRetryable else {
+                    throw error
+                }
+                try Task.checkCancellation()
+            }
+        }
+        preconditionFailure("generated-output retry loop exhausted without returning or throwing")
+    }
+
     // MARK: - Detailed section planning (structurally lossless)
 
     /// Packs `allItems` into context-safe batches, asks the model only how
@@ -310,24 +353,28 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
     /// slices of the original `allItems` — so section content is exactly
     /// the original items, never a model reconstruction of them.
     private func generateDetailedSections(from allItems: [LectureNoteItem]) async throws -> [LectureNoteSection] {
-        let batches = try await makeContextSafeBatches(
-            allItems,
-            instructions: Self.detailedSectionInstructions,
-            generating: AppleSectionPlanDTO.self,
-            stage: .sectionPlan,
-            encode: Self.encodeIndexedItemsPrompt
-        )
+        let requests = try await makeContextSafeSectionPlanRequests(allItems)
 
         var sections: [LectureNoteSection] = []
-        for batch in batches {
+        for request in requests {
             try Task.checkCancellation()
-            let prompt = Self.encodeIndexedItemsPrompt(batch)
-            let plan = try await sessionDriver.respond(
-                instructions: Self.detailedSectionInstructions,
-                prompt: prompt,
-                generating: AppleSectionPlanDTO.self
-            )
-            sections.append(contentsOf: try Self.assembleSections(from: plan, originalBatch: batch))
+            let plannedSections: [LectureNoteSection] = try await withGeneratedOutputRetry {
+                let generated = try await sessionDriver.respond(
+                    instructions: Self.detailedSectionInstructions,
+                    prompt: request.prompt,
+                    schema: request.schema
+                )
+                let plan: AppleSectionPlanDTO
+                do {
+                    plan = try AppleSectionPlanDTO(generated)
+                } catch {
+                    throw FoundationModelsNotesBackendError.malformedResponse(
+                        "could not decode section plan: \(error.localizedDescription)"
+                    )
+                }
+                return try Self.assembleSections(from: plan, originalBatch: request.batch)
+            }
+            sections.append(contentsOf: plannedSections)
         }
         return sections
     }
@@ -398,16 +445,18 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
 
         try Task.checkCancellation()
         let prompt = Self.encodeItemsPrompt(currentItems)
-        let dto = try await sessionDriver.respond(
-            instructions: Self.overviewInstructions,
-            prompt: prompt,
-            generating: AppleOverviewDTO.self
-        )
-        let overview = dto.overview.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !overview.isEmpty else {
-            throw FoundationModelsNotesBackendError.malformedResponse("overview was empty")
+        return try await withGeneratedOutputRetry {
+            let dto = try await sessionDriver.respond(
+                instructions: Self.overviewInstructions,
+                prompt: prompt,
+                generating: AppleOverviewDTO.self
+            )
+            let overview = dto.overview.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !overview.isEmpty else {
+                throw FoundationModelsNotesBackendError.malformedResponse("overview was empty")
+            }
+            return overview
         }
-        return overview
     }
 
     private func reduceChunks(_ chunks: [[LectureNoteItem]], sessionID: UUID) async throws -> [LectureNoteItem] {
@@ -416,16 +465,21 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
             try Task.checkCancellation()
             let allowedSequences = try Self.allowedSequences(in: chunk)
             let prompt = Self.encodeItemsPrompt(chunk)
-            let dto = try await sessionDriver.respond(
-                instructions: Self.reductionInstructions,
-                prompt: prompt,
-                generating: AppleNoteItemsDTO.self
-            )
-            let reducedItems = try dto.items.map {
-                try Self.mapItem($0, sessionID: sessionID, allowedSequences: allowedSequences)
-            }
-            guard !reducedItems.isEmpty else {
-                throw FoundationModelsNotesBackendError.malformedResponse("reduction contained no note items")
+            let reducedItems: [LectureNoteItem] = try await withGeneratedOutputRetry {
+                let dto = try await sessionDriver.respond(
+                    instructions: Self.reductionInstructions,
+                    prompt: prompt,
+                    generating: AppleNoteItemsDTO.self
+                )
+                let mapped = try dto.items.map {
+                    try Self.mapItem($0, sessionID: sessionID, allowedSequences: allowedSequences)
+                }
+                guard !mapped.isEmpty else {
+                    throw FoundationModelsNotesBackendError.malformedResponse(
+                        "reduction contained no note items"
+                    )
+                }
+                return mapped
             }
             result.append(contentsOf: reducedItems)
         }
@@ -433,6 +487,51 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
     }
 
     // MARK: - Context-safe batching
+
+    /// Produces the exact request values used for detailed-section dispatch.
+    /// Each candidate is checked with its request-specific runtime schema;
+    /// successful prompt/schema values are retained so dispatch cannot drift
+    /// from the preflighted request.
+    private func makeContextSafeSectionPlanRequests(
+        _ items: [LectureNoteItem],
+        depth: Int = 0
+    ) async throws -> [SectionPlanRequest] {
+        try Task.checkCancellation()
+        let prompt = Self.encodeIndexedItemsPrompt(items)
+        let schema = try Self.sectionPlanSchema(inputCount: items.count)
+        if await fits(
+            prompt: prompt,
+            itemCountForFallback: items.count,
+            instructions: Self.detailedSectionInstructions,
+            schema: schema,
+            stage: .sectionPlan
+        ) {
+            return [SectionPlanRequest(batch: items, prompt: prompt, schema: schema)]
+        }
+        guard items.count > 1, depth < maxReductionLevels else {
+            throw FoundationModelsNotesBackendError.contextBudgetExceeded(
+                FoundationModelsCallStage.sectionPlan.description
+            )
+        }
+        var pieces = Self.packItemsForCall(
+            items,
+            maxBytesPerChunk: maxInputBytesPerCall,
+            maxItemsPerChunk: maxItemsSafetyCapPerCall,
+            encode: Self.encodeIndexedItemsPrompt
+        )
+        if pieces.count <= 1 {
+            pieces = Self.bisect(items)
+        }
+        var result: [SectionPlanRequest] = []
+        for piece in pieces {
+            try Task.checkCancellation()
+            result.append(contentsOf: try await makeContextSafeSectionPlanRequests(
+                piece,
+                depth: depth + 1
+            ))
+        }
+        return result
+    }
 
     /// Verifies whether `items` fits `instructions`/`generating` (encoded
     /// via `encode`) as ONE request first — preferring a real token-count
@@ -571,6 +670,26 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         return prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
     }
 
+    /// Runtime-schema equivalent used by detailed section planning. The
+    /// exact schema passed here is retained with the successful request and
+    /// reused for dispatch.
+    private func fits(
+        prompt: String,
+        itemCountForFallback: Int,
+        instructions: String,
+        schema: GenerationSchema,
+        stage: FoundationModelsCallStage
+    ) async -> Bool {
+        if let inputTokens = await sessionDriver.estimatedTokenCount(
+            instructions: instructions,
+            prompt: prompt,
+            schema: schema
+        ) {
+            return inputTokens + responseReserves.reserve(for: stage) <= sessionDriver.contextTokenBudget
+        }
+        return prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
+    }
+
     // MARK: - Prompt encoding
 
     private static func encodeUnitsPrompt(_ units: [NotesTranscriptSourceUnit]) -> String {
@@ -608,6 +727,48 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
             let uncertainty = item.uncertaintyNote.map { " {uncertainty: \($0)}" } ?? ""
             return "[\(index)] (\(item.kind.rawValue)/\(item.fidelity.rawValue)) \(title)\(item.body)\(uncertainty)"
         }.joined(separator: "\n")
+    }
+
+    static func sectionPlanSchema(inputCount: Int) throws -> GenerationSchema {
+        guard inputCount > 0 else {
+            throw FoundationModelsNotesBackendError.malformedResponse(
+                "a request-specific section-plan schema requires at least one input item"
+            )
+        }
+        do {
+            let itemIndex = DynamicGenerationSchema(
+                type: Int.self,
+                guides: [.range(0...(inputCount - 1))]
+            )
+            let section = DynamicGenerationSchema(
+                name: "AppleSectionRange",
+                properties: [
+                    .init(name: "heading", schema: DynamicGenerationSchema(type: String.self)),
+                    .init(name: "firstItemIndex", schema: itemIndex),
+                    .init(name: "lastItemIndex", schema: itemIndex)
+                ]
+            )
+            let root = DynamicGenerationSchema(
+                name: "AppleSectionPlan",
+                properties: [
+                    .init(
+                        name: "sections",
+                        schema: DynamicGenerationSchema(
+                            arrayOf: section,
+                            minimumElements: 1,
+                            maximumElements: inputCount
+                        )
+                    )
+                ]
+            )
+            return try GenerationSchema(root: root, dependencies: [])
+        } catch let error as FoundationModelsNotesBackendError {
+            throw error
+        } catch {
+            throw FoundationModelsNotesBackendError.malformedResponse(
+                "could not construct the request-specific section-plan schema: \(error.localizedDescription)"
+            )
+        }
     }
 
     // MARK: - Response validation/mapping

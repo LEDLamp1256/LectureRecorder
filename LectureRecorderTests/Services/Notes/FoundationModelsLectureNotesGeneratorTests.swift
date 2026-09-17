@@ -73,6 +73,47 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         AppleSectionRangeDTO(heading: heading, firstItemIndex: first, lastItemIndex: last)
     }
 
+    private func assertSectionPlanIndexBounds(
+        _ request: FakeFoundationModelsSchemaRequest,
+        inputCount: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(request.schemaDescription.utf8)) as? [String: Any],
+            file: file,
+            line: line
+        )
+        let properties = try XCTUnwrap(object["properties"] as? [String: Any], file: file, line: line)
+        let sections = try XCTUnwrap(properties["sections"] as? [String: Any], file: file, line: line)
+        XCTAssertEqual((sections["minItems"] as? NSNumber)?.intValue, 1, file: file, line: line)
+        XCTAssertEqual((sections["maxItems"] as? NSNumber)?.intValue, inputCount, file: file, line: line)
+        let itemReference = try XCTUnwrap(sections["items"] as? [String: Any], file: file, line: line)
+        let section: [String: Any]
+        if let reference = itemReference["$ref"] as? String {
+            let name = String(reference.split(separator: "/").last ?? "")
+            let definitions = try XCTUnwrap(object["$defs"] as? [String: Any], file: file, line: line)
+            section = try XCTUnwrap(definitions[name] as? [String: Any], file: file, line: line)
+        } else {
+            section = itemReference
+        }
+        let sectionProperties = try XCTUnwrap(
+            section["properties"] as? [String: Any],
+            file: file,
+            line: line
+        )
+        for key in ["firstItemIndex", "lastItemIndex"] {
+            let index = try XCTUnwrap(sectionProperties[key] as? [String: Any], file: file, line: line)
+            XCTAssertEqual((index["minimum"] as? NSNumber)?.intValue, 0, file: file, line: line)
+            XCTAssertEqual(
+                (index["maximum"] as? NSNumber)?.intValue,
+                inputCount - 1,
+                file: file,
+                line: line
+            )
+        }
+    }
+
     private func singleUnitWindow(_ sequence: Int) -> NotesInputWindow {
         NotesInputWindow(windowIndex: sequence, firstSequenceNumber: sequence, lastSequenceNumber: sequence, unitCount: 1, isOversizedSingleUnit: false)
     }
@@ -103,6 +144,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
     func testAnalyzeWindowRejectsOutOfRangeSourceReference() async throws {
         let driver = FakeFoundationModelsSessionDriver()
         driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(first: 99)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(first: 99)]))
         let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
         let window = singleUnitWindow(0)
         let generationRecord = makeGenerationRecord(windows: [window])
@@ -118,6 +160,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
     func testAnalyzeWindowRequiresUncertaintyNoteForNonTranscriptSupportedFidelity() async throws {
         let driver = FakeFoundationModelsSessionDriver()
         driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: "")]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(fidelity: "reconstructed", first: 0, uncertaintyNote: "")]))
         let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
         let window = singleUnitWindow(0)
         let generationRecord = makeGenerationRecord(windows: [window])
@@ -131,6 +174,92 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
                 return
             }
         }
+    }
+
+    func testAnalyzeWindowRetriesMissingUncertaintyWithExactRequestAndUsesOnlyValidAttempt() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueue(AppleNoteItemsDTO(items: [
+            makeItemDTO(
+                body: "Discarded malformed content.",
+                fidelity: "reconstructed",
+                first: 0,
+                uncertaintyNote: " "
+            )
+        ]))
+        driver.enqueue(AppleNoteItemsDTO(items: [
+            makeItemDTO(
+                body: "Valid grounded content.",
+                fidelity: "reconstructed",
+                first: 0,
+                uncertaintyNote: "Equation notation was normalized from speech."
+            )
+        ]))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        let analysis = try await generator.analyzeWindow(
+            units: [unit(0)], window: window, generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.callCount, 2)
+        XCTAssertEqual(driver.tokenCountCallCount, 1)
+        XCTAssertEqual(driver.capturedPrompts[0].instructions, driver.capturedPrompts[1].instructions)
+        XCTAssertEqual(driver.capturedPrompts[0].prompt, driver.capturedPrompts[1].prompt)
+        XCTAssertEqual(driver.capturedResponseTypes[0], driver.capturedResponseTypes[1])
+        XCTAssertEqual(analysis.items.map(\.body), ["Valid grounded content."])
+        XCTAssertEqual(
+            analysis.items[0].uncertaintyNote,
+            "Equation notation was normalized from speech."
+        )
+        XCTAssertEqual(
+            analysis.items[0].sourceReferences,
+            [NotesSourceReference(sessionID: generationRecord.sessionID, sequenceNumber: 0)]
+        )
+    }
+
+    func testAnalyzeWindowRetriesInvalidGeneratedSourceReferenceAndUsesOnlyValidEvidence() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(body: "Invented evidence.", first: 99)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(body: "Valid evidence.", first: 0)]))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        let analysis = try await generator.analyzeWindow(
+            units: [unit(0)], window: window, generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.callCount, 2)
+        XCTAssertEqual(analysis.items.map(\.body), ["Valid evidence."])
+        XCTAssertEqual(
+            analysis.items[0].sourceReferences,
+            [NotesSourceReference(sessionID: generationRecord.sessionID, sequenceNumber: 0)]
+        )
+    }
+
+    func testAnalyzeWindowRetryExhaustionReturnsFinalTypedError() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(first: 99)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [
+            makeItemDTO(fidelity: "uncertain", first: 0, uncertaintyNote: " ")
+        ]))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        do {
+            _ = try await generator.analyzeWindow(
+                units: [unit(0)], window: window, generation: generationRecord
+            )
+            XCTFail("expected retry exhaustion")
+        } catch {
+            XCTAssertEqual(
+                error as? FoundationModelsNotesBackendError,
+                .malformedResponse("reconstructed or uncertain item omitted uncertainty context")
+            )
+        }
+        XCTAssertEqual(driver.callCount, 2)
     }
 
     func testFidelityAndUncertaintyNoteSurviveMapping() async throws {
@@ -153,6 +282,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
 
     private func mapSingleItem(_ dto: AppleNoteItemDTO) async throws -> LectureNoteItem {
         let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueue(AppleNoteItemsDTO(items: [dto]))
         driver.enqueue(AppleNoteItemsDTO(items: [dto]))
         let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
         let window = singleUnitWindow(0)
@@ -220,6 +350,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         } catch {
             XCTAssertTrue(error is CancellationError)
         }
+        XCTAssertEqual(driver.callCount, 1)
     }
 
     /// A window whose units cannot be made to fit the local context budget
@@ -337,6 +468,126 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         XCTAssertEqual(document.sections.count, 1)
         XCTAssertEqual(document.sections[0].heading, "Section")
         XCTAssertEqual(document.sections[0].items, analysis0.items, "the section's items must be exactly the original items, never reconstructed")
+    }
+
+    func testSectionPlanRuntimeSchemaBoundsMatchBatchAndExactPreflight() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        let sessionID = UUID()
+        let windows = (0..<3).map { singleUnitWindow($0) }
+        let generationRecord = makeGenerationRecord(sessionID: sessionID, windows: windows)
+        let analyses = (0..<3).map {
+            makeAnalysis(
+                windowIndex: $0,
+                sessionID: sessionID,
+                generationID: generationRecord.generationID,
+                fingerprint: generationRecord.transcriptFingerprint,
+                sequenceNumber: $0
+            )
+        }
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("All", 0, 2)]))
+        driver.enqueue(AppleOverviewDTO(overview: "Overview."))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+
+        _ = try await generator.synthesize(analyses: analyses, generation: generationRecord)
+
+        XCTAssertEqual(driver.capturedSchemaPreflights.count, 1)
+        XCTAssertEqual(driver.capturedSchemaResponses.count, 1)
+        let preflight = try XCTUnwrap(driver.capturedSchemaPreflights.first)
+        let dispatch = try XCTUnwrap(driver.capturedSchemaResponses.first)
+        XCTAssertEqual(dispatch, preflight)
+        XCTAssertEqual(dispatch.instructions, FoundationModelsLectureNotesGenerator.detailedSectionInstructions)
+        XCTAssertEqual(dispatch.prompt, driver.capturedPrompts[0].prompt)
+        try assertSectionPlanIndexBounds(dispatch, inputCount: 3)
+    }
+
+    func testMalformedSectionPlanRetriesBeforeAppendingAnySections() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        let sessionID = UUID()
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(sessionID: sessionID, windows: [window])
+        let analysis0 = makeAnalysis(
+            windowIndex: 0,
+            sessionID: sessionID,
+            generationID: generationRecord.generationID,
+            fingerprint: generationRecord.transcriptFingerprint,
+            sequenceNumber: 0
+        )
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange(" ", 0, 0)]))
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Valid section", 0, 0)]))
+        driver.enqueue(AppleOverviewDTO(overview: "Overview."))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+
+        let document = try await generator.synthesize(
+            analyses: [analysis0], generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.callCount, 3)
+        XCTAssertEqual(driver.capturedPrompts[0].instructions, driver.capturedPrompts[1].instructions)
+        XCTAssertEqual(driver.capturedPrompts[0].prompt, driver.capturedPrompts[1].prompt)
+        XCTAssertEqual(driver.capturedResponseTypes[0], driver.capturedResponseTypes[1])
+        XCTAssertEqual(driver.capturedSchemaPreflights.count, 1)
+        XCTAssertEqual(driver.capturedSchemaResponses.count, 2)
+        XCTAssertEqual(driver.capturedSchemaResponses[0], driver.capturedSchemaResponses[1])
+        XCTAssertEqual(driver.capturedSchemaResponses[0], driver.capturedSchemaPreflights[0])
+        try assertSectionPlanIndexBounds(driver.capturedSchemaResponses[0], inputCount: 1)
+        XCTAssertEqual(document.sections.map(\.heading), ["Valid section"])
+        XCTAssertEqual(document.sections[0].items, analysis0.items)
+    }
+
+    func testMalformedGeneratedSectionContentRetriesThenDecodesValidPlan() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        let sessionID = UUID()
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(sessionID: sessionID, windows: [window])
+        let analysis0 = makeAnalysis(
+            windowIndex: 0,
+            sessionID: sessionID,
+            generationID: generationRecord.generationID,
+            fingerprint: generationRecord.transcriptFingerprint,
+            sequenceNumber: 0
+        )
+        driver.enqueue(AppleOverviewDTO(overview: "Wrong schema.").generatedContent)
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Valid section", 0, 0)]))
+        driver.enqueue(AppleOverviewDTO(overview: "Overview."))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+
+        let document = try await generator.synthesize(
+            analyses: [analysis0],
+            generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.capturedSchemaPreflights.count, 1)
+        XCTAssertEqual(driver.capturedSchemaResponses.count, 2)
+        XCTAssertEqual(driver.capturedSchemaResponses[0], driver.capturedSchemaResponses[1])
+        XCTAssertEqual(document.sections.map(\.heading), ["Valid section"])
+    }
+
+    func testEmptyOverviewRetriesAndReturnsOnlyValidOverview() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        let sessionID = UUID()
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(sessionID: sessionID, windows: [window])
+        let analysis0 = makeAnalysis(
+            windowIndex: 0,
+            sessionID: sessionID,
+            generationID: generationRecord.generationID,
+            fingerprint: generationRecord.transcriptFingerprint,
+            sequenceNumber: 0
+        )
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Section", 0, 0)]))
+        driver.enqueue(AppleOverviewDTO(overview: " "))
+        driver.enqueue(AppleOverviewDTO(overview: "Valid overview."))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+
+        let document = try await generator.synthesize(
+            analyses: [analysis0], generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.callCount, 3)
+        XCTAssertEqual(driver.capturedPrompts[1].instructions, driver.capturedPrompts[2].instructions)
+        XCTAssertEqual(driver.capturedPrompts[1].prompt, driver.capturedPrompts[2].prompt)
+        XCTAssertEqual(driver.capturedResponseTypes[1], driver.capturedResponseTypes[2])
+        XCTAssertEqual(document.overview, "Valid overview.")
     }
 
     /// 20 small window analyses exceed only the deterministic item-count
@@ -531,6 +782,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         for (description, sections) in malformedPlans {
             let driver = FakeFoundationModelsSessionDriver()
             driver.enqueue(AppleSectionPlanDTO(sections: sections))
+            driver.enqueue(AppleSectionPlanDTO(sections: sections))
             let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
             let (record, analyses) = makeFixture()
 
@@ -622,6 +874,48 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         XCTAssertEqual(driver.callCount, 4, "2 detailed-section calls + 2 reduction calls, and never a 5th (oversized) overview call")
     }
 
+    func testMalformedReductionRetriesAndPreservesExactSourceGrounding() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        let sessionID = UUID()
+        let windows = (0..<20).map { singleUnitWindow($0) }
+        let generationRecord = makeGenerationRecord(sessionID: sessionID, windows: windows)
+        let analyses = (0..<20).map {
+            makeAnalysis(
+                windowIndex: $0,
+                sessionID: sessionID,
+                generationID: generationRecord.generationID,
+                fingerprint: generationRecord.transcriptFingerprint,
+                sequenceNumber: $0
+            )
+        }
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Sec A", 0, 11)]))
+        driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Sec B", 0, 7)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(
+            body: "Discarded invalid reduction.", first: 99
+        )]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(
+            body: "Valid reduced first chunk.", first: 0, last: 1
+        )]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(
+            body: "Valid reduced second chunk.", first: 12, last: 13
+        )]))
+        driver.enqueue(AppleOverviewDTO(overview: "Grounded overview."))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+
+        let document = try await generator.synthesize(
+            analyses: analyses, generation: generationRecord
+        )
+
+        XCTAssertEqual(driver.callCount, 6)
+        XCTAssertEqual(driver.capturedPrompts[2].instructions, driver.capturedPrompts[3].instructions)
+        XCTAssertEqual(driver.capturedPrompts[2].prompt, driver.capturedPrompts[3].prompt)
+        XCTAssertEqual(driver.capturedResponseTypes[2], driver.capturedResponseTypes[3])
+        let overviewPrompt = driver.capturedPrompts[5].prompt
+        XCTAssertTrue(overviewPrompt.contains("Valid reduced first chunk."))
+        XCTAssertFalse(overviewPrompt.contains("Discarded invalid reduction."))
+        XCTAssertEqual(document.overview, "Grounded overview.")
+    }
+
     func testReductionCannotExpandSourceReferenceScope() async throws {
         let driver = FakeFoundationModelsSessionDriver()
         let sessionID = UUID()
@@ -639,6 +933,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Sec A", 0, 11)]))
         driver.enqueue(AppleSectionPlanDTO(sections: [sectionRange("Sec B", 0, 7)]))
         driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(first: 99)]))
+        driver.enqueue(AppleNoteItemsDTO(items: [makeItemDTO(first: 99)]))
         let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
 
         do {
@@ -647,6 +942,7 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? FoundationModelsNotesBackendError, .invalidSourceReference)
         }
+        XCTAssertEqual(driver.callCount, 4)
     }
 
     // MARK: - Uncertainty preservation across stages

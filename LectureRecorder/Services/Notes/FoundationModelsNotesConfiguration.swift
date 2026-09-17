@@ -6,7 +6,7 @@ import Foundation
 /// no per-request credential or endpoint: `SystemLanguageModel.default` is
 /// always the model, so there is nothing here to resolve lazily.
 nonisolated enum FoundationModelsNotesConfiguration {
-    static let recipeVersion = "t5e-apple-local-notes-v1"
+    static let recipeVersion = "t5e-apple-local-notes-v2"
     static let generatorIdentifier = "system-language-model"
     static let backendIdentifier = "apple-foundation-models"
 

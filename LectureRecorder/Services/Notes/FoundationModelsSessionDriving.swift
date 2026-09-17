@@ -30,6 +30,14 @@ nonisolated protocol FoundationModelsSessionDriving: Sendable {
         generating: Content.Type
     ) async -> Int?
 
+    /// Exact-schema variant for requests whose legal generated values depend
+    /// on runtime input cardinality.
+    func estimatedTokenCount(
+        instructions: String,
+        prompt: String,
+        schema: GenerationSchema
+    ) async -> Int?
+
     /// Runs one guided-generation request in a fresh `LanguageModelSession`
     /// (never an accumulated multi-turn conversation — every call here is
     /// independent, matching T5-E's "fresh session per call" requirement).
@@ -38,6 +46,14 @@ nonisolated protocol FoundationModelsSessionDriving: Sendable {
         prompt: String,
         generating: Content.Type
     ) async throws -> Content
+
+    /// Runs one guided request against the supplied runtime schema in a fresh
+    /// session. The caller is responsible for strictly decoding the result.
+    func respond(
+        instructions: String,
+        prompt: String,
+        schema: GenerationSchema
+    ) async throws -> GeneratedContent
 }
 
 /// Production driver. Every FoundationModels-specific detail (the real
@@ -85,6 +101,21 @@ nonisolated struct RealFoundationModelsSessionDriver: FoundationModelsSessionDri
         }
     }
 
+    func estimatedTokenCount(
+        instructions: String,
+        prompt: String,
+        schema: GenerationSchema
+    ) async -> Int? {
+        do {
+            async let instructionsTokens = model.tokenCount(for: Instructions(instructions))
+            async let promptTokens = model.tokenCount(for: prompt)
+            async let schemaTokens = model.tokenCount(for: schema)
+            return try await instructionsTokens + promptTokens + schemaTokens
+        } catch {
+            return nil
+        }
+    }
+
     func respond<Content: Generable>(
         instructions: String,
         prompt: String,
@@ -92,6 +123,16 @@ nonisolated struct RealFoundationModelsSessionDriver: FoundationModelsSessionDri
     ) async throws -> Content {
         let session = LanguageModelSession(model: model, instructions: instructions)
         let response = try await session.respond(to: prompt, generating: Content.self)
+        return response.content
+    }
+
+    func respond(
+        instructions: String,
+        prompt: String,
+        schema: GenerationSchema
+    ) async throws -> GeneratedContent {
+        let session = LanguageModelSession(model: model, instructions: instructions)
+        let response = try await session.respond(to: prompt, schema: schema)
         return response.content
     }
 
