@@ -618,34 +618,14 @@ final class LectureSummaryGenerationService: ObservableObject {
             && source.sourceNotesDocumentFingerprint == generation.sourceNotesDocumentFingerprint
     }
 
-    /// Whether a thrown `sourceLoader.loadSourceSnapshot` error means the
-    /// pinned Notes source is genuinely not a valid/current Summary source
-    /// (`.sourceInvalid` — the semantic `LectureSummarySourceError` cases
-    /// other than `.sourceLoadFailed`), or is an ordinary operational
-    /// failure that says nothing about source validity (`.operational` —
-    /// `.sourceLoadFailed`, or any error `LectureSummarySourceLoader` did
-    /// not itself classify). Only `.sourceInvalid` may ever be reported as
+    /// Only `.sourceInvalid` may ever be reported as
     /// `.staleSource`/`.sourceNotesUnavailable`; `.operational` always
     /// surfaces as an ordinary `.failed(description:)`, never source
-    /// staleness.
-    private enum SourceLoadFailureKind {
-        case sourceInvalid(description: String)
-        case operational(description: String)
-    }
-
-    private func classifySourceLoadFailure(_ error: Error) -> SourceLoadFailureKind {
-        guard let sourceError = error as? LectureSummarySourceError else {
-            return .operational(description: error.localizedDescription)
-        }
-        switch sourceError {
-        case .sourceLoadFailed:
-            return .operational(description: sourceError.localizedDescription)
-        case .missingGeneration, .incompleteGeneration, .notesValidationFailed,
-             .sourceIdentityMismatch, .emptyNotesDocument, .emptySectionHeading,
-             .emptyItemBody, .duplicateItemID, .missingUncertaintyExplanation,
-             .fingerprintEncodingFailed:
-            return .sourceInvalid(description: sourceError.localizedDescription)
-        }
+    /// staleness. See `SummarySourceLoadFailureClassification`'s own header
+    /// comment — shared with `SessionSummaryPresenter` so the two layers can
+    /// never diverge on this mapping.
+    private func classifySourceLoadFailure(_ error: Error) -> SummarySourceLoadFailureClassification {
+        SummarySourceLoadFailureClassification.classify(error)
     }
 
     // MARK: - Sequential batch generation

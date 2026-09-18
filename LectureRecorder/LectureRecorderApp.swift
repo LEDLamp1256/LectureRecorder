@@ -21,9 +21,13 @@ struct LectureRecorderApp: App {
                 catalog: appDelegate.environment.completedSessionCatalog,
                 service: appDelegate.environment.completedSessionTranscriptionService,
                 notesService: appDelegate.environment.lectureNotesGenerationService,
+                summaryService: appDelegate.environment.lectureSummaryGenerationService,
                 notesStore: appDelegate.environment.notesStore,
                 notesOperationStateStore: appDelegate.environment.notesOperationStateStore,
                 notesSourceLoader: appDelegate.environment.notesTranscriptSourceLoader,
+                summaryStore: appDelegate.environment.summaryStore,
+                summaryOperationStateStore: appDelegate.environment.summaryOperationStateStore,
+                summarySourceLoader: appDelegate.environment.summarySourceLoader,
                 sessionManager: appDelegate.environment.sessionManager
             )
         }
