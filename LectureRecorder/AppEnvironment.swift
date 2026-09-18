@@ -30,6 +30,15 @@ final class AppEnvironment: ObservableObject {
     let notesStore: LectureNotesStore
     let notesOperationStateStore: LectureNotesOperationStateStore
     let notesTranscriptSourceLoader: NotesTranscriptSourceLoader
+    let lectureSummaryGenerationService: LectureSummaryGenerationService
+    /// The same read-only Summary durable-state collaborators wired into
+    /// `lectureSummaryGenerationService` above, exposed separately for the
+    /// same reason `notesStore`/`notesOperationStateStore` are: a future
+    /// Summary presenter can perform its own read-only durable-state
+    /// reconstruction without the generation service needing to expose its
+    /// private stores.
+    let summaryStore: LectureSummaryStore
+    let summaryOperationStateStore: LectureSummaryOperationStateStore
 
     init() {
         let store = SessionStore()
@@ -90,6 +99,30 @@ final class AppEnvironment: ObservableObject {
             newGenerationAvailabilityChecker: notesGeneratorRouter,
             windowBudget: notesWindowBudget,
             generationProvenance: FoundationModelsNotesConfiguration.generationProvenance
+        )
+
+        // T5-F3A: Summary orchestration. Deliberately its own independent
+        // admission slot and generator — never routed through, or gated by,
+        // `lectureNotesGenerationService` above (see
+        // `LectureSummaryGenerationService`'s own header comment). Apple
+        // Foundation Models is the only Summary backend F1/F2 defines; there
+        // is no OpenAI equivalent to route between here.
+        let summaryStore = LectureSummaryStore()
+        let summaryOperationStateStore = LectureSummaryOperationStateStore()
+        let summarySourceLoader = LectureSummarySourceLoader(
+            notesStore: notesStore,
+            transcriptLoader: notesTranscriptSourceLoader
+        )
+        let summaryGenerator = FoundationModelsLectureSummaryGenerator()
+        self.summaryStore = summaryStore
+        self.summaryOperationStateStore = summaryOperationStateStore
+        self.lectureSummaryGenerationService = LectureSummaryGenerationService(
+            sourceLoader: summarySourceLoader,
+            summaryStore: summaryStore,
+            operationStateStore: summaryOperationStateStore,
+            generator: summaryGenerator,
+            newGenerationAvailabilityChecker: summaryGenerator,
+            generationProvenance: FoundationModelsSummaryConfiguration.generationProvenance
         )
     }
 }
