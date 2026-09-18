@@ -144,6 +144,37 @@ nonisolated protocol LectureSummarySourceLoading: Sendable {
     func loadSourceSnapshot(sessionID: UUID, notesGenerationID: UUID) async throws -> LectureSummarySourceSnapshot
 }
 
+/// Whether a thrown `LectureSummarySourceLoading.loadSourceSnapshot` error
+/// means the referenced Notes generation is genuinely not a valid/current
+/// Summary source (`.sourceInvalid` — every `LectureSummarySourceError` case
+/// other than `.sourceLoadFailed`), or is an ordinary operational failure
+/// that says nothing about source validity (`.operational` —
+/// `.sourceLoadFailed`, or any error a `LectureSummarySourceLoading`
+/// implementation did not itself classify). Shared by
+/// `LectureSummaryGenerationService` and `SessionSummaryPresenter` so the
+/// live orchestration path and the read-only durable-state presenter can
+/// never diverge on which failures mean staleness/unavailability versus an
+/// ordinary I/O problem.
+nonisolated enum SummarySourceLoadFailureClassification: Equatable, Sendable {
+    case sourceInvalid(description: String)
+    case operational(description: String)
+
+    static func classify(_ error: Error) -> SummarySourceLoadFailureClassification {
+        guard let sourceError = error as? LectureSummarySourceError else {
+            return .operational(description: error.localizedDescription)
+        }
+        switch sourceError {
+        case .sourceLoadFailed:
+            return .operational(description: sourceError.localizedDescription)
+        case .missingGeneration, .incompleteGeneration, .notesValidationFailed,
+             .sourceIdentityMismatch, .emptyNotesDocument, .emptySectionHeading,
+             .emptyItemBody, .duplicateItemID, .missingUncertaintyExplanation,
+             .fingerprintEncodingFailed:
+            return .sourceInvalid(description: sourceError.localizedDescription)
+        }
+    }
+}
+
 /// Loads only committed Notes artifacts and delegates transcript loading and
 /// Notes validation to the established T5-E boundaries.
 nonisolated struct LectureSummarySourceLoader: LectureSummarySourceLoading {

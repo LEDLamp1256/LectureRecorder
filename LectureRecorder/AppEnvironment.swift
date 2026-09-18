@@ -39,6 +39,16 @@ final class AppEnvironment: ObservableObject {
     /// private stores.
     let summaryStore: LectureSummaryStore
     let summaryOperationStateStore: LectureSummaryOperationStateStore
+    /// The same source-loading collaborator wired into
+    /// `lectureSummaryGenerationService` above, exposed separately so
+    /// `SessionSummaryPresenter` can obtain a real, current
+    /// `LectureSummarySourceSnapshot` for an existing Summary generation's
+    /// own pinned source identity (see `SummaryGenerationRecoveryClassifier`)
+    /// without the generation service needing to expose its private
+    /// dependency. Sharing this exact instance — rather than constructing a
+    /// second one elsewhere — keeps exactly one production source-loading
+    /// configuration in play.
+    let summarySourceLoader: LectureSummarySourceLoader
 
     init() {
         let store = SessionStore()
@@ -116,6 +126,7 @@ final class AppEnvironment: ObservableObject {
         let summaryGenerator = FoundationModelsLectureSummaryGenerator()
         self.summaryStore = summaryStore
         self.summaryOperationStateStore = summaryOperationStateStore
+        self.summarySourceLoader = summarySourceLoader
         self.lectureSummaryGenerationService = LectureSummaryGenerationService(
             sourceLoader: summarySourceLoader,
             summaryStore: summaryStore,

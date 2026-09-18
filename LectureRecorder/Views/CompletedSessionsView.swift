@@ -7,9 +7,13 @@ import SwiftUI
 struct CompletedSessionsView: View {
     let service: CompletedSessionTranscriptionService
     let notesService: LectureNotesGenerationService
+    let summaryService: LectureSummaryGenerationService
     let notesStore: any LectureNotesStoring
     let notesOperationStateStore: any LectureNotesOperationStateStoring
     let notesSourceLoader: any NotesTranscriptSourceLoading
+    let summaryStore: any LectureSummaryStoring
+    let summaryOperationStateStore: any LectureSummaryOperationStateStoring
+    let summarySourceLoader: any LectureSummarySourceLoading
     @ObservedObject var sessionManager: SessionManager
     @StateObject private var presenter: CompletedSessionsListPresenter
 
@@ -17,16 +21,24 @@ struct CompletedSessionsView: View {
         catalog: CompletedSessionCatalog,
         service: CompletedSessionTranscriptionService,
         notesService: LectureNotesGenerationService,
+        summaryService: LectureSummaryGenerationService,
         notesStore: any LectureNotesStoring,
         notesOperationStateStore: any LectureNotesOperationStateStoring,
         notesSourceLoader: any NotesTranscriptSourceLoading,
+        summaryStore: any LectureSummaryStoring,
+        summaryOperationStateStore: any LectureSummaryOperationStateStoring,
+        summarySourceLoader: any LectureSummarySourceLoading,
         sessionManager: SessionManager
     ) {
         self.service = service
         self.notesService = notesService
+        self.summaryService = summaryService
         self.notesStore = notesStore
         self.notesOperationStateStore = notesOperationStateStore
         self.notesSourceLoader = notesSourceLoader
+        self.summaryStore = summaryStore
+        self.summaryOperationStateStore = summaryOperationStateStore
+        self.summarySourceLoader = summarySourceLoader
         self.sessionManager = sessionManager
         _presenter = StateObject(wrappedValue: CompletedSessionsListPresenter(catalog: catalog))
     }
@@ -71,9 +83,13 @@ struct CompletedSessionsView: View {
                     entry: selectedEntry,
                     transcriptionService: service,
                     notesService: notesService,
+                    summaryService: summaryService,
                     notesStore: notesStore,
                     notesOperationStateStore: notesOperationStateStore,
-                    notesSourceLoader: notesSourceLoader
+                    notesSourceLoader: notesSourceLoader,
+                    summaryStore: summaryStore,
+                    summaryOperationStateStore: summaryOperationStateStore,
+                    summarySourceLoader: summarySourceLoader
                 )
                 .id(selectedEntry.manifest.sessionID)
             } else {
