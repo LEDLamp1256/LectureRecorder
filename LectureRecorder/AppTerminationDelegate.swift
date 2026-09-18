@@ -42,6 +42,7 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
         // Transcribe/Continue/Retry after termination had already begun.
         environment.completedSessionTranscriptionService.beginShutdown()
         environment.lectureNotesGenerationService.beginShutdown()
+        environment.lectureSummaryGenerationService.beginShutdown()
 
         Task { @MainActor in
             // `beginShutdown()` already ran above; this call's own
@@ -49,7 +50,8 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
             // proceeds straight to the bounded wait.
             async let transcriptionShutdown = self.environment.completedSessionTranscriptionService.shutdown()
             async let notesShutdown = self.environment.lectureNotesGenerationService.shutdown()
-            _ = await (transcriptionShutdown, notesShutdown)
+            async let summaryShutdown = self.environment.lectureSummaryGenerationService.shutdown()
+            _ = await (transcriptionShutdown, notesShutdown, summaryShutdown)
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
