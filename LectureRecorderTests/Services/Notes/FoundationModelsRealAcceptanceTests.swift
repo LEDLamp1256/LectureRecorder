@@ -1,6 +1,34 @@
 import XCTest
 @testable import LectureRecorder
 
+/// Thread-safe, in-memory sink for `FoundationModelsSummaryDiagnosticEvent`s
+/// recorded during the real-acceptance run below. `print` output is not
+/// reliably captured by this Xcode/xctestrun environment's `.xcresult`, so
+/// this collector — not `print` — is what makes diagnostics reach the
+/// XCTest failure message itself.
+private final class RealAcceptanceDiagnosticCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEvents: [FoundationModelsSummaryDiagnosticEvent] = []
+
+    var events: [FoundationModelsSummaryDiagnosticEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return storedEvents
+    }
+
+    func record(_ event: FoundationModelsSummaryDiagnosticEvent) {
+        lock.lock(); defer { lock.unlock() }
+        storedEvents.append(event)
+    }
+
+    var chronologicalDescription: String {
+        let events = events
+        guard !events.isEmpty else { return "no generated-output diagnostic events were recorded" }
+        return events.enumerated().map { index, event in
+            "[\(index + 1)] stage=\(event.stage.rawValue) attempt=\(event.attempt) error=\(event.error) generatedFidelity=\(event.generatedFidelity?.rawValue ?? "n/a") requiredFloorFidelity=\(event.requiredFloorFidelity?.rawValue ?? "n/a") supportIndices=\(event.supportIndices.map(String.init(describing:)) ?? "n/a")"
+        }.joined(separator: ", ")
+    }
+}
+
 /// Opt-in real on-device Foundation Models acceptance path — disabled by
 /// default and never part of normal deterministic-suite success. Enable
 /// with:
@@ -81,5 +109,89 @@ final class FoundationModelsRealAcceptanceTests: XCTestCase {
 
         XCTAssertNoThrow(try NotesIntegrityValidator.validateCoverage(analyses: [analysis0, analysis1], generation: generationRecord, sourceSnapshot: snapshot))
         XCTAssertNoThrow(try NotesIntegrityValidator.validate(document: document, generation: generationRecord, sourceSnapshot: snapshot))
+    }
+
+    /// Narrow T5-F2 acceptance using the same opt-in local-model mechanism:
+    /// real token preflight, one small batch, final synthesis, local support
+    /// mapping, and the production Summary integrity validator.
+    func testRealLocalSummaryGenerationProducesIntegrityValidatedGroundedSummary() async throws {
+        try XCTSkipUnless(Self.isEnabled, "Opt-in only — set LECTURE_RECORDER_RUN_LOCAL_NOTES_ACCEPTANCE=1 to run against the real on-device model.")
+
+        let driver = RealFoundationModelsSessionDriver()
+        let availability = driver.availability()
+        guard case .available = availability else {
+            throw XCTSkip("Apple's on-device model is unavailable in this environment: \(availability)")
+        }
+
+        let source = try SummaryTestSupport.source()
+        let diagnostics = RealAcceptanceDiagnosticCollector()
+        let backend = FoundationModelsLectureSummaryGenerator(sessionDriver: driver) { event in
+            diagnostics.record(event)
+            // Secondary convenience only — the XCTFail below is what makes
+            // diagnostics reach the recorded .xcresult on failure.
+            print("T5-F2 Summary diagnostic: stage=\(event.stage.rawValue) attempt=\(event.attempt) error=\(event.error) generatedFidelity=\(event.generatedFidelity?.rawValue ?? "n/a") requiredFloorFidelity=\(event.requiredFloorFidelity?.rawValue ?? "n/a") supportIndices=\(event.supportIndices.map(String.init(describing:)) ?? "n/a")")
+        }
+
+        do {
+            let plan = try await backend.makePlan(for: source)
+            let generation = LectureSummaryGenerationRecord.newGeneration(
+                sessionID: source.sessionID,
+                sourceNotesGenerationID: source.sourceNotesGenerationID,
+                transcriptFingerprint: source.transcriptFingerprint,
+                sourceNotesDocumentFingerprint: source.sourceNotesDocumentFingerprint,
+                batchPlan: plan,
+                provenance: backend.provenance
+            )
+
+            var analyses: [LectureSummaryAnalysis] = []
+            for batch in plan.batches.sorted(by: { $0.batchIndex < $1.batchIndex }) {
+                analyses.append(try await backend.generateAnalysis(
+                    for: batch, generation: generation, source: source
+                ))
+            }
+            let document = try await backend.generateDocument(
+                from: analyses, generation: generation, source: source
+            )
+            XCTAssertFalse(analyses.flatMap(\.passages).isEmpty)
+            XCTAssertFalse(document.sections.isEmpty)
+            XCTAssertNoThrow(try LectureSummaryIntegrityValidator.validate(
+                document: document, generation: generation, source: source
+            ))
+
+            let firstBatch = plan.batches[0]
+            let batchIDs = Set(firstBatch.sourceItemIDs)
+            let firstBatchItems = source.sourceItems.filter { batchIDs.contains($0.item.id) }
+            let batchPrompt = FoundationModelsLectureSummaryGenerator.encodeSourceItems(firstBatchItems)
+            let batchSchema = try FoundationModelsLectureSummaryGenerator.passagesSchema(
+                inputCount: firstBatchItems.count
+            )
+            let batchTokens = await driver.estimatedTokenCount(
+                instructions: FoundationModelsLectureSummaryGenerator.batchInstructions,
+                prompt: batchPrompt,
+                schema: batchSchema
+            )
+            let carriers = analyses.sorted(by: { $0.batchIndex < $1.batchIndex }).flatMap(\.passages).map {
+                FoundationModelsSummaryCarrier(
+                    text: $0.text,
+                    supportingNoteItemIDs: $0.supportingNoteItemIDs,
+                    sourceReferences: $0.sourceReferences,
+                    fidelity: $0.fidelity,
+                    uncertaintyNote: $0.uncertaintyNote
+                )
+            }
+            let structureSchema = try FoundationModelsLectureSummaryGenerator.structureSchema(
+                inputCount: carriers.count
+            )
+            let structureTokens = await driver.estimatedTokenCount(
+                instructions: FoundationModelsLectureSummaryGenerator.finalStructureInstructions,
+                prompt: FoundationModelsLectureSummaryGenerator.encodeCarriers(carriers),
+                schema: structureSchema
+            )
+            let measuredBatchTokens = batchTokens.map(String.init) ?? "unavailable"
+            let measuredStructureTokens = structureTokens.map(String.init) ?? "unavailable"
+            print("T5-F2 Foundation Models measurements: contextSize=\(driver.contextTokenBudget), batchInputTokens=\(measuredBatchTokens), finalStructureInputTokens=\(measuredStructureTokens)")
+        } catch {
+            XCTFail("Summary generation failed: \(error). Diagnostics (chronological): \(diagnostics.chronologicalDescription)")
+        }
     }
 }

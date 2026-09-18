@@ -1,4 +1,5 @@
 import XCTest
+import FoundationModels
 @testable import LectureRecorder
 
 final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
@@ -1224,5 +1225,119 @@ final class FoundationModelsLectureNotesGeneratorTests: XCTestCase {
             XCTAssertEqual(error as? FoundationModelsNotesBackendError, .contextBudgetExceeded("detailed section planning"))
         }
         XCTAssertEqual(driver.callCount, 0)
+    }
+
+    // MARK: - Framework-level `exceededContextWindowSize` backstop
+    //
+    // Even a request that passes preflight (real-token or byte/item
+    // fallback) can still be rejected by the framework's own tokenization
+    // of the fully assembled request. This must map to the same typed
+    // `.contextBudgetExceeded` the preflight itself throws, must never be
+    // retried with the same oversized content, and must never be
+    // misclassified as malformed generated output.
+
+    func testFrameworkExceededContextWindowSizeMapsToTypedContextBudgetExceededAndIsNotRetried() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueueFailure(LanguageModelSession.GenerationError.exceededContextWindowSize(
+            .init(debugDescription: "Content contains 4091 tokens, which exceeds the maximum allowed context size of 4096")
+        ))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        do {
+            _ = try await generator.analyzeWindow(units: [unit(0)], window: window, generation: generationRecord)
+            XCTFail("expected the framework overflow to be mapped to .contextBudgetExceeded")
+        } catch {
+            guard case .contextBudgetExceeded(let stage) = error as? FoundationModelsNotesBackendError else {
+                XCTFail("expected .contextBudgetExceeded, got \(error)")
+                return
+            }
+            XCTAssertTrue(stage.contains("window analysis"))
+        }
+        XCTAssertEqual(driver.callCount, 1, "a framework-level context overflow must never be retried with the same oversized request")
+    }
+
+    /// Only `exceededContextWindowSize` is intercepted — every other
+    /// `LanguageModelSession.GenerationError` case is left exactly as the
+    /// framework threw it, out of scope for this reliability fix.
+    func testOtherFrameworkGenerationErrorsPropagateUnchanged() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.enqueueFailure(LanguageModelSession.GenerationError.guardrailViolation(
+            .init(debugDescription: "blocked by safety guardrails")
+        ))
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver)
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        do {
+            _ = try await generator.analyzeWindow(units: [unit(0)], window: window, generation: generationRecord)
+            XCTFail("expected the guardrail error to propagate")
+        } catch {
+            guard case .guardrailViolation = error as? LanguageModelSession.GenerationError else {
+                XCTFail("expected the raw framework error to propagate unchanged, got \(error)")
+                return
+            }
+        }
+        XCTAssertEqual(driver.callCount, 1)
+    }
+
+    // MARK: - Diagnostic recorder
+
+    /// Every preflight decision is reported, and a framework-level overflow
+    /// backstop is reported distinctly (`frameworkOverflow: true`) —
+    /// purely additive observability that never changes what is
+    /// fit-checked, split, retried, or dispatched.
+    func testDiagnosticRecorderReportsPreflightAndFrameworkOverflowEvents() async throws {
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.setTokenCountOverride(10)
+        driver.enqueueFailure(LanguageModelSession.GenerationError.exceededContextWindowSize(
+            .init(debugDescription: "overflow")
+        ))
+        let events = LockedBox<[FoundationModelsNotesDiagnosticEvent]>([])
+        let generator = FoundationModelsLectureNotesGenerator(sessionDriver: driver) { event in
+            events.mutate { $0.append(event) }
+        }
+        let window = singleUnitWindow(0)
+        let generationRecord = makeGenerationRecord(windows: [window])
+
+        do {
+            _ = try await generator.analyzeWindow(units: [unit(0)], window: window, generation: generationRecord)
+            XCTFail("expected a context-budget failure")
+        } catch {
+            guard case .contextBudgetExceeded = error as? FoundationModelsNotesBackendError else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+
+        let recorded = events.value
+        XCTAssertEqual(recorded.count, 2, "expected one preflight event and one framework-overflow backstop event")
+        XCTAssertEqual(recorded[0].stage, .windowAnalysis)
+        XCTAssertEqual(recorded[0].estimatedInputTokens, 10)
+        XCTAssertTrue(recorded[0].fitDirectly)
+        XCTAssertFalse(recorded[0].frameworkOverflow)
+        XCTAssertEqual(recorded[1].stage, .windowAnalysis)
+        XCTAssertTrue(recorded[1].frameworkOverflow)
+        XCTAssertEqual(recorded[1].contextLimit, driver.contextTokenBudget)
+    }
+}
+
+/// Minimal thread-safe mutable box for capturing `@Sendable` diagnostic
+/// callback output in tests, without pulling in a heavier test-support
+/// dependency for this one file.
+private final class LockedBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Value
+
+    init(_ value: Value) { storage = value }
+
+    var value: Value {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+
+    func mutate(_ body: (inout Value) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        body(&storage)
     }
 }
