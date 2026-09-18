@@ -80,25 +80,36 @@ nonisolated struct RealFoundationModelsSessionDriver: FoundationModelsSessionDri
 
     /// `SystemLanguageModel.tokenCount(for:)` is `@available(macOS 26.4, *)`
     /// — this project's macOS 26.5 deployment target is newer, so it is
-    /// unconditionally available here (no `if #available` needed). Sums the
-    /// real token cost of instructions, prompt, and the guided-generation
-    /// schema separately, since the SDK exposes no single "whole request"
-    /// overload. Any failure (including "model unavailable") is reduced to
-    /// `nil` — real token counting is a best-effort preflight, never a
-    /// requirement for `respond` itself to work.
+    /// unconditionally available here (no `if #available` needed).
+    ///
+    /// Measures the token cost of the exact `Transcript` a fresh
+    /// `LanguageModelSession(model:instructions:)` + `respond(to:...)` call
+    /// would actually dispatch — one `.instructions` entry plus one
+    /// `.prompt` entry carrying `responseFormat` — via the single
+    /// `tokenCount(for: transcriptEntries:)` overload, rather than summing
+    /// `tokenCount(for:)` over instructions/prompt/schema independently.
+    /// Tokenization is not additive across concatenated content, and the
+    /// real dispatched prompt also carries the framework's own rendering of
+    /// `responseFormat` (guided generation's default `includeSchemaInPrompt`
+    /// behavior) — a sum of three independently-tokenized pieces can
+    /// therefore substantially undercount what the framework actually
+    /// charges against `contextSize` at dispatch time, letting a request
+    /// pass preflight with response headroom to spare on paper while the
+    /// real assembled request lands far closer to the limit. Any failure
+    /// (including "model unavailable") is reduced to `nil` — real token
+    /// counting is a best-effort preflight, never a requirement for
+    /// `respond` itself to work.
     func estimatedTokenCount<Content: Generable>(
         instructions: String,
         prompt: String,
         generating: Content.Type
     ) async -> Int? {
-        do {
-            async let instructionsTokens = model.tokenCount(for: Instructions(instructions))
-            async let promptTokens = model.tokenCount(for: prompt)
-            async let schemaTokens = model.tokenCount(for: Content.generationSchema)
-            return try await instructionsTokens + promptTokens + schemaTokens
-        } catch {
-            return nil
-        }
+        await Self.assembledTokenCount(
+            model: model,
+            instructions: instructions,
+            prompt: prompt,
+            responseFormat: Transcript.ResponseFormat(type: Content.self)
+        )
     }
 
     func estimatedTokenCount(
@@ -106,11 +117,37 @@ nonisolated struct RealFoundationModelsSessionDriver: FoundationModelsSessionDri
         prompt: String,
         schema: GenerationSchema
     ) async -> Int? {
+        await Self.assembledTokenCount(
+            model: model,
+            instructions: instructions,
+            prompt: prompt,
+            responseFormat: Transcript.ResponseFormat(schema: schema)
+        )
+    }
+
+    /// Builds the same two-entry `Transcript` shape (`.instructions` +
+    /// `.prompt`) that a real `respond` call assembles internally, and asks
+    /// the model to tokenize that whole transcript in one call — the
+    /// authoritative preflight measurement, as opposed to summing
+    /// independently-tokenized parts.
+    private static func assembledTokenCount(
+        model: SystemLanguageModel,
+        instructions: String,
+        prompt: String,
+        responseFormat: Transcript.ResponseFormat
+    ) async -> Int? {
+        let entries: [Transcript.Entry] = [
+            .instructions(Transcript.Instructions(
+                segments: [.text(Transcript.TextSegment(content: instructions))],
+                toolDefinitions: []
+            )),
+            .prompt(Transcript.Prompt(
+                segments: [.text(Transcript.TextSegment(content: prompt))],
+                responseFormat: responseFormat
+            ))
+        ]
         do {
-            async let instructionsTokens = model.tokenCount(for: Instructions(instructions))
-            async let promptTokens = model.tokenCount(for: prompt)
-            async let schemaTokens = model.tokenCount(for: schema)
-            return try await instructionsTokens + promptTokens + schemaTokens
+            return try await model.tokenCount(for: entries)
         } catch {
             return nil
         }

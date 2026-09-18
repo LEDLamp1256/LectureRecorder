@@ -6,7 +6,21 @@ import Foundation
 /// no per-request credential or endpoint: `SystemLanguageModel.default` is
 /// always the model, so there is nothing here to resolve lazily.
 nonisolated enum FoundationModelsNotesConfiguration {
-    static let recipeVersion = "t5e-apple-local-notes-v2"
+    /// Bumped v2 → v3 alongside the fix for a real on-device
+    /// `exceededContextWindowSize` failure at the 4,091/4,096-token
+    /// boundary: `RealFoundationModelsSessionDriver.estimatedTokenCount`
+    /// now measures the actual assembled `Transcript` (via
+    /// `tokenCount(for: transcriptEntries:)`) instead of summing
+    /// independently-tokenized instructions/prompt/schema, and
+    /// `FoundationModelsLectureNotesGenerator` now maps a framework-level
+    /// `exceededContextWindowSize` backstop to `.contextBudgetExceeded`.
+    /// The more accurate estimate can classify a batch that previously
+    /// preflighted as "fits" as too large for the same input, which the
+    /// existing deterministic splitting/reduction paths then subdivide
+    /// further — a production batching/context-budget recipe change,
+    /// following the same v1 → v2 precedent set when per-stage response
+    /// reserves were first added.
+    static let recipeVersion = "t5e-apple-local-notes-v3"
     static let generatorIdentifier = "system-language-model"
     static let backendIdentifier = "apple-foundation-models"
 

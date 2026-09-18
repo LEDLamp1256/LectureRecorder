@@ -93,6 +93,30 @@ nonisolated struct FoundationModelsResponseReserves: Sendable, Equatable {
     }
 }
 
+/// Test/debug-only observability for one context-budget preflight decision
+/// or framework-dispatch backstop — purely additive: recording (or not
+/// recording) an event never changes what is fit-checked, split, retried,
+/// or dispatched (see `FoundationModelsLectureNotesGenerator.diagnosticRecorder`,
+/// mirroring `FoundationModelsSummaryDiagnosticEvent`'s established
+/// contract for the Summary backend). Exists so a real run can report,
+/// per logical model request, exactly which stage was involved, what input
+/// was estimated, what reserve/limit applied, and whether it fit directly
+/// or needed a smaller request — without that information ever gating
+/// control flow.
+nonisolated struct FoundationModelsNotesDiagnosticEvent: Sendable, Equatable {
+    var stage: FoundationModelsCallStage
+    /// `nil` when real token counting itself was unavailable and the
+    /// deterministic byte/item fallback decided instead.
+    var estimatedInputTokens: Int?
+    var responseReserve: Int
+    var contextLimit: Int
+    var fitDirectly: Bool
+    /// Set only when this event reports the framework's own defensive
+    /// `exceededContextWindowSize` backstop firing after a request already
+    /// passed preflight (see `FoundationModelsLectureNotesGenerator.dispatch`).
+    var frameworkOverflow: Bool = false
+}
+
 /// Apple Foundation Models adapter for the provider-neutral Notes
 /// generation protocol — the $0, on-device default backend for every
 /// brand-new generation. Performs no planning, persistence, recovery,
@@ -179,19 +203,27 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
     /// `.contextBudgetExceeded` rather than ever submitting a request
     /// known to be oversized.
     private let maxReductionLevels: Int
+    /// Nil by default. When set (tests, real-acceptance diagnostics), every
+    /// context-budget preflight decision and every framework-dispatch
+    /// `exceededContextWindowSize` backstop is reported here — never
+    /// consulted for any fit/dispatch/retry decision itself. Mirrors
+    /// `FoundationModelsLectureSummaryGenerator.diagnosticRecorder`.
+    private let diagnosticRecorder: (@Sendable (FoundationModelsNotesDiagnosticEvent) -> Void)?
 
     init(
         sessionDriver: any FoundationModelsSessionDriving = RealFoundationModelsSessionDriver(),
         responseReserves: FoundationModelsResponseReserves = .conservativeDefault,
         maxInputBytesPerCall: Int = 6_000,
         maxItemsSafetyCapPerCall: Int = 12,
-        maxReductionLevels: Int = 8
+        maxReductionLevels: Int = 8,
+        diagnosticRecorder: (@Sendable (FoundationModelsNotesDiagnosticEvent) -> Void)? = nil
     ) {
         self.sessionDriver = sessionDriver
         self.responseReserves = responseReserves
         self.maxInputBytesPerCall = maxInputBytesPerCall
         self.maxItemsSafetyCapPerCall = maxItemsSafetyCapPerCall
         self.maxReductionLevels = max(1, maxReductionLevels)
+        self.diagnosticRecorder = diagnosticRecorder
     }
 
     func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
@@ -220,10 +252,11 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         }
         let allowedSequences = Set(units.map(\.sequenceNumber))
         let items: [LectureNoteItem] = try await withGeneratedOutputRetry {
-            let dto = try await sessionDriver.respond(
+            let dto = try await dispatch(
                 instructions: Self.analysisInstructions,
                 prompt: prompt,
-                generating: AppleNoteItemsDTO.self
+                generating: AppleNoteItemsDTO.self,
+                stage: .windowAnalysis
             )
             let mapped = try dto.items.map {
                 try Self.mapItem(
@@ -344,6 +377,67 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         preconditionFailure("generated-output retry loop exhausted without returning or throwing")
     }
 
+    /// Runs one guided-generation call through `sessionDriver`, converting
+    /// the framework's own defensive `exceededContextWindowSize` runtime
+    /// error into the same typed `.contextBudgetExceeded` this backend
+    /// already throws from its own preflight — a backstop for the rare case
+    /// a request passes preflight (real-token or byte/item fallback) but
+    /// the framework's own tokenization of the fully assembled request
+    /// still rejects it. `.contextBudgetExceeded` is never retryable (see
+    /// `withGeneratedOutputRetry`), so this never resends the same
+    /// oversized request. Every other `LanguageModelSession.GenerationError`
+    /// (guardrail, unsupported language, decoding, etc.) is left exactly as
+    /// the framework threw it — out of scope for this reliability fix, and
+    /// never misclassified as malformed generated output.
+    private func dispatch<Content: Generable>(
+        instructions: String,
+        prompt: String,
+        generating: Content.Type,
+        stage: FoundationModelsCallStage
+    ) async throws -> Content {
+        do {
+            return try await sessionDriver.respond(instructions: instructions, prompt: prompt, generating: Content.self)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as LanguageModelSession.GenerationError {
+            if case .exceededContextWindowSize = error {
+                diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+                    stage: stage, estimatedInputTokens: nil,
+                    responseReserve: responseReserves.reserve(for: stage),
+                    contextLimit: sessionDriver.contextTokenBudget,
+                    fitDirectly: true, frameworkOverflow: true
+                ))
+                throw FoundationModelsNotesBackendError.contextBudgetExceeded("\(stage.description) (framework dispatch)")
+            }
+            throw error
+        }
+    }
+
+    /// Runtime-schema variant of `dispatch(instructions:prompt:generating:stage:)`.
+    private func dispatch(
+        instructions: String,
+        prompt: String,
+        schema: GenerationSchema,
+        stage: FoundationModelsCallStage
+    ) async throws -> GeneratedContent {
+        do {
+            return try await sessionDriver.respond(instructions: instructions, prompt: prompt, schema: schema)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as LanguageModelSession.GenerationError {
+            if case .exceededContextWindowSize = error {
+                diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+                    stage: stage, estimatedInputTokens: nil,
+                    responseReserve: responseReserves.reserve(for: stage),
+                    contextLimit: sessionDriver.contextTokenBudget,
+                    fitDirectly: true, frameworkOverflow: true
+                ))
+                throw FoundationModelsNotesBackendError.contextBudgetExceeded("\(stage.description) (framework dispatch)")
+            }
+            throw error
+        }
+    }
+
     // MARK: - Detailed section planning (structurally lossless)
 
     /// Packs `allItems` into context-safe batches, asks the model only how
@@ -359,10 +453,11 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         for request in requests {
             try Task.checkCancellation()
             let plannedSections: [LectureNoteSection] = try await withGeneratedOutputRetry {
-                let generated = try await sessionDriver.respond(
+                let generated = try await dispatch(
                     instructions: Self.detailedSectionInstructions,
                     prompt: request.prompt,
-                    schema: request.schema
+                    schema: request.schema,
+                    stage: .sectionPlan
                 )
                 let plan: AppleSectionPlanDTO
                 do {
@@ -446,10 +541,11 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         try Task.checkCancellation()
         let prompt = Self.encodeItemsPrompt(currentItems)
         return try await withGeneratedOutputRetry {
-            let dto = try await sessionDriver.respond(
+            let dto = try await dispatch(
                 instructions: Self.overviewInstructions,
                 prompt: prompt,
-                generating: AppleOverviewDTO.self
+                generating: AppleOverviewDTO.self,
+                stage: .overview
             )
             let overview = dto.overview.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !overview.isEmpty else {
@@ -466,10 +562,11 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
             let allowedSequences = try Self.allowedSequences(in: chunk)
             let prompt = Self.encodeItemsPrompt(chunk)
             let reducedItems: [LectureNoteItem] = try await withGeneratedOutputRetry {
-                let dto = try await sessionDriver.respond(
+                let dto = try await dispatch(
                     instructions: Self.reductionInstructions,
                     prompt: prompt,
-                    generating: AppleNoteItemsDTO.self
+                    generating: AppleNoteItemsDTO.self,
+                    stage: .reduction
                 )
                 let mapped = try dto.items.map {
                     try Self.mapItem($0, sessionID: sessionID, allowedSequences: allowedSequences)
@@ -660,14 +757,26 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         generating: Content.Type,
         stage: FoundationModelsCallStage
     ) async -> Bool {
+        let reserve = responseReserves.reserve(for: stage)
+        let limit = sessionDriver.contextTokenBudget
         if let inputTokens = await sessionDriver.estimatedTokenCount(
             instructions: instructions,
             prompt: prompt,
             generating: Content.self
         ) {
-            return inputTokens + responseReserves.reserve(for: stage) <= sessionDriver.contextTokenBudget
+            let fitDirectly = inputTokens + reserve <= limit
+            diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+                stage: stage, estimatedInputTokens: inputTokens,
+                responseReserve: reserve, contextLimit: limit, fitDirectly: fitDirectly
+            ))
+            return fitDirectly
         }
-        return prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
+        let fitDirectly = prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
+        diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+            stage: stage, estimatedInputTokens: nil,
+            responseReserve: reserve, contextLimit: limit, fitDirectly: fitDirectly
+        ))
+        return fitDirectly
     }
 
     /// Runtime-schema equivalent used by detailed section planning. The
@@ -680,14 +789,26 @@ nonisolated struct FoundationModelsLectureNotesGenerator: LectureNotesGenerating
         schema: GenerationSchema,
         stage: FoundationModelsCallStage
     ) async -> Bool {
+        let reserve = responseReserves.reserve(for: stage)
+        let limit = sessionDriver.contextTokenBudget
         if let inputTokens = await sessionDriver.estimatedTokenCount(
             instructions: instructions,
             prompt: prompt,
             schema: schema
         ) {
-            return inputTokens + responseReserves.reserve(for: stage) <= sessionDriver.contextTokenBudget
+            let fitDirectly = inputTokens + reserve <= limit
+            diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+                stage: stage, estimatedInputTokens: inputTokens,
+                responseReserve: reserve, contextLimit: limit, fitDirectly: fitDirectly
+            ))
+            return fitDirectly
         }
-        return prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
+        let fitDirectly = prompt.utf8.count <= maxInputBytesPerCall && itemCountForFallback <= maxItemsSafetyCapPerCall
+        diagnosticRecorder?(FoundationModelsNotesDiagnosticEvent(
+            stage: stage, estimatedInputTokens: nil,
+            responseReserve: reserve, contextLimit: limit, fitDirectly: fitDirectly
+        ))
+        return fitDirectly
     }
 
     // MARK: - Prompt encoding
