@@ -12,7 +12,14 @@ nonisolated enum SessionNotesDisplayState: Equatable {
     /// session.
     case loading
     /// `listGenerationIDs` returned no generations for this session yet.
-    case noGeneration
+    /// `transcriptSourceReady` is `true` only when `NotesTranscriptSourceLoading
+    /// .loadCurrentSnapshot` currently succeeds for this session — the exact
+    /// same authoritative "transcript is fully completed and valid" check
+    /// `LectureNotesGenerationService.generate` itself performs before
+    /// admitting a run. `false` while transcription has not started, is
+    /// still queued/running, or is otherwise ineligible; T5-D never offers a
+    /// fresh Generate until this is `true`.
+    case noGeneration(transcriptSourceReady: Bool)
     case loaded(record: LectureNotesGenerationRecord, classification: NotesGenerationRecoveryClassification, advisoryStateIntegrity: NotesAdvisoryStateIntegrity)
     /// A durable read failed (corrupt store, unreadable transcript source,
     /// etc.) — distinct from any `NotesGenerationRecoveryClassification`
@@ -115,7 +122,19 @@ final class SessionNotesPresenter: ObservableObject {
         }
 
         guard !generationIDs.isEmpty else {
-            publish(.noGeneration)
+            // No Notes generation exists yet, so a fresh Generate is the
+            // only action in play — gate it on the same authoritative
+            // eligibility check `LectureNotesGenerationService.generate`
+            // itself relies on, rather than assuming a missing generation
+            // always means the transcript is ready.
+            let transcriptSourceReady: Bool
+            do {
+                _ = try await sourceLoader.loadCurrentSnapshot(sessionID: sessionID)
+                transcriptSourceReady = true
+            } catch {
+                transcriptSourceReady = false
+            }
+            publish(.noGeneration(transcriptSourceReady: transcriptSourceReady))
             return
         }
 

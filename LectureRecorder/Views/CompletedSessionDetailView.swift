@@ -116,6 +116,7 @@ struct CompletedSessionDetailView: View {
         SessionNotesView(
             entry: entry,
             service: notesService,
+            transcriptionService: transcriptionService,
             notesStore: notesStore,
             operationStateStore: notesOperationStateStore,
             sourceLoader: notesSourceLoader

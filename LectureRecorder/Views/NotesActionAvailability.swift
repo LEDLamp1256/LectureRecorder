@@ -44,8 +44,8 @@ nonisolated enum NotesActionAvailabilityCalculator {
         switch displayState {
         case .loading, .loadError:
             return NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
-        case .noGeneration:
-            return NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+        case .noGeneration(let transcriptSourceReady):
+            return NotesActionAvailability(canGenerate: transcriptSourceReady, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
         case .loaded(_, let classification, let advisoryStateIntegrity):
             return availability(forLoaded: classification, advisoryStateIntegrity: advisoryStateIntegrity)
         }

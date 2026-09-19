@@ -227,7 +227,11 @@ final class SessionNotesPresenterTests: XCTestCase {
 
     // MARK: - No existing generation
 
-    func testNoExistingGenerationPublishesNoGeneration() async {
+    /// No stub snapshot is registered for `sessionID`, so `loadCurrentSnapshot`
+    /// throws — the transcript is not currently a valid, completed source
+    /// (e.g. transcription still processing) — and Generate must stay
+    /// disabled.
+    func testNoExistingGenerationWithTranscriptNotReadyPublishesNoGenerationNotReady() async {
         let sessionID = UUID()
         let entry = makeEntry(sessionID: sessionID)
         let presenter = SessionNotesPresenter(
@@ -239,7 +243,27 @@ final class SessionNotesPresenterTests: XCTestCase {
         await presenter.refresh(for: entry)
 
         XCTAssertEqual(presenter.displayedSessionID, sessionID)
-        XCTAssertEqual(presenter.displayState, .noGeneration)
+        XCTAssertEqual(presenter.displayState, .noGeneration(transcriptSourceReady: false))
+    }
+
+    /// A stub snapshot is registered for `sessionID`, mirroring a session
+    /// whose transcript has fully completed — Generate must become
+    /// available even though no Notes generation has ever been created yet.
+    func testNoExistingGenerationWithTranscriptReadyPublishesNoGenerationReady() async {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let loader = StubNotesTranscriptSourceLoader()
+        await loader.setSnapshot(makeSnapshot(sessionID: sessionID, unitCount: 1), forSessionID: sessionID)
+        let presenter = SessionNotesPresenter(
+            notesStore: notesStore,
+            operationStateStore: operationStateStore,
+            sourceLoader: loader
+        )
+
+        await presenter.refresh(for: entry)
+
+        XCTAssertEqual(presenter.displayedSessionID, sessionID)
+        XCTAssertEqual(presenter.displayState, .noGeneration(transcriptSourceReady: true))
     }
 
     // MARK: - Completed document
@@ -578,8 +602,11 @@ final class SessionNotesPresenterTests: XCTestCase {
         let snapshotA = makeSnapshot(sessionID: sessionA, unitCount: 1)
         _ = try! writeGeneration(sessionID: sessionA, sessionPaths: entryA.sessionPaths, windowCount: 1, fingerprint: snapshotA.fingerprint)
 
-        // Session B has no generation at all, so its refresh completes
-        // synchronously without ever touching the source loader.
+        // Session B has no generation at all, so its refresh now also
+        // consults the source loader (for `transcriptSourceReady`), but B is
+        // not in `gatedSessionIDs` and has no stub snapshot registered, so
+        // that call throws immediately without suspending on the shared
+        // gate — it never blocks behind session A's still-gated call.
         let loader = StubNotesTranscriptSourceLoader(gatedSessionIDs: [sessionA])
         await loader.setSnapshot(snapshotA, forSessionID: sessionA)
         let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
@@ -594,7 +621,7 @@ final class SessionNotesPresenterTests: XCTestCase {
 
         await presenter.refresh(for: entryB)
         XCTAssertEqual(presenter.displayedSessionID, sessionB)
-        XCTAssertEqual(presenter.displayState, .noGeneration)
+        XCTAssertEqual(presenter.displayState, .noGeneration(transcriptSourceReady: false))
 
         await loader.releaseGate()
         _ = await staleLoad.value
@@ -602,6 +629,6 @@ final class SessionNotesPresenterTests: XCTestCase {
         // The now-stale session-A load must never have overwritten
         // session B's newer, already-published result.
         XCTAssertEqual(presenter.displayedSessionID, sessionB)
-        XCTAssertEqual(presenter.displayState, .noGeneration)
+        XCTAssertEqual(presenter.displayState, .noGeneration(transcriptSourceReady: false))
     }
 }

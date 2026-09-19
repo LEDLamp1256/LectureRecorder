@@ -184,6 +184,64 @@ final class SessionOwnershipHandoffTests: XCTestCase {
         XCTAssertFalse(availability.canCancel)
     }
 
+    // MARK: - Cross-service handoff: transcription completion refreshes Notes availability
+
+    /// Proves the cross-service refresh cue `SessionNotesView` performs:
+    /// when `CompletedSessionTranscriptionService.activeSessionID` releases
+    /// ownership of this session (transcription just finished), the
+    /// completely separate Notes presenter/service pair must be refreshed
+    /// so `NotesActionAvailabilityCalculator` flips Generate from disabled
+    /// to enabled — exercising the real `NotesTranscriptSourceLoader`
+    /// production implementation end to end, not a stub, so the
+    /// transcript-eligibility check itself is genuinely proven, not merely
+    /// assumed.
+    func testNotesGenerateBecomesAvailableAfterTranscriptionOwnershipReleases() async throws {
+        let manifest = try writeManifest(chunkCount: 1)
+        let entry = CompletedSessionEntry(manifest: manifest, sessionPaths: sessionPaths)
+        let transcriber = FakeTranscriber()
+        let transcriptionService = makeService(transcriber: transcriber)
+
+        let notesStore = LectureNotesStore()
+        let notesOperationStateStore = LectureNotesOperationStateStore()
+        let root = tempDirectory!
+        let notesSourceLoader = NotesTranscriptSourceLoader(
+            transcriptionStore: TranscriptionStore(),
+            sessionsRootResolver: { root }
+        )
+        let notesPresenter = SessionNotesPresenter(
+            notesStore: notesStore,
+            operationStateStore: notesOperationStateStore,
+            sourceLoader: notesSourceLoader
+        )
+
+        // Before transcription: no Notes generation exists yet and the
+        // transcript is not eligible input — Generate must be disabled.
+        await notesPresenter.refresh(for: entry)
+        XCTAssertEqual(notesPresenter.displayState, .noGeneration(transcriptSourceReady: false))
+        let before = NotesActionAvailabilityCalculator.availability(displayState: notesPresenter.displayState, ownership: .none)
+        XCTAssertFalse(before.canGenerate)
+
+        // Transcribe for real, then apply the exact production
+        // ownership-release cue `SessionNotesView`'s
+        // `.onChange(of: transcriptionService.activeSessionID)` performs.
+        XCTAssertEqual(transcriptionService.transcribe(sessionID: sessionID), .admitted)
+        await waitUntilFinished(transcriptionService)
+        let activeAfter = transcriptionService.activeSessionID
+        XCTAssertNil(activeAfter, "sanity: transcription ownership was actually released")
+
+        let shouldRefresh = SessionOwnershipTransition.shouldRefreshDurableState(
+            oldActiveSessionID: sessionID,
+            newActiveSessionID: activeAfter,
+            sessionID: sessionID
+        )
+        XCTAssertTrue(shouldRefresh, "expected the ownership-release predicate to fire")
+        await notesPresenter.refresh(for: entry)
+
+        XCTAssertEqual(notesPresenter.displayState, .noGeneration(transcriptSourceReady: true))
+        let after = NotesActionAvailabilityCalculator.availability(displayState: notesPresenter.displayState, ownership: .none)
+        XCTAssertTrue(after.canGenerate)
+    }
+
     // MARK: - No cross-session regression (retained)
 
     func testHistoricalTranscriptRemainsReopenableAfterHandoff() async throws {

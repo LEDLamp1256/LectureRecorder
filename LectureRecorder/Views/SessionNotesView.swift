@@ -17,20 +17,40 @@ import SwiftUI
 /// `NotesActionAvailabilityCalculator` — this session's own saved
 /// classification is never reinterpreted as an integrity problem merely
 /// because a *different* session currently owns the shared operation.
+///
+/// Also observes the shared `CompletedSessionTranscriptionService`'s
+/// `activeSessionID`, purely as a refresh cue: when transcription for this
+/// session releases ownership (completion, cancellation, or failure), the
+/// transcript on disk may have just become — or remain — eligible/ineligible
+/// notes input, so durable state is re-read the same way it already is when
+/// this view's own `service.activeSessionID` releases. This never calls
+/// `CompletedSessionTranscriptionService` beyond reading that one published
+/// property, and never couples `LectureNotesGenerationService` itself to
+/// transcription.
 struct SessionNotesView: View {
     let entry: CompletedSessionEntry
     @ObservedObject var service: LectureNotesGenerationService
+    /// Observed only for its `activeSessionID` ownership-release signal —
+    /// this view never calls any `CompletedSessionTranscriptionService`
+    /// method. Notes generation itself remains entirely decoupled from
+    /// transcription (see `NotesTranscriptSourceLoading`); this is purely a
+    /// "durable state may have changed on disk, refresh the display" cue,
+    /// the same role `service.activeSessionID` already plays below for
+    /// Notes' own operations.
+    @ObservedObject var transcriptionService: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionNotesPresenter
 
     init(
         entry: CompletedSessionEntry,
         service: LectureNotesGenerationService,
+        transcriptionService: CompletedSessionTranscriptionService,
         notesStore: any LectureNotesStoring,
         operationStateStore: any LectureNotesOperationStateStoring,
         sourceLoader: any NotesTranscriptSourceLoading
     ) {
         self.entry = entry
         self.service = service
+        self.transcriptionService = transcriptionService
         _presenter = StateObject(wrappedValue: SessionNotesPresenter(
             notesStore: notesStore,
             operationStateStore: operationStateStore,
@@ -100,6 +120,20 @@ struct SessionNotesView: View {
             await presenter.refresh(for: entry)
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
+            guard SessionOwnershipTransition.shouldRefreshDurableState(
+                oldActiveSessionID: oldValue,
+                newActiveSessionID: newValue,
+                sessionID: sessionID
+            ) else { return }
+            Task { await presenter.refresh(for: entry) }
+        }
+        // A visible Notes pane must reflect transcription finishing for
+        // this session without requiring the user to navigate away and
+        // back — otherwise Generate stays incorrectly disabled until some
+        // unrelated re-mount happens to occur. Reuses the exact same
+        // ownership-release cue already used for `service.activeSessionID`
+        // above, now against the shared transcription service instead.
+        .onChange(of: transcriptionService.activeSessionID) { oldValue, newValue in
             guard SessionOwnershipTransition.shouldRefreshDurableState(
                 oldActiveSessionID: oldValue,
                 newActiveSessionID: newValue,
