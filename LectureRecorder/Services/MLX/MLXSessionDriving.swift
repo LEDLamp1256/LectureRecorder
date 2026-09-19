@@ -162,13 +162,16 @@ actor RealMLXSessionDriver: MLXSessionDriving {
 
     private var loadedContainer: ModelContainer?
     /// Built once per loaded model (the grammar tokenizer depends only on
-    /// the model's own vocabulary, never on a particular schema).
+    /// the model's own vocabulary, never on a particular schema or
+    /// generation) — safe to cache and reuse, unlike `GrammarConstraint`
+    /// below.
     private var grammarTokenizer: GrammarTokenizer?
-    /// Compiled grammar constraints, keyed by JSON Schema string — grammar
-    /// compilation is the potentially slow step
-    /// (`MLXGuidedGeneration.GrammarConstraint.init`), so a schema this
-    /// driver has already compiled once is never recompiled.
-    private var grammarConstraints: [String: GrammarConstraint] = [:]
+    /// Closing/whitespace logit biases derived only from the model's own
+    /// vocabulary (never from a particular schema or generation) — safe to
+    /// cache and reuse, mirroring the pinned upstream
+    /// `MLXFoundationModels.ModelContextCache.makeTokenizerBias`'s own
+    /// per-model caching of this exact data.
+    private var tokenizerBias: (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>)?
 
     init(
         descriptor: MLXModelDescriptor = .qwen3_8b_4bit,
@@ -216,7 +219,8 @@ actor RealMLXSessionDriver: MLXSessionDriving {
         try Task.checkCancellation()
         let container = try await loadedModelContainer()
         do {
-            let (constraint, vocabSize) = try await constraint(forJSONSchema: jsonSchema, container: container)
+            let grammarTok = try await cachedGrammarTokenizer(container: container)
+            let bias = try await cachedTokenizerBias(container: container)
 
             return try await container.perform { context in
                 try Task.checkCancellation()
@@ -225,6 +229,35 @@ actor RealMLXSessionDriver: MLXSessionDriving {
                 )
                 let promptTokenCount = tokenIDs.count
                 let input = LMInput(text: LMInput.Text(tokens: MLXArray(tokenIDs.map { Int32($0) })))
+
+                // A fresh matcher for every call (Correction: `GrammarConstraint`
+                // owns mutable xgrammar matcher state that `computeMask()`/
+                // `commitToken()` advance — a constraint that already
+                // completed one generation must never be reused for another
+                // generation or retry). Only the vocabulary-derived
+                // `GrammarTokenizer` above is safe to cache. `fastForward:
+                // true` matches `GuidedGenerationLoop.run`'s own documented
+                // contract ("constraint ... must have fastForward: true"),
+                // with `hostTokenizer` set to the exact same tokenizer
+                // instance (`context.tokenizer`) whose vocabulary built
+                // `grammarTok`.
+                let constraint = try GrammarConstraint(
+                    tokenizer: grammarTok, jsonSchema: jsonSchema, fastForward: true, hostTokenizer: context.tokenizer
+                )
+                let vocabSize = grammarTok.vocabSize
+
+                // Completion controls, computed exactly as the pinned
+                // upstream `MLXFoundationModels.MLXLanguageModel` production
+                // integration does (never invented here): without these,
+                // `GuidedGenerationLoop.run` has no mechanism nudging the
+                // model toward closing its JSON before `maxTokens`, and a
+                // real model can exhaust the entire token budget without
+                // ever reaching a grammar-accepting stop state.
+                let structuralReserve = CompletionReserve.estimate(
+                    schemaJSON: jsonSchema, tokenizer: context.tokenizer
+                )
+                let completionReserve = max(structuralReserve * 3, maxOutputTokens / 4)
+                let hardReserve = structuralReserve * 8
 
                 // Mirrors `MLXLMCommon.WiredMemoryUtils.tune`'s own measurement
                 // convention: `Memory.peakMemory` is a process-global counter,
@@ -241,7 +274,12 @@ actor RealMLXSessionDriver: MLXSessionDriving {
                     context: context,
                     constraint: constraint,
                     maxTokens: maxOutputTokens,
-                    vocabSize: vocabSize
+                    vocabSize: vocabSize,
+                    completionReserve: completionReserve,
+                    hardReserve: hardReserve,
+                    closingBias: bias.closing,
+                    whitespaceBias: bias.whitespace,
+                    whitespaceTokenIDs: bias.whitespaceTokenIDs
                 ) { delta in
                     jsonText += delta
                     return true
@@ -288,33 +326,41 @@ actor RealMLXSessionDriver: MLXSessionDriving {
         return container
     }
 
-    private func constraint(
-        forJSONSchema jsonSchema: String, container: ModelContainer
-    ) async throws -> (GrammarConstraint, Int) {
-        if let existing = grammarConstraints[jsonSchema], let grammarTokenizer {
-            return (existing, grammarTokenizer.vocabSize)
+    /// The vocabulary-derived `GrammarTokenizer` is immutable per loaded
+    /// model and safe to build once and reuse — unlike `GrammarConstraint`
+    /// (see `respond`'s own comment), which owns per-generation mutable
+    /// matcher state and is always constructed fresh.
+    private func cachedGrammarTokenizer(container: ModelContainer) async throws -> GrammarTokenizer {
+        if let grammarTokenizer { return grammarTokenizer }
+        let built = try await container.perform { context -> GrammarTokenizer in
+            let vocab = TokenizerVocabExtractor.extractForGrammar(from: context.tokenizer)
+            return try GrammarTokenizer(
+                vocab: vocab.vocab,
+                vocabType: vocab.vocabType,
+                eosTokenId: Int32(context.tokenizer.eosTokenId ?? 0)
+            )
         }
+        self.grammarTokenizer = built
+        return built
+    }
 
-        let tokenizer =
-            if let grammarTokenizer {
-                grammarTokenizer
-            } else {
-                try await container.perform { context -> GrammarTokenizer in
-                    let vocab = TokenizerVocabExtractor.extractForGrammar(from: context.tokenizer)
-                    return try GrammarTokenizer(
-                        vocab: vocab.vocab,
-                        vocabType: vocab.vocabType,
-                        eosTokenId: Int32(context.tokenizer.eosTokenId ?? 0)
-                    )
-                }
-            }
-        self.grammarTokenizer = tokenizer
-
-        let constraint = try GrammarConstraint(
-            tokenizer: tokenizer, jsonSchema: jsonSchema, fastForward: false
-        )
-        grammarConstraints[jsonSchema] = constraint
-        return (constraint, tokenizer.vocabSize)
+    /// The closing/whitespace logit biases are derived only from the
+    /// model's own vocabulary — immutable per loaded model, and safe to
+    /// build once and reuse, exactly like `cachedGrammarTokenizer` above.
+    private func cachedTokenizerBias(
+        container: ModelContainer
+    ) async throws -> (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) {
+        if let tokenizerBias { return tokenizerBias }
+        let built = try await container.perform {
+            context -> (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) in
+            let closing = ClosingTokenBias.compute(
+                tokenizer: context.tokenizer, eosTokenId: context.tokenizer.eosTokenId
+            )
+            let (whitespace, whitespaceTokenIDs) = WhitespaceTokenBias.compute(tokenizer: context.tokenizer)
+            return (closing, whitespace, whitespaceTokenIDs)
+        }
+        self.tokenizerBias = built
+        return built
     }
 
     // MARK: - Chat formatting

@@ -642,8 +642,41 @@ nonisolated struct MLXLectureNotesGenerator: LectureNotesGenerating, NewLectureN
     private static func decode<T: Decodable>(_ type: T.Type, from jsonText: String) throws -> T {
         do {
             return try JSONDecoder().decode(T.self, from: Data(jsonText.utf8))
+        } catch let error as DecodingError {
+            throw MLXLectureNotesBackendError.malformedResponse(
+                "could not decode JSON: \(Self.safeDecodingErrorDescription(error, rawText: jsonText))"
+            )
         } catch {
             throw MLXLectureNotesBackendError.malformedResponse("could not decode JSON: \(error.localizedDescription)")
+        }
+    }
+
+    /// A privacy-safe description of a `DecodingError` — category, coding
+    /// path (key names/indexes only), expected type, and the framework's
+    /// own structural debug description, plus (for a malformed top-level
+    /// payload) size/shape metadata that never includes the actual
+    /// generated text. Never includes the raw JSON, transcript content, or
+    /// generated Notes bodies — only structural facts about the payload.
+    private static func safeDecodingErrorDescription(_ error: DecodingError, rawText: String) -> String {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isValidJSONSyntax = (try? JSONSerialization.jsonObject(with: Data(rawText.utf8))) != nil
+        let shape = "utf8Bytes=\(rawText.utf8.count) empty=\(trimmed.isEmpty) startsWithBrace=\(trimmed.first == "{") endsWithBrace=\(trimmed.last == "}") validJSONSyntax=\(isValidJSONSyntax)"
+
+        func path(_ codingPath: [CodingKey]) -> String {
+            codingPath.isEmpty ? "<root>" : codingPath.map(\.stringValue).joined(separator: ".")
+        }
+
+        switch error {
+        case .dataCorrupted(let context):
+            return "dataCorrupted at \(path(context.codingPath)): \(context.debugDescription) [\(shape)]"
+        case .keyNotFound(let key, let context):
+            return "keyNotFound '\(key.stringValue)' at \(path(context.codingPath)) [\(shape)]"
+        case .typeMismatch(let type, let context):
+            return "typeMismatch expected \(type) at \(path(context.codingPath)) [\(shape)]"
+        case .valueNotFound(let type, let context):
+            return "valueNotFound expected \(type) at \(path(context.codingPath)) [\(shape)]"
+        @unknown default:
+            return "unknownDecodingError [\(shape)]"
         }
     }
 
@@ -757,6 +790,7 @@ nonisolated struct MLXLectureNotesGenerator: LectureNotesGenerating, NewLectureN
               "fidelity": { "type": "string", "enum": \(Self.jsonArray(MLXNoteVocabulary.fidelities)) },
               "sourceReferences": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                   "type": "object",
                   "properties": {

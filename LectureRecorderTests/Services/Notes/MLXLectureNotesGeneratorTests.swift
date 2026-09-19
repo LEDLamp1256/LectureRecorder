@@ -222,6 +222,30 @@ final class MLXLectureNotesGeneratorTests: XCTestCase {
         XCTAssertEqual(driver.respondCallCount, 2)
     }
 
+    /// Regression: a guided-generation call that reports success (no
+    /// thrown MLXGuidedGenerationRuntimeError) but yields a genuinely
+    /// empty jsonText must still classify as a retryable malformedResponse
+    /// -- never crash, hang, or silently produce an empty note-item list.
+    func testAnalyzeWindowFailsClosedOnEmptyGuidedGenerationOutput() async {
+        let driver = FakeMLXSessionDriver()
+        driver.enqueueRespond(.success(.stub(jsonText: "")))
+        driver.enqueueRespond(.success(.stub(jsonText: "")))
+        let generator = makeGenerator(driver: driver)
+        let generation = generationRecord()
+
+        do {
+            _ = try await generator.analyzeWindow(units: [unit(0, "a")], window: window(first: 0, last: 0), generation: generation)
+            XCTFail("expected malformedResponse for empty guided-generation output")
+        } catch let error as MLXLectureNotesBackendError {
+            guard case .malformedResponse = error else {
+                return XCTFail("expected malformedResponse, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+        XCTAssertEqual(driver.respondCallCount, 2, "empty output is retryable -- both attempts should run")
+    }
+
     /// Correction 3: an incomplete/truncated guided-generation output from
     /// the MLX runtime must receive the same bounded retry as a malformed
     /// response, never escape unclassified.
@@ -435,5 +459,19 @@ final class MLXLectureNotesGeneratorTests: XCTestCase {
         let analysis = try await generator.analyzeWindow(units: [unit(0, "a")], window: window(first: 0, last: 0), generation: generation)
         XCTAssertEqual(analysis.items.first?.body, "content")
         XCTAssertFalse(recordedEvents.isEmpty, "diagnostics should have observed the preflight, purely additively")
+    }
+
+    // MARK: - Schema
+
+    func testNoteItemsJSONSchemaRequiresAtLeastOneSourceReference() throws {
+        let schemaData = Data(MLXLectureNotesGenerator.noteItemsJSONSchema.utf8)
+        let schema = try JSONSerialization.jsonObject(with: schemaData) as? [String: Any]
+        let items = schema?["properties"] as? [String: Any]
+        let itemsArray = items?["items"] as? [String: Any]
+        let itemSchema = itemsArray?["items"] as? [String: Any]
+        let properties = itemSchema?["properties"] as? [String: Any]
+        let sourceReferences = properties?["sourceReferences"] as? [String: Any]
+
+        XCTAssertEqual(sourceReferences?["minItems"] as? Int, 1)
     }
 }
