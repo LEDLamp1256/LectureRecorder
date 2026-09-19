@@ -214,3 +214,55 @@ model to already be staged (see above). It is a diagnostic/benchmarking aid
 only, not part of normal build, test, or production inference; runtime
 diagnostics stay off and GPU-preferred execution stays on unless this
 script is invoked explicitly.
+
+## Acceptance-diagnostics trace
+
+`AcceptanceDiagnosticLogger` (`LectureRecorder/Support/AcceptanceDiagnosticLogger.swift`)
+is a strictly diagnostic, opt-in, append-only trace of what happens during a
+real acceptance run of record/import → transcription → detailed Notes →
+dedicated Summary — elapsed timings, chunk/window/batch/reduction-level
+progress, preflight token/context results, cancellation latency, and
+Continue/Retry/recovery paths. It changes no product behavior and is never
+consulted by any generation, recovery, or persistence logic.
+
+Off by default. Enable it for one run with:
+
+```sh
+LECTURE_RECORDER_ACCEPTANCE_DIAGNOSTICS=1 open /path/to/LectureRecorder.app
+```
+
+or by adding the same environment variable, set to exactly `1`, to the
+active Xcode scheme's Run environment. Any other value (including unset)
+leaves diagnostics off, with no filesystem access beyond that one cheap
+environment check.
+
+When enabled, one JSON Lines (JSONL) file is written per app process/run to
+`~/Library/Logs/LectureRecorder/acceptance-<timestamp>-<pid>.jsonl` — a
+line-delimited stream of independent JSON objects, each with a
+`schemaVersion`, ISO-8601 `timestamp`, `pid`, `event` name, optional
+monotonic `elapsedSeconds`, and a `metadata` object, for example:
+
+```json
+{"elapsedSeconds":1.204,"event":"summary.analysis.batch.completed","metadata":{"batchIndex":2,"generationID":"...","passageCount":4,"sessionID":"..."},"pid":12345,"schemaVersion":1,"timestamp":"2026-09-18T18:34:03.512Z"}
+```
+
+**Privacy**: the trace never contains transcript text, Notes prose, Summary
+prose, prompts, model responses, raw audio, or other lecture content — only
+identifiers, counts, indexes, states, timings, and error categories.
+
+**Failure semantics**: every write is best-effort. A logging failure (a
+missing log directory, a full disk, anything) never affects the actual
+recording/transcription/Notes/Summary operation in progress, and this trace
+is entirely outside canonical session storage — it is never read by, and
+never participates in, generation recovery or classification.
+
+**Not crash-durable**: events are queued asynchronously onto a private
+background writer and are never awaited by the operation that logged them —
+normal recording/transcription/Notes/Summary work is never blocked on a
+diagnostic write. An abrupt process kill or force-quit can therefore lose
+the final queued diagnostic event(s) that had not yet reached disk. A JSONL
+trace that ends abruptly during deliberate crash/force-quit recovery testing
+is expected in that scenario and must not itself be read as product
+corruption — the canonical session/Notes/Summary artifacts (not this trace)
+remain the source of truth for what actually completed. The next app launch
+always starts a fresh, separate per-process trace file.

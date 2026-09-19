@@ -1217,6 +1217,38 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         _ = await waitUntilFinished(service)
     }
+
+    // MARK: - Acceptance-diagnostics error categorization
+
+    func testDiagnosticErrorCategoryNeverIncludesArbitraryErrorText() {
+        struct OpaqueUnderlyingError: Error {}
+
+        XCTAssertEqual(
+            CompletedSessionTranscriptionService.diagnosticErrorCategory(for: CancellationError()),
+            "cancellation"
+        )
+        XCTAssertEqual(
+            CompletedSessionTranscriptionService.diagnosticErrorCategory(
+                for: TranscriptionCoordinatorError.sourceMissing(sequenceNumber: 3)
+            ),
+            "sourceMissing"
+        )
+        XCTAssertEqual(
+            CompletedSessionTranscriptionService.diagnosticErrorCategory(
+                for: TranscriptionCoordinatorError.commitDurabilityUncertain(sequenceNumber: 7)
+            ),
+            "commitDurabilityUncertain"
+        )
+        // An error type this classification does not know about must fall
+        // back to only its concrete Swift error *type* name — never a
+        // `localizedDescription`/`String(describing: error)` rendering,
+        // which for an arbitrary underlying error could embed a filesystem
+        // path or other free-text content.
+        XCTAssertEqual(
+            CompletedSessionTranscriptionService.diagnosticErrorCategory(for: OpaqueUnderlyingError()),
+            "OpaqueUnderlyingError"
+        )
+    }
 }
 
 /// A permission service whose `requestPermission()` hangs until explicitly

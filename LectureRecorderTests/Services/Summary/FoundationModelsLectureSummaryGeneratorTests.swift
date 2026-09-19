@@ -20,6 +20,23 @@ private final class DiagnosticEventCollector: @unchecked Sendable {
     }
 }
 
+/// Thread-safe sink for `FoundationModelsSummarySynthesisEvent`s recorded
+/// during a test.
+private final class SynthesisEventCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEvents: [FoundationModelsSummarySynthesisEvent] = []
+
+    var events: [FoundationModelsSummarySynthesisEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return storedEvents
+    }
+
+    func record(_ event: FoundationModelsSummarySynthesisEvent) {
+        lock.lock(); defer { lock.unlock() }
+        storedEvents.append(event)
+    }
+}
+
 final class FoundationModelsLectureSummaryGeneratorTests: XCTestCase {
     private var noReserve: FoundationModelsSummaryResponseReserves {
         FoundationModelsSummaryResponseReserves(
@@ -45,7 +62,9 @@ final class FoundationModelsLectureSummaryGeneratorTests: XCTestCase {
         _ driver: FakeFoundationModelsSessionDriver,
         maxItems: Int = 12,
         levels: Int = 8,
-        diagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)? = nil
+        diagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)? = nil,
+        preflightRecorder: (@Sendable (FoundationModelsSummaryPreflightEvent) -> Void)? = nil,
+        synthesisRecorder: (@Sendable (FoundationModelsSummarySynthesisEvent) -> Void)? = nil
     ) -> FoundationModelsLectureSummaryGenerator {
         FoundationModelsLectureSummaryGenerator(
             sessionDriver: driver,
@@ -53,7 +72,9 @@ final class FoundationModelsLectureSummaryGeneratorTests: XCTestCase {
             maxInputBytesPerCall: 100_000,
             maxItemsPerBatch: maxItems,
             maxReductionLevels: levels,
-            diagnosticRecorder: diagnosticRecorder
+            diagnosticRecorder: diagnosticRecorder,
+            preflightRecorder: preflightRecorder,
+            synthesisRecorder: synthesisRecorder
         )
     }
 
@@ -526,7 +547,217 @@ final class FoundationModelsLectureSummaryGeneratorTests: XCTestCase {
         XCTAssertTrue(collector.events.isEmpty)
     }
 
+    func testPreflightRecorderReceivesRealTokenCountAndContextBudgetOnBatchAnalysis() async throws {
+        var recorded: [FoundationModelsSummaryPreflightEvent] = []
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.setTokenCountOverride(1)
+        let backend = generator(driver, maxItems: 2, preflightRecorder: { recorded.append($0) })
+        let source = try SummaryTestSupport.source()
+        let (plan, record) = try await planAndGeneration(backend, source: source)
+        recorded.removeAll() // isolate the call under test from makePlan's own preflights
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Grounded", support: [1])
+        ]))
+
+        _ = try await backend.generateAnalysis(for: plan.batches[0], generation: record, source: source)
+
+        XCTAssertEqual(recorded.count, 1)
+        let event = try XCTUnwrap(recorded.first)
+        XCTAssertEqual(event.stage, .batchAnalysis)
+        XCTAssertEqual(event.estimatedInputTokens, 1, "must be the real preflight count the fake driver reports, never an invented estimate")
+        XCTAssertEqual(event.contextLimit, driver.contextTokenBudget)
+        XCTAssertTrue(event.fitsDirectly)
+    }
+
+    // MARK: Content-free error classification
+
+    func testDiagnosticCategoryIsCaseNameOnlyNeverAssociatedPayload() {
+        let secret = "SECRET_LECTURE_CONTENT_MARKER"
+        let cases: [(FoundationModelsSummaryBackendError, String)] = [
+            (.unavailable(secret), "unavailable"),
+            (.incompatibleProvenance, "incompatibleProvenance"),
+            (.contextBudgetExceeded(secret), "contextBudgetExceeded"),
+            (.tokenPreflightUnavailable(secret), "tokenPreflightUnavailable"),
+            (.sourceItemTooLarge(999), "sourceItemTooLarge"),
+            (.malformedGeneratedStructure(secret), "malformedGeneratedStructure"),
+            (.invalidLocalSupportIndex(999), "invalidLocalSupportIndex"),
+            (.duplicateLocalSupportIndex(999), "duplicateLocalSupportIndex"),
+            (.missingSupport, "missingSupport"),
+            (.emptyGeneratedContent, "emptyGeneratedContent"),
+            (.fidelityViolation, "fidelityViolation"),
+            (.uncertaintyExplanationRequired, "uncertaintyExplanationRequired"),
+            (.reductionCoverageLost, "reductionCoverageLost"),
+            (.nonProgressingReduction, "nonProgressingReduction"),
+            (.unsupportedLanguage(secret), "unsupportedLanguage"),
+            (.guardrailFailure(secret), "guardrailFailure"),
+            (.frameworkFailure(secret), "frameworkFailure"),
+            (.finalIntegrityValidationFailed(secret), "finalIntegrityValidationFailed")
+        ]
+        for (error, expectedCategory) in cases {
+            XCTAssertEqual(error.diagnosticCategory, expectedCategory)
+            XCTAssertFalse(error.diagnosticCategory.contains(secret), "\(expectedCategory) leaked its associated payload")
+        }
+    }
+
+    // MARK: Synthesis-phase boundary events
+
+    func testFinalStructureAndFinalSectionSynthesisEventsReportAccurateCounts() async throws {
+        let collector = SynthesisEventCollector()
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.setContextTokenBudget(10)
+        driver.setTokenCountHandler { _, _ in 1 }
+        let backend = generator(driver, maxItems: 1, synthesisRecorder: collector.record)
+        let source = try SummaryTestSupport.source()
+        let (_, record) = try await planAndGeneration(backend, source: source)
+        let analyses = try completeAnalyses(generation: record, source: source)
+        driver.enqueue(AppleSummaryStructureDTO(sections: [
+            AppleSummarySectionPlanDTO(title: "Second evidence", supportIndices: [2]),
+            AppleSummarySectionPlanDTO(title: "First evidence", supportIndices: [1])
+        ]))
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Formula section", fidelity: "reconstructed", uncertainty: "Formula was normalized.")
+        ]))
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [passageDTO("Concept section")]))
+
+        let document = try await backend.generateDocument(from: analyses, generation: record, source: source)
+
+        XCTAssertEqual(document.sections.count, 2, "setup sanity check")
+        let events = collector.events
+        XCTAssertEqual(
+            events.count, 6,
+            "one started/completed pair for final structure, plus one started/completed pair per final section (2 sections)"
+        )
+
+        guard case .finalStructureStarted(let structureInputCount) = events[0].boundary else {
+            return XCTFail("expected finalStructureStarted first, got \(events[0].boundary)")
+        }
+        XCTAssertEqual(structureInputCount, 3, "all three source carriers enter the final-structure request")
+        XCTAssertEqual(events[0].sessionID, record.sessionID)
+        XCTAssertEqual(events[0].generationID, record.generationID)
+
+        guard case .finalStructureCompleted(let sectionCount) = events[1].boundary else {
+            return XCTFail("expected finalStructureCompleted second, got \(events[1].boundary)")
+        }
+        XCTAssertEqual(sectionCount, 2)
+        XCTAssertNotNil(events[1].elapsedSeconds, "a completed event must report elapsed time")
+
+        guard case .finalSectionStarted(let sectionIndex0, let totalSections0, let sectionInputCount0) = events[2].boundary else {
+            return XCTFail("expected finalSectionStarted third, got \(events[2].boundary)")
+        }
+        XCTAssertEqual(sectionIndex0, 0)
+        XCTAssertEqual(totalSections0, 2)
+        XCTAssertEqual(sectionInputCount0, 1, "the first planned section selects exactly one carrier (index 2)")
+
+        guard case .finalSectionCompleted(let completedIndex0, let passageCount0) = events[3].boundary else {
+            return XCTFail("expected finalSectionCompleted fourth, got \(events[3].boundary)")
+        }
+        XCTAssertEqual(completedIndex0, 0)
+        XCTAssertEqual(passageCount0, 1)
+        XCTAssertNotNil(events[3].elapsedSeconds)
+
+        guard case .finalSectionStarted(let sectionIndex1, let totalSections1, let sectionInputCount1) = events[4].boundary else {
+            return XCTFail("expected finalSectionStarted fifth, got \(events[4].boundary)")
+        }
+        XCTAssertEqual(sectionIndex1, 1)
+        XCTAssertEqual(totalSections1, 2)
+        XCTAssertEqual(sectionInputCount1, 1, "the second planned section selects exactly one carrier (index 1)")
+
+        guard case .finalSectionCompleted(let completedIndex1, let passageCount1) = events[5].boundary else {
+            return XCTFail("expected finalSectionCompleted sixth, got \(events[5].boundary)")
+        }
+        XCTAssertEqual(completedIndex1, 1)
+        XCTAssertEqual(passageCount1, 1)
+        XCTAssertNotNil(events[5].elapsedSeconds)
+    }
+
+    func testReductionGroupSynthesisEventsOmitSingletonPassthroughGroups() async throws {
+        let collector = SynthesisEventCollector()
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.setContextTokenBudget(2)
+        driver.setTokenCountHandler { instructions, prompt in
+            let count = prompt.split(separator: "\n").count
+            if instructions == FoundationModelsLectureSummaryGenerator.batchInstructions { return 1 }
+            if instructions == FoundationModelsLectureSummaryGenerator.reductionInstructions { return count <= 2 ? 1 : 99 }
+            if instructions == FoundationModelsLectureSummaryGenerator.finalStructureInstructions { return count <= 2 ? 1 : 99 }
+            return 1
+        }
+        let backend = generator(driver, maxItems: 1, synthesisRecorder: collector.record)
+        let source = try SummaryTestSupport.source()
+        let (_, record) = try await planAndGeneration(backend, source: source)
+        let analyses = try completeAnalyses(generation: record, source: source)
+        // Three source carriers pack into groups of at most 2 under this
+        // budget: one real two-carrier reduction group, plus one
+        // single-carrier group carried forward unchanged (a passthrough,
+        // never a model call).
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Reduced pair", support: [1, 2], fidelity: "reconstructed", uncertainty: "Includes reconstructed formula support.")
+        ]))
+        driver.enqueue(AppleSummaryStructureDTO(sections: [
+            AppleSummarySectionPlanDTO(title: "Selected", supportIndices: [1, 2])
+        ]))
+        // The final section's own input carriers are the reduced carrier
+        // (reconstructed) plus the untouched third source carrier
+        // (uncertain) — its fidelity floor is therefore `uncertain`.
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Final section", support: [1, 2], fidelity: "uncertain", uncertainty: "Includes reconstructed formula support and an uncertain conclusion.")
+        ]))
+
+        _ = try await backend.generateDocument(from: analyses, generation: record, source: source)
+
+        let reductionEvents = collector.events.filter {
+            switch $0.boundary {
+            case .reductionGroupStarted, .reductionGroupCompleted: return true
+            default: return false
+            }
+        }
+        XCTAssertEqual(reductionEvents.count, 2, "exactly one group actually calls the model — no event for the passthrough singleton group")
+        guard case .reductionGroupStarted(let level, let groupIndex, let totalGroups, let inputCarrierCount) = reductionEvents[0].boundary else {
+            return XCTFail("expected reductionGroupStarted first")
+        }
+        XCTAssertEqual(level, 0)
+        XCTAssertEqual(groupIndex, 0, "the two-carrier group is packed first")
+        XCTAssertEqual(totalGroups, 2)
+        XCTAssertEqual(inputCarrierCount, 2)
+        guard case .reductionGroupCompleted(_, _, let outputCarrierCount) = reductionEvents[1].boundary else {
+            return XCTFail("expected reductionGroupCompleted second")
+        }
+        XCTAssertEqual(outputCarrierCount, 1)
+        XCTAssertNotNil(reductionEvents[1].elapsedSeconds)
+    }
+
     // MARK: Generated-output retry boundary
+
+    func testGeneratedOutputAttemptFailedDiagnosticReportsAccurateWillRetry() async throws {
+        let collector = DiagnosticEventCollector()
+        let driver = FakeFoundationModelsSessionDriver()
+        driver.setTokenCountOverride(1)
+        let backend = generator(driver, maxItems: 2, diagnosticRecorder: collector.record)
+        let source = try SummaryTestSupport.source()
+        let (plan, record) = try await planAndGeneration(backend, source: source)
+        // Both scripted attempts fail with the same retryable category
+        // (`.uncertaintyExplanationRequired`), so attempt 1 retries and
+        // attempt 2 — the last allowed attempt — exhausts retries and
+        // throws.
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Attempt 1", support: [1], fidelity: "uncertain", uncertainty: " ")
+        ]))
+        driver.enqueue(AppleSummaryPassagesDTO(passages: [
+            passageDTO("Attempt 2", support: [1], fidelity: "uncertain", uncertainty: " ")
+        ]))
+
+        do {
+            _ = try await backend.generateAnalysis(for: plan.batches[0], generation: record, source: source)
+            XCTFail("expected retry exhaustion to throw")
+        } catch let error as FoundationModelsSummaryBackendError {
+            XCTAssertEqual(error, .uncertaintyExplanationRequired)
+        }
+
+        XCTAssertEqual(collector.events.count, 2)
+        XCTAssertEqual(collector.events[0].attempt, 1)
+        XCTAssertTrue(collector.events[0].willRetry, "a retryable category with attempts remaining must report willRetry == true")
+        XCTAssertEqual(collector.events[1].attempt, 2)
+        XCTAssertFalse(collector.events[1].willRetry, "the final attempt must never claim it will retry, matching the actual thrown outcome")
+    }
 
     func testMissingUncertaintyExplanationRetriesExactRequestAndUsesOnlyValidResponseEvidence() async throws {
         let driver = FakeFoundationModelsSessionDriver()

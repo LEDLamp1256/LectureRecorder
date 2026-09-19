@@ -83,8 +83,35 @@ final class AppEnvironment: ObservableObject {
         )
         // Local, $0 default backend for every brand-new generation. All
         // real FoundationModels/LanguageModelSession calls stay inside
-        // `RealFoundationModelsSessionDriver`.
-        let appleNotesGenerator = FoundationModelsLectureNotesGenerator()
+        // `RealFoundationModelsSessionDriver`. `diagnosticRecorder` below is
+        // purely additive (see the type's own doc comment) — it only
+        // forwards already-computed preflight metadata into
+        // `AcceptanceDiagnosticLogger`. Supplied only when acceptance
+        // diagnostics are actually enabled, so a normal disabled run never
+        // even constructs a diagnostic-event value or invokes a callback
+        // merely to reach a no-op logger.
+        let notesDiagnosticRecorder: (@Sendable (FoundationModelsNotesDiagnosticEvent) -> Void)?
+        if AcceptanceDiagnosticLogger.isEnabled {
+            notesDiagnosticRecorder = { (event: FoundationModelsNotesDiagnosticEvent) in
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Notes.preflight,
+                    metadata: [
+                        "stage": .string(event.stage.description),
+                        "estimatedInputTokens": .int(event.estimatedInputTokens),
+                        "tokenCountAvailable": .bool(event.estimatedInputTokens != nil),
+                        "responseReserve": .int(event.responseReserve),
+                        "contextLimit": .int(event.contextLimit),
+                        "fitDirectly": .bool(event.fitDirectly),
+                        "frameworkOverflow": .bool(event.frameworkOverflow)
+                    ]
+                )
+            }
+        } else {
+            notesDiagnosticRecorder = nil
+        }
+        let appleNotesGenerator = FoundationModelsLectureNotesGenerator(
+            diagnosticRecorder: notesDiagnosticRecorder
+        )
         let notesGeneratorRouter = LectureNotesGeneratorRouter(
             appleGenerator: appleNotesGenerator,
             openAIGenerator: openAINotesGenerator
@@ -123,7 +150,113 @@ final class AppEnvironment: ObservableObject {
             notesStore: notesStore,
             transcriptLoader: notesTranscriptSourceLoader
         )
-        let summaryGenerator = FoundationModelsLectureSummaryGenerator()
+        // Both recorder closures below are purely additive, mirroring
+        // `notesDiagnosticRecorder` above — and, likewise, supplied only
+        // when acceptance diagnostics are actually enabled.
+        let summaryDiagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)?
+        if AcceptanceDiagnosticLogger.isEnabled {
+            summaryDiagnosticRecorder = { (event: FoundationModelsSummaryDiagnosticEvent) in
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Summary.generatedOutputAttemptFailed,
+                    metadata: [
+                        "stage": .string(event.stage.rawValue),
+                        "attempt": .int(event.attempt),
+                        // Case name only — never `errorDescription`, which
+                        // can carry framework-provided free-text payloads
+                        // this diagnostic facility must never assume are
+                        // lecture-content-free.
+                        "errorCategory": .string(event.error.diagnosticCategory),
+                        "willRetry": .bool(event.willRetry)
+                    ]
+                )
+            }
+        } else {
+            summaryDiagnosticRecorder = nil
+        }
+        let summaryPreflightRecorder: (@Sendable (FoundationModelsSummaryPreflightEvent) -> Void)?
+        if AcceptanceDiagnosticLogger.isEnabled {
+            summaryPreflightRecorder = { (event: FoundationModelsSummaryPreflightEvent) in
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Summary.preflight,
+                    metadata: [
+                        "stage": .string(event.stage.rawValue),
+                        "estimatedInputTokens": .int(event.estimatedInputTokens),
+                        "tokenCountAvailable": .bool(event.estimatedInputTokens != nil),
+                        "responseReserve": .int(event.responseReserve),
+                        "contextLimit": .int(event.contextLimit),
+                        "fitsDirectly": .bool(event.fitsDirectly)
+                    ]
+                )
+            }
+        } else {
+            summaryPreflightRecorder = nil
+        }
+        let summarySynthesisRecorder: (@Sendable (FoundationModelsSummarySynthesisEvent) -> Void)?
+        if AcceptanceDiagnosticLogger.isEnabled {
+            summarySynthesisRecorder = { (event: FoundationModelsSummarySynthesisEvent) in
+                let baseMetadata: [String: AcceptanceDiagnosticValue] = [
+                    "sessionID": .uuid(event.sessionID),
+                    "generationID": .uuid(event.generationID)
+                ]
+                switch event.boundary {
+                case .reductionGroupStarted(let level, let groupIndex, let totalGroups, let inputCarrierCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.reductionGroupStarted,
+                        metadata: baseMetadata.merging([
+                            "level": .int(level), "groupIndex": .int(groupIndex),
+                            "totalGroups": .int(totalGroups), "inputCarrierCount": .int(inputCarrierCount)
+                        ]) { _, new in new }
+                    )
+                case .reductionGroupCompleted(let level, let groupIndex, let outputCarrierCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.reductionGroupCompleted,
+                        metadata: baseMetadata.merging([
+                            "level": .int(level), "groupIndex": .int(groupIndex),
+                            "outputCarrierCount": .int(outputCarrierCount)
+                        ]) { _, new in new },
+                        elapsedSeconds: event.elapsedSeconds
+                    )
+                case .finalStructureStarted(let inputCarrierCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.finalStructureStarted,
+                        metadata: baseMetadata.merging([
+                            "inputCarrierCount": .int(inputCarrierCount)
+                        ]) { _, new in new }
+                    )
+                case .finalStructureCompleted(let sectionCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.finalStructureCompleted,
+                        metadata: baseMetadata.merging([
+                            "sectionCount": .int(sectionCount)
+                        ]) { _, new in new },
+                        elapsedSeconds: event.elapsedSeconds
+                    )
+                case .finalSectionStarted(let sectionIndex, let totalSections, let inputCarrierCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.finalSectionStarted,
+                        metadata: baseMetadata.merging([
+                            "sectionIndex": .int(sectionIndex), "totalSections": .int(totalSections),
+                            "inputCarrierCount": .int(inputCarrierCount)
+                        ]) { _, new in new }
+                    )
+                case .finalSectionCompleted(let sectionIndex, let passageCount):
+                    AcceptanceDiagnosticLogger.shared.log(
+                        AcceptanceDiagnosticEvent.Summary.finalSectionCompleted,
+                        metadata: baseMetadata.merging([
+                            "sectionIndex": .int(sectionIndex), "passageCount": .int(passageCount)
+                        ]) { _, new in new },
+                        elapsedSeconds: event.elapsedSeconds
+                    )
+                }
+            }
+        } else {
+            summarySynthesisRecorder = nil
+        }
+        let summaryGenerator = FoundationModelsLectureSummaryGenerator(
+            diagnosticRecorder: summaryDiagnosticRecorder,
+            preflightRecorder: summaryPreflightRecorder,
+            synthesisRecorder: summarySynthesisRecorder
+        )
         self.summaryStore = summaryStore
         self.summaryOperationStateStore = summaryOperationStateStore
         self.summarySourceLoader = summarySourceLoader

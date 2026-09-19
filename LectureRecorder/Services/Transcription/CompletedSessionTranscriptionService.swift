@@ -80,8 +80,28 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     private let shutdownPollInterval: TimeInterval
 
     @Published private(set) var activeSessionID: UUID?
-    @Published private(set) var phase: OperationPhase = .idle
+    @Published private(set) var phase: OperationPhase = .idle {
+        didSet {
+            // Purely additive acceptance-diagnostics observation of every
+            // terminal state this operation reaches — see
+            // `AcceptanceDiagnosticLogger`. Never itself a source of truth;
+            // reads only already-published state.
+            guard case .finished(let status) = phase, let activeSessionID else { return }
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Transcription.completed,
+                metadata: [
+                    "sessionID": .uuid(activeSessionID),
+                    "status": .string(Self.diagnosticDescription(for: status))
+                ],
+                elapsedSeconds: currentRunStartInstant.map(AcceptanceDiagnosticLogger.elapsedSeconds(since:))
+            )
+        }
+    }
     @Published private(set) var displayedSegments: [OrderedSegment] = []
+    /// Set alongside `activeSessionID` at admission, purely so the
+    /// `phase` diagnostic observer above can report total run elapsed —
+    /// never consulted by any operational logic.
+    private var currentRunStartInstant: ContinuousClock.Instant?
 
     /// Set synchronously, before any `await`, by `shutdown()` — never by
     /// any other path, and never cleared once set (this instance is done
@@ -144,6 +164,10 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     /// because a view disappeared — this must be called explicitly.
     func cancel(sessionID: UUID) {
         guard currentTask != nil, activeSessionID == sessionID else { return }
+        AcceptanceDiagnosticLogger.shared.log(
+            AcceptanceDiagnosticEvent.Transcription.cancelRequested,
+            metadata: ["sessionID": .uuid(sessionID)]
+        )
         phase = .cancelling
         currentTask?.cancel()
     }
@@ -350,6 +374,12 @@ final class CompletedSessionTranscriptionService: ObservableObject {
         // pointing at a different, not-yet-processed session.
         displayedSegments = []
 
+        currentRunStartInstant = AcceptanceDiagnosticLogger.startInstant()
+        AcceptanceDiagnosticLogger.shared.log(
+            retryFailedJobs ? AcceptanceDiagnosticEvent.Transcription.continueOrRetryStarted : AcceptanceDiagnosticEvent.Transcription.started,
+            metadata: ["sessionID": .uuid(sessionID)]
+        )
+
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generation: myGeneration, retryFailedJobs: retryFailedJobs)
             await self?.releaseOperation(generation: myGeneration)
@@ -548,9 +578,24 @@ final class CompletedSessionTranscriptionService: ObservableObject {
                 self.phase = .processing(completed: completedSoFar, total: totalExpected, currentlyProcessing: chunk.sequenceNumber)
             }
 
+            let chunkStart = AcceptanceDiagnosticLogger.startInstant()
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Transcription.chunkStarted,
+                metadata: ["sessionID": .uuid(sessionID), "chunkSequenceNumber": .int(chunk.sequenceNumber)]
+            )
             do {
                 let resultJob = try await coordinator.processJob(sequenceNumber: chunk.sequenceNumber, paths: validated.artifactPaths)
                 currentJobs[chunk.sequenceNumber] = resultJob
+                AcceptanceDiagnosticLogger.shared.log(
+                    resultJob.state == .completed ? AcceptanceDiagnosticEvent.Transcription.chunkCompleted : AcceptanceDiagnosticEvent.Transcription.chunkFailed,
+                    metadata: [
+                        "sessionID": .uuid(sessionID),
+                        "chunkSequenceNumber": .int(chunk.sequenceNumber),
+                        "state": .string(resultJob.state.rawValue),
+                        "errorCategory": .string(resultJob.lastFailure?.category.rawValue)
+                    ],
+                    elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: chunkStart)
+                )
                 if resultJob.state != .completed {
                     // Fail-fast: stop scheduling further chunks after the
                     // first unsuccessful result. The successful prefix
@@ -561,6 +606,15 @@ final class CompletedSessionTranscriptionService: ObservableObject {
                 // Cancellation, commitDurabilityUncertain, or any other
                 // processJob failure — stop scheduling; terminal reload
                 // and classification below reports the true state.
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Transcription.chunkFailed,
+                    metadata: [
+                        "sessionID": .uuid(sessionID),
+                        "chunkSequenceNumber": .int(chunk.sequenceNumber),
+                        "errorCategory": .string(Self.diagnosticErrorCategory(for: error))
+                    ],
+                    elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: chunkStart)
+                )
                 break
             }
         }
@@ -619,6 +673,50 @@ final class CompletedSessionTranscriptionService: ObservableObject {
                 self.displayedSegments = []
             }
         }
+    }
+
+    // MARK: - Diagnostics
+
+    /// A content-free description of one terminal `SessionTranscriptionStatus`
+    /// for the acceptance-diagnostics trace — case name plus structural
+    /// counts only, never the full `.blocked(reasons:)` text (those reasons
+    /// can reference internal artifact detail beyond what this trace needs
+    /// to stay minimal).
+    private static func diagnosticDescription(for status: SessionTranscriptionStatus) -> String {
+        switch status {
+        case .notTranscribed: return "notTranscribed"
+        case .zeroChunkSession: return "zeroChunkSession"
+        case .incomplete(let completed, let total): return "incomplete(completed: \(completed), total: \(total))"
+        case .interrupted(let retryable): return "interrupted(retryableCount: \(retryable.count))"
+        case .recoveryPending: return "recoveryPending"
+        case .completed: return "completed"
+        case .blocked(let reasons): return "blocked(reasonCount: \(reasons.count))"
+        }
+    }
+
+    /// A deterministic, content-free classification of an error thrown out
+    /// of `coordinator.processJob(...)`, for the acceptance-diagnostics
+    /// trace only. Never `localizedDescription` or `String(describing:
+    /// error)` on the error value itself (either can embed arbitrary
+    /// underlying I/O detail, e.g. a filesystem path) — known cases are
+    /// named explicitly; anything else falls back to just the concrete
+    /// Swift error *type* name, never its message.
+    /// Not `private` so `@testable import` unit tests can verify no
+    /// arbitrary error text ever escapes into this classification.
+    static func diagnosticErrorCategory(for error: Error) -> String {
+        if error is CancellationError { return "cancellation" }
+        if let coordinatorError = error as? TranscriptionCoordinatorError {
+            switch coordinatorError {
+            case .alreadyClaimedByThisCoordinator: return "alreadyClaimedByThisCoordinator"
+            case .jobNotFound: return "jobNotFound"
+            case .jobNotClaimable: return "jobNotClaimable"
+            case .attemptSuperseded: return "attemptSuperseded"
+            case .sourceMissing: return "sourceMissing"
+            case .commitDurabilityUncertain: return "commitDurabilityUncertain"
+            case .retryNotEligible: return "retryNotEligible"
+            }
+        }
+        return String(describing: type(of: error))
     }
 
     // MARK: - Load helpers

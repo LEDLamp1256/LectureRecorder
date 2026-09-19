@@ -43,6 +43,34 @@ nonisolated enum FoundationModelsSummaryBackendError: LocalizedError, Sendable, 
         case .finalIntegrityValidationFailed(let reason): return "The generated Summary failed integrity validation: \(reason)"
         }
     }
+
+    /// A deterministic, content-free classification for acceptance
+    /// diagnostics — the case name only, never an associated `String`
+    /// payload (which can carry framework-provided stage/context text this
+    /// diagnostic facility must never assume is lecture-content-free).
+    /// Never consulted by `errorDescription` or any product error handling.
+    var diagnosticCategory: String {
+        switch self {
+        case .unavailable: return "unavailable"
+        case .incompatibleProvenance: return "incompatibleProvenance"
+        case .contextBudgetExceeded: return "contextBudgetExceeded"
+        case .tokenPreflightUnavailable: return "tokenPreflightUnavailable"
+        case .sourceItemTooLarge: return "sourceItemTooLarge"
+        case .malformedGeneratedStructure: return "malformedGeneratedStructure"
+        case .invalidLocalSupportIndex: return "invalidLocalSupportIndex"
+        case .duplicateLocalSupportIndex: return "duplicateLocalSupportIndex"
+        case .missingSupport: return "missingSupport"
+        case .emptyGeneratedContent: return "emptyGeneratedContent"
+        case .fidelityViolation: return "fidelityViolation"
+        case .uncertaintyExplanationRequired: return "uncertaintyExplanationRequired"
+        case .reductionCoverageLost: return "reductionCoverageLost"
+        case .nonProgressingReduction: return "nonProgressingReduction"
+        case .unsupportedLanguage: return "unsupportedLanguage"
+        case .guardrailFailure: return "guardrailFailure"
+        case .frameworkFailure: return "frameworkFailure"
+        case .finalIntegrityValidationFailed: return "finalIntegrityValidationFailed"
+        }
+    }
 }
 
 nonisolated enum FoundationModelsSummaryCallStage: String, Sendable {
@@ -60,9 +88,59 @@ nonisolated struct FoundationModelsSummaryDiagnosticEvent: Sendable, Equatable {
     var stage: FoundationModelsSummaryCallStage
     var attempt: Int
     var error: FoundationModelsSummaryBackendError
+    /// Whether `withGeneratedOutputRetry` will actually retry this failure
+    /// — computed once from the exact same boolean the retry `guard` uses
+    /// (see `withGeneratedOutputRetry`), never independently recomputed or
+    /// reinterpreted here. Diagnostics observe this decision; they never
+    /// make it.
+    var willRetry: Bool
     var generatedFidelity: LectureNoteContentFidelity?
     var requiredFloorFidelity: LectureNoteContentFidelity?
     var supportIndices: [Int]?
+}
+
+/// Test/debug-only observability for one context-budget preflight decision
+/// — purely additive, mirroring `FoundationModelsNotesDiagnosticEvent`'s
+/// established contract for the Notes backend: recording (or not recording)
+/// an event never changes what is fit-checked, split, retried, or
+/// dispatched. Reported for every `fits(...)` call, successful or not —
+/// unlike `FoundationModelsSummaryDiagnosticEvent` above, which only
+/// reports a failed generated-output attempt.
+/// Test/debug-only observability for the generator's sequential
+/// synthesis-phase model-call boundaries (reduction groups, final
+/// structure, final sections) — purely additive, same contract as
+/// `diagnosticRecorder`/`preflightRecorder` above: recording an event never
+/// changes what is dispatched, retried, or how many Foundation Models
+/// calls occur. Content-free by construction — every case carries only
+/// identifiers, indices, and counts, never carrier/prompt/model-output
+/// text. `elapsedSeconds` is set only on a `*Completed` case.
+nonisolated struct FoundationModelsSummarySynthesisEvent: Sendable, Equatable {
+    nonisolated enum Boundary: Sendable, Equatable {
+        /// Never reported for a singleton group carried forward unchanged
+        /// — that is a passthrough, not a model call.
+        case reductionGroupStarted(level: Int, groupIndex: Int, totalGroups: Int, inputCarrierCount: Int)
+        case reductionGroupCompleted(level: Int, groupIndex: Int, outputCarrierCount: Int)
+        case finalStructureStarted(inputCarrierCount: Int)
+        case finalStructureCompleted(sectionCount: Int)
+        case finalSectionStarted(sectionIndex: Int, totalSections: Int, inputCarrierCount: Int)
+        case finalSectionCompleted(sectionIndex: Int, passageCount: Int)
+    }
+
+    var sessionID: UUID
+    var generationID: UUID
+    var boundary: Boundary
+    var elapsedSeconds: Double?
+}
+
+nonisolated struct FoundationModelsSummaryPreflightEvent: Sendable, Equatable {
+    var stage: FoundationModelsSummaryCallStage
+    /// `nil` when the real token-count preflight itself was unavailable
+    /// (model unavailable, or any other framework error) — never a value
+    /// this backend estimated or approximated on its own.
+    var estimatedInputTokens: Int?
+    var responseReserve: Int
+    var contextLimit: Int
+    var fitsDirectly: Bool
 }
 
 /// Mutable scratch space, private to one `withGeneratedOutputRetry` call,
@@ -136,6 +214,16 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
     /// here before `withGeneratedOutputRetry` applies its unchanged retry
     /// decision. Never consulted for that decision itself.
     private let diagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)?
+    /// Nil by default. When set (tests, real-acceptance diagnostics), every
+    /// `fits(...)` preflight decision — successful or not — is reported
+    /// here, never consulted for the fit decision itself. See
+    /// `FoundationModelsSummaryPreflightEvent`.
+    private let preflightRecorder: (@Sendable (FoundationModelsSummaryPreflightEvent) -> Void)?
+    /// Nil by default. When set (tests, real-acceptance diagnostics), every
+    /// reduction-group/final-structure/final-section boundary is reported
+    /// here — purely additive, never consulted for any dispatch decision.
+    /// See `FoundationModelsSummarySynthesisEvent`.
+    private let synthesisRecorder: (@Sendable (FoundationModelsSummarySynthesisEvent) -> Void)?
 
     init(
         sessionDriver: any FoundationModelsSessionDriving = RealFoundationModelsSessionDriver(),
@@ -143,7 +231,9 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
         maxInputBytesPerCall: Int = 6_000,
         maxItemsPerBatch: Int = 12,
         maxReductionLevels: Int = 8,
-        diagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)? = nil
+        diagnosticRecorder: (@Sendable (FoundationModelsSummaryDiagnosticEvent) -> Void)? = nil,
+        preflightRecorder: (@Sendable (FoundationModelsSummaryPreflightEvent) -> Void)? = nil,
+        synthesisRecorder: (@Sendable (FoundationModelsSummarySynthesisEvent) -> Void)? = nil
     ) {
         self.sessionDriver = sessionDriver
         self.responseReserves = responseReserves
@@ -151,6 +241,8 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
         self.maxItemsPerBatch = max(1, maxItemsPerBatch)
         self.maxReductionLevels = max(1, maxReductionLevels)
         self.diagnosticRecorder = diagnosticRecorder
+        self.preflightRecorder = preflightRecorder
+        self.synthesisRecorder = synthesisRecorder
     }
 
     func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
@@ -311,22 +403,74 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
             guard level < maxReductionLevels else {
                 throw FoundationModelsSummaryBackendError.contextBudgetExceeded(FoundationModelsSummaryCallStage.finalStructure.rawValue)
             }
+            let levelStart = AcceptanceDiagnosticLogger.startInstant()
             let groups = try await makeReductionGroups(carriers)
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Summary.reductionLevelStarted,
+                metadata: [
+                    "sessionID": .uuid(generation.sessionID),
+                    "generationID": .uuid(generation.generationID),
+                    "level": .int(level),
+                    "inputCarrierCount": .int(carriers.count),
+                    "groupCount": .int(groups.count)
+                ]
+            )
             var reduced: [FoundationModelsSummaryCarrier] = []
-            for group in groups {
+            for (groupIndex, group) in groups.enumerated() {
                 if group.count == 1 {
+                    // A passthrough — carried forward unchanged, never a
+                    // model call. No group-level event: recording one here
+                    // would misrepresent this as a Foundation Models
+                    // request that never happened.
                     reduced.append(group[0])
                 } else {
-                    reduced.append(contentsOf: try await reduce(group, source: source))
+                    let groupStart = AcceptanceDiagnosticLogger.startInstant()
+                    synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+                        sessionID: generation.sessionID,
+                        generationID: generation.generationID,
+                        boundary: .reductionGroupStarted(
+                            level: level, groupIndex: groupIndex,
+                            totalGroups: groups.count, inputCarrierCount: group.count
+                        )
+                    ))
+                    let groupOutput = try await reduce(group, source: source)
+                    synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+                        sessionID: generation.sessionID,
+                        generationID: generation.generationID,
+                        boundary: .reductionGroupCompleted(
+                            level: level, groupIndex: groupIndex, outputCarrierCount: groupOutput.count
+                        ),
+                        elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: groupStart)
+                    ))
+                    reduced.append(contentsOf: groupOutput)
                 }
             }
             guard reduced.count < carriers.count else { throw FoundationModelsSummaryBackendError.nonProgressingReduction }
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Summary.reductionLevelCompleted,
+                metadata: [
+                    "sessionID": .uuid(generation.sessionID),
+                    "generationID": .uuid(generation.generationID),
+                    "level": .int(level),
+                    "outputCarrierCount": .int(reduced.count)
+                ],
+                elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: levelStart)
+            )
             carriers = reduced
             level += 1
         }
         guard let structureRequest else {
             preconditionFailure("final-structure reduction loop exited without a context-safe request")
         }
+        let finalStructureStart = AcceptanceDiagnosticLogger.startInstant()
+        synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+            sessionID: generation.sessionID,
+            generationID: generation.generationID,
+            boundary: .finalStructureStarted(inputCarrierCount: carriers.count)
+        ))
+        // Elapsed here covers exactly this generator operation, including
+        // its own internal generated-output retry — never the orchestration
+        // service's later source revalidation or document persistence.
         let sectionSelections: [(heading: String, carriers: [FoundationModelsSummaryCarrier])] = try await withGeneratedOutputRetry(stage: .finalStructure) { _ in
             let structure: AppleSummaryStructureDTO = try await respond(
                 instructions: Self.finalStructureInstructions,
@@ -353,9 +497,15 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
                 return (heading, indices.map { carriers[$0 - 1] })
             }
         }
+        synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+            sessionID: generation.sessionID,
+            generationID: generation.generationID,
+            boundary: .finalStructureCompleted(sectionCount: sectionSelections.count),
+            elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: finalStructureStart)
+        ))
 
         var sections: [LectureSummarySection] = []
-        for selection in sectionSelections {
+        for (sectionIndex, selection) in sectionSelections.enumerated() {
             try Task.checkCancellation()
             let prompt = Self.encodeFinalSectionPrompt(
                 heading: selection.heading,
@@ -369,6 +519,15 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
                 prompt: prompt, instructions: Self.finalSectionInstructions,
                 schema: schema, stage: .finalSection
             ) else { throw FoundationModelsSummaryBackendError.contextBudgetExceeded(FoundationModelsSummaryCallStage.finalSection.rawValue) }
+            let finalSectionStart = AcceptanceDiagnosticLogger.startInstant()
+            synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+                sessionID: generation.sessionID,
+                generationID: generation.generationID,
+                boundary: .finalSectionStarted(
+                    sectionIndex: sectionIndex, totalSections: sectionSelections.count,
+                    inputCarrierCount: selection.carriers.count
+                )
+            ))
             let passages: [LectureSummaryPassage] = try await withGeneratedOutputRetry(stage: .finalSection) { fidelityBox in
                 let result: AppleSummaryPassagesDTO = try await respond(
                     instructions: Self.finalSectionInstructions, prompt: prompt, schema: schema,
@@ -398,6 +557,12 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
                 }
                 return mapped
             }
+            synthesisRecorder?(FoundationModelsSummarySynthesisEvent(
+                sessionID: generation.sessionID,
+                generationID: generation.generationID,
+                boundary: .finalSectionCompleted(sectionIndex: sectionIndex, passageCount: passages.count),
+                elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: finalSectionStart)
+            ))
             sections.append(LectureSummarySection(heading: selection.heading, passages: passages))
         }
 
@@ -747,12 +912,23 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
         schema: GenerationSchema,
         stage: FoundationModelsSummaryCallStage
     ) async throws -> Bool {
+        let reserve = responseReserves.reserve(for: stage)
+        let limit = sessionDriver.contextTokenBudget
         guard let tokens = await sessionDriver.estimatedTokenCount(
             instructions: instructions, prompt: prompt, schema: schema
         ) else {
+            preflightRecorder?(FoundationModelsSummaryPreflightEvent(
+                stage: stage, estimatedInputTokens: nil,
+                responseReserve: reserve, contextLimit: limit, fitsDirectly: false
+            ))
             throw FoundationModelsSummaryBackendError.tokenPreflightUnavailable(stage.rawValue)
         }
-        return tokens + responseReserves.reserve(for: stage) <= sessionDriver.contextTokenBudget
+        let fitsDirectly = tokens + reserve <= limit
+        preflightRecorder?(FoundationModelsSummaryPreflightEvent(
+            stage: stage, estimatedInputTokens: tokens,
+            responseReserve: reserve, contextLimit: limit, fitsDirectly: fitsDirectly
+        ))
+        return fitsDirectly
     }
 
     private func ensureAvailable() throws {
@@ -780,16 +956,22 @@ nonisolated struct FoundationModelsLectureSummaryGenerator: LectureSummaryGenera
             } catch is CancellationError {
                 throw CancellationError()
             } catch let error as FoundationModelsSummaryBackendError {
+                // Computed exactly once and reused for both the diagnostic
+                // event and the control-flow guard below — diagnostics
+                // must observe this decision, never independently
+                // recompute or risk diverging from it.
+                let willRetry = attempt < Self.maximumGeneratedOutputAttempts
+                    && Self.isRetryableGeneratedOutputError(error)
                 diagnosticRecorder?(FoundationModelsSummaryDiagnosticEvent(
                     stage: stage,
                     attempt: attempt,
                     error: error,
+                    willRetry: willRetry,
                     generatedFidelity: fidelityBox.context?.generatedFidelity,
                     requiredFloorFidelity: fidelityBox.context?.requiredFloorFidelity,
                     supportIndices: fidelityBox.context?.supportIndices
                 ))
-                guard attempt < Self.maximumGeneratedOutputAttempts,
-                      Self.isRetryableGeneratedOutputError(error) else {
+                guard willRetry else {
                     throw error
                 }
                 try Task.checkCancellation()
