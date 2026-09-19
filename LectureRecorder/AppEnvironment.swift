@@ -112,13 +112,18 @@ final class AppEnvironment: ObservableObject {
         let appleNotesGenerator = FoundationModelsLectureNotesGenerator(
             diagnosticRecorder: notesDiagnosticRecorder
         )
-        // MLX-1: local Qwen3-8B-4bit backend, the new default for every
-        // brand-new Notes generation. `RealMLXSessionDriver` owns model
-        // verification/loading, tokenizer access, and grammar-constrained
-        // generation; constructing it here never loads the (multi-GB) model
-        // — that happens lazily on first real request, gated by
-        // `MLXModelVerifier`.
-        let mlxNotesGenerator = MLXLectureNotesGenerator()
+        // MLX-1/MLX-2: single shared local Qwen3-8B-4bit runtime for every
+        // brand-new Notes and Summary generation. `RealMLXSessionDriver` owns
+        // model verification/loading, tokenizer access, and grammar-
+        // constrained generation; constructing it here never loads the
+        // (multi-GB) model — that happens lazily on first real request,
+        // gated by `MLXModelVerifier`. Deliberately constructed once and
+        // injected into both `MLXLectureNotesGenerator` and
+        // `MLXLectureSummaryGenerator` below (rather than each defaulting to
+        // its own instance) so the model loads and stays resident at most
+        // once per app session, never once per domain.
+        let sharedMLXSessionDriver = RealMLXSessionDriver()
+        let mlxNotesGenerator = MLXLectureNotesGenerator(sessionDriver: sharedMLXSessionDriver)
         let notesGeneratorRouter = LectureNotesGeneratorRouter(
             appleGenerator: appleNotesGenerator,
             openAIGenerator: openAINotesGenerator,
@@ -261,10 +266,23 @@ final class AppEnvironment: ObservableObject {
         } else {
             summarySynthesisRecorder = nil
         }
-        let summaryGenerator = FoundationModelsLectureSummaryGenerator(
+        // Legacy backend, retained only for Continue/Retry of pre-existing
+        // Apple Foundation Models Summary generations — no longer the
+        // default for brand-new generations (mirrors the same Notes-side
+        // demotion of `appleNotesGenerator` above).
+        let appleSummaryGenerator = FoundationModelsLectureSummaryGenerator(
             diagnosticRecorder: summaryDiagnosticRecorder,
             preflightRecorder: summaryPreflightRecorder,
             synthesisRecorder: summarySynthesisRecorder
+        )
+        // MLX-2: the new default for every brand-new Summary generation —
+        // injected with the exact same `sharedMLXSessionDriver` instance
+        // `mlxNotesGenerator` above uses, so Notes and Summary share one
+        // loaded model rather than each loading their own copy.
+        let mlxSummaryGenerator = MLXLectureSummaryGenerator(sessionDriver: sharedMLXSessionDriver)
+        let summaryGeneratorRouter = LectureSummaryGeneratorRouter(
+            appleGenerator: appleSummaryGenerator,
+            mlxGenerator: mlxSummaryGenerator
         )
         self.summaryStore = summaryStore
         self.summaryOperationStateStore = summaryOperationStateStore
@@ -273,9 +291,9 @@ final class AppEnvironment: ObservableObject {
             sourceLoader: summarySourceLoader,
             summaryStore: summaryStore,
             operationStateStore: summaryOperationStateStore,
-            generator: summaryGenerator,
-            newGenerationAvailabilityChecker: summaryGenerator,
-            generationProvenance: FoundationModelsSummaryConfiguration.generationProvenance
+            generator: summaryGeneratorRouter,
+            newGenerationAvailabilityChecker: summaryGeneratorRouter,
+            generationProvenance: MLXSummaryConfiguration.generationProvenance
         )
     }
 }
