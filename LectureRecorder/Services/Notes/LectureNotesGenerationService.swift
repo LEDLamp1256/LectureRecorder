@@ -87,10 +87,46 @@ final class LectureNotesGenerationService: ObservableObject {
             default:
                 description = nil
             }
-            guard let description, let activeSessionID else { return }
-            lastFailureDescriptionBySessionID[activeSessionID] = description
+            if let description, let activeSessionID {
+                lastFailureDescriptionBySessionID[activeSessionID] = description
+            }
+
+            // Purely additive acceptance-diagnostics observation of every
+            // terminal outcome — see `AcceptanceDiagnosticLogger`. Reads
+            // only already-published/already-computed state; never a
+            // source of truth for anything above.
+            guard case .finished(let outcome) = phase, let activeSessionID else { return }
+            let elapsed = currentRunStartInstant.map(AcceptanceDiagnosticLogger.elapsedSeconds(since:))
+            switch outcome {
+            case .completed:
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Notes.completed,
+                    metadata: ["sessionID": .uuid(activeSessionID), "generationID": .uuid(activeGenerationID)],
+                    elapsedSeconds: elapsed
+                )
+            case .cancelled:
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Notes.cancelled,
+                    metadata: ["sessionID": .uuid(activeSessionID), "generationID": .uuid(activeGenerationID)],
+                    elapsedSeconds: elapsed
+                )
+            case .staleSource, .damaged, .failed, .backendUnavailable:
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Notes.failed,
+                    metadata: [
+                        "sessionID": .uuid(activeSessionID),
+                        "generationID": .uuid(activeGenerationID),
+                        "outcome": .string(Self.diagnosticDescription(for: outcome))
+                    ],
+                    elapsedSeconds: elapsed
+                )
+            }
         }
     }
+    /// Set on every successful admission, purely so the `phase` diagnostic
+    /// observer above can report total run elapsed — never consulted by
+    /// any operational logic.
+    private var currentRunStartInstant: ContinuousClock.Instant?
     /// Transient, memory-only, session-keyed record of the most recent
     /// `.failed(description:)` terminal outcome for each session — the
     /// only terminal case that can otherwise leave no new durable evidence
@@ -166,7 +202,14 @@ final class LectureNotesGenerationService: ObservableObject {
     /// for this session (T5-B contract §6).
     @discardableResult
     func generate(sessionID: UUID) -> AdmissionResult {
-        beginOperation(sessionID: sessionID, generationID: nil)
+        let result = beginOperation(sessionID: sessionID, generationID: nil)
+        if result == .admitted {
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Notes.started,
+                metadata: ["sessionID": .uuid(sessionID)]
+            )
+        }
+        return result
     }
 
     /// Resumes `generationID` after cancellation, interruption, or clean
@@ -174,7 +217,14 @@ final class LectureNotesGenerationService: ObservableObject {
     /// (T5-B contract §7).
     @discardableResult
     func continueGeneration(sessionID: UUID, generationID: UUID) -> AdmissionResult {
-        beginOperation(sessionID: sessionID, generationID: generationID)
+        let result = beginOperation(sessionID: sessionID, generationID: generationID)
+        if result == .admitted {
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Notes.continueStarted,
+                metadata: ["sessionID": .uuid(sessionID), "generationID": .uuid(generationID)]
+            )
+        }
+        return result
     }
 
     /// Resumes `generationID` after a recoverable failure. Uses the same
@@ -182,7 +232,14 @@ final class LectureNotesGenerationService: ObservableObject {
     /// which case a caller invokes it from — see T5-B contract §8.
     @discardableResult
     func retry(sessionID: UUID, generationID: UUID) -> AdmissionResult {
-        beginOperation(sessionID: sessionID, generationID: generationID)
+        let result = beginOperation(sessionID: sessionID, generationID: generationID)
+        if result == .admitted {
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Notes.retryStarted,
+                metadata: ["sessionID": .uuid(sessionID), "generationID": .uuid(generationID)]
+            )
+        }
+        return result
     }
 
     /// Requests cooperative cancellation of the active operation, if it
@@ -190,6 +247,10 @@ final class LectureNotesGenerationService: ObservableObject {
     /// because a view disappeared.
     func cancel(sessionID: UUID) {
         guard currentTask != nil, activeSessionID == sessionID else { return }
+        AcceptanceDiagnosticLogger.shared.log(
+            AcceptanceDiagnosticEvent.Notes.cancelRequested,
+            metadata: ["sessionID": .uuid(sessionID), "generationID": .uuid(activeGenerationID)]
+        )
         phase = .cancelling
         currentTask?.cancel()
     }
@@ -250,6 +311,7 @@ final class LectureNotesGenerationService: ObservableObject {
         activeSessionID = sessionID
         activeGenerationID = generationID
         phase = .preparingSource
+        currentRunStartInstant = AcceptanceDiagnosticLogger.startInstant()
 
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generationID: generationID, epoch: myEpoch)
@@ -592,6 +654,17 @@ final class LectureNotesGenerationService: ObservableObject {
             }
 
             let units = sourceUnits(for: window, in: sourceSnapshotAtStart)
+            let windowStart = AcceptanceDiagnosticLogger.startInstant()
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Notes.windowStarted,
+                metadata: [
+                    "sessionID": .uuid(sessionID),
+                    "generationID": .uuid(record.generationID),
+                    "windowIndex": .int(window.windowIndex),
+                    "totalWindows": .int(orderedWindows.count),
+                    "sourceUnitCount": .int(units.count)
+                ]
+            )
             let analysis: LectureNotesWindowAnalysis
             do {
                 analysis = try await generator.analyzeWindow(units: units, window: window, generation: record)
@@ -669,6 +742,16 @@ final class LectureNotesGenerationService: ObservableObject {
             switch commitOutcome {
             case .committed, .alreadyCommittedIdentical:
                 analyses.append(analysis)
+                AcceptanceDiagnosticLogger.shared.log(
+                    AcceptanceDiagnosticEvent.Notes.windowCompleted,
+                    metadata: [
+                        "sessionID": .uuid(sessionID),
+                        "generationID": .uuid(record.generationID),
+                        "windowIndex": .int(window.windowIndex),
+                        "itemCount": .int(analysis.items.count)
+                    ],
+                    elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: windowStart)
+                )
             case .committedDurabilityUncertain:
                 let description = "Commit durability for window \(window.windowIndex) is uncertain; use Continue or Retry to confirm."
                 persistState(.failed, stage: .analyzingWindow(windowIndex: window.windowIndex), failureDescription: description, record: record, paths: paths, runID: runID, attemptCount: attemptCount)
@@ -757,6 +840,15 @@ final class LectureNotesGenerationService: ObservableObject {
         persistState(.running, stage: .synthesizing, failureDescription: nil, record: record, paths: paths, runID: runID, attemptCount: attemptCount)
 
         let orderedAnalyses = analyses.sorted { $0.windowIndex < $1.windowIndex }
+        let synthesisStart = AcceptanceDiagnosticLogger.startInstant()
+        AcceptanceDiagnosticLogger.shared.log(
+            AcceptanceDiagnosticEvent.Notes.synthesisStarted,
+            metadata: [
+                "sessionID": .uuid(sessionID),
+                "generationID": .uuid(record.generationID),
+                "analysisCount": .int(orderedAnalyses.count)
+            ]
+        )
         let document: LectureNotesDocument
         do {
             document = try await generator.synthesize(analyses: orderedAnalyses, generation: record)
@@ -830,6 +922,15 @@ final class LectureNotesGenerationService: ObservableObject {
 
         switch commitOutcome {
         case .committed, .alreadyCommittedIdentical:
+            AcceptanceDiagnosticLogger.shared.log(
+                AcceptanceDiagnosticEvent.Notes.synthesisCompleted,
+                metadata: [
+                    "sessionID": .uuid(sessionID),
+                    "generationID": .uuid(record.generationID),
+                    "sectionCount": .int(document.sections.count)
+                ],
+                elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: synthesisStart)
+            )
             persistState(.completed, stage: .synthesizing, failureDescription: nil, record: record, paths: paths, runID: runID, attemptCount: attemptCount)
             publish { self.phase = .finished(.completed(document: document)) }
         case .committedDurabilityUncertain:
@@ -840,6 +941,38 @@ final class LectureNotesGenerationService: ObservableObject {
             let description = "A conflicting document already exists for this generation."
             persistState(.failed, stage: .synthesizing, failureDescription: description, record: record, paths: paths, runID: runID, attemptCount: attemptCount)
             publish { self.phase = .finished(.failed(description: description)) }
+        }
+    }
+
+    // MARK: - Diagnostics
+
+    /// A content-free description of one terminal `NotesGenerationOutcome`
+    /// for the acceptance-diagnostics trace — case name plus structural
+    /// detail only, never Notes content.
+    private static func diagnosticDescription(for outcome: NotesGenerationOutcome) -> String {
+        switch outcome {
+        case .completed: return "completed"
+        case .cancelled: return "cancelled"
+        case .staleSource: return "staleSource"
+        case .damaged(let reason): return "damaged(\(diagnosticCaseName(for: reason)))"
+        case .failed: return "failed"
+        case .backendUnavailable: return "backendUnavailable"
+        }
+    }
+
+    /// Case name only — never the associated payload, which for
+    /// `.corruptOrInvalidAnalysis`/`.invalidDocument`/`.coverageIntegrityViolation`
+    /// can carry an arbitrary underlying decode/validation error string.
+    private static func diagnosticCaseName(for reason: NotesGenerationDamageReason) -> String {
+        switch reason {
+        case .invalidWindowPlan: return "invalidWindowPlan"
+        case .corruptOrInvalidAnalysis: return "corruptOrInvalidAnalysis"
+        case .duplicateAnalysis: return "duplicateAnalysis"
+        case .analysisOutsidePlan: return "analysisOutsidePlan"
+        case .nonPrefixCoverage: return "nonPrefixCoverage"
+        case .documentWithoutCompleteCoverage: return "documentWithoutCompleteCoverage"
+        case .invalidDocument: return "invalidDocument"
+        case .coverageIntegrityViolation: return "coverageIntegrityViolation"
         }
     }
 
