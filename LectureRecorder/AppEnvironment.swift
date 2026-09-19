@@ -112,15 +112,24 @@ final class AppEnvironment: ObservableObject {
         let appleNotesGenerator = FoundationModelsLectureNotesGenerator(
             diagnosticRecorder: notesDiagnosticRecorder
         )
+        // MLX-1: local Qwen3-8B-4bit backend, the new default for every
+        // brand-new Notes generation. `RealMLXSessionDriver` owns model
+        // verification/loading, tokenizer access, and grammar-constrained
+        // generation; constructing it here never loads the (multi-GB) model
+        // — that happens lazily on first real request, gated by
+        // `MLXModelVerifier`.
+        let mlxNotesGenerator = MLXLectureNotesGenerator()
         let notesGeneratorRouter = LectureNotesGeneratorRouter(
             appleGenerator: appleNotesGenerator,
-            openAIGenerator: openAINotesGenerator
+            openAIGenerator: openAINotesGenerator,
+            mlxGenerator: mlxNotesGenerator
         )
-        // Apple's on-device session context is far smaller than OpenAI's —
-        // this budget only ever governs planning a *brand-new* generation;
-        // already-persisted generations (OpenAI or Apple) keep their own
-        // frozen `NotesWindowPlan` regardless of this value.
-        let notesWindowBudget = FoundationModelsNotesConfiguration.windowBudget
+        // MLX's operational context ceiling is far larger than Apple's
+        // on-device ~4,096 — this budget only ever governs planning a
+        // *brand-new* generation; already-persisted generations (OpenAI,
+        // Apple, or MLX) keep their own frozen `NotesWindowPlan` regardless
+        // of this value.
+        let notesWindowBudget = MLXNotesConfiguration.windowBudget
         let notesStore = LectureNotesStore()
         let notesOperationStateStore = LectureNotesOperationStateStore()
         let notesTranscriptSourceLoader = NotesTranscriptSourceLoader(transcriptionStore: transcriptionStore)
