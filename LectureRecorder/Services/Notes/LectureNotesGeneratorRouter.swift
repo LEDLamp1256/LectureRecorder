@@ -15,40 +15,46 @@ nonisolated enum LectureNotesGeneratorRoutingError: LocalizedError, Sendable, Eq
 }
 
 /// Routes every `LectureNotesGenerating` call to exactly the backend its
-/// own generation's persisted `provenance.backendIdentifier` names — Apple
-/// Foundation Models for new generations, the existing OpenAI generator for
-/// legacy ones. Deliberately small and fixed to these two known routes
-/// (T5-E scope explicitly excludes a general provider registry/picker); a
-/// future `MLXLectureNotesGenerator` route can be added the same way
-/// without touching this shape.
+/// own generation's persisted `provenance.backendIdentifier` names — MLX
+/// for new generations, Apple Foundation Models and the existing OpenAI
+/// generator preserved for legacy ones. Deliberately small and fixed to
+/// these three known routes (T5-E scope explicitly excluded a general
+/// provider registry/picker; MLX-1 extends the same fixed shape rather
+/// than replacing it).
 ///
-/// Never falls back from one backend to the other: a failure the routed
+/// Never falls back from one backend to another: a failure the routed
 /// backend throws is reported as-is, and unrecognized provenance fails
 /// closed via `LectureNotesGeneratorRoutingError.unknownBackend`.
 nonisolated struct LectureNotesGeneratorRouter: LectureNotesGenerating, NewLectureNotesGenerationAvailabilityChecking {
-    private let appleGenerator: any (LectureNotesGenerating & NewLectureNotesGenerationAvailabilityChecking)
+    private let appleGenerator: any LectureNotesGenerating
     private let openAIGenerator: any LectureNotesGenerating
+    private let mlxGenerator: any (LectureNotesGenerating & NewLectureNotesGenerationAvailabilityChecking)
     private let appleBackendIdentifier: String
     private let openAIBackendIdentifier: String
+    private let mlxBackendIdentifier: String
 
     init(
-        appleGenerator: any (LectureNotesGenerating & NewLectureNotesGenerationAvailabilityChecking),
+        appleGenerator: any LectureNotesGenerating,
         openAIGenerator: any LectureNotesGenerating,
+        mlxGenerator: any (LectureNotesGenerating & NewLectureNotesGenerationAvailabilityChecking),
         appleBackendIdentifier: String = FoundationModelsNotesConfiguration.backendIdentifier,
-        openAIBackendIdentifier: String = OpenAINotesConfiguration.backendIdentifier
+        openAIBackendIdentifier: String = OpenAINotesConfiguration.backendIdentifier,
+        mlxBackendIdentifier: String = MLXNotesConfiguration.backendIdentifier
     ) {
         self.appleGenerator = appleGenerator
         self.openAIGenerator = openAIGenerator
+        self.mlxGenerator = mlxGenerator
         self.appleBackendIdentifier = appleBackendIdentifier
         self.openAIBackendIdentifier = openAIBackendIdentifier
+        self.mlxBackendIdentifier = mlxBackendIdentifier
     }
 
-    /// Apple is the sole backend this router ever mints provenance for on a
-    /// brand-new generation (see `FoundationModelsNotesConfiguration
-    /// .generationProvenance`), so admission-time availability is always the
-    /// Apple generator's own answer — never the OpenAI generator's.
+    /// MLX is the sole backend this router ever mints provenance for on a
+    /// brand-new generation (see `MLXNotesConfiguration
+    /// .generationProvenance`), so admission-time availability is always
+    /// the MLX generator's own answer — never Apple's or OpenAI's.
     func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
-        appleGenerator.availabilityForNewGeneration()
+        mlxGenerator.availabilityForNewGeneration()
     }
 
     func analyzeWindow(
@@ -68,6 +74,8 @@ nonisolated struct LectureNotesGeneratorRouter: LectureNotesGenerating, NewLectu
 
     private func route(for generation: LectureNotesGenerationRecord) throws -> any LectureNotesGenerating {
         switch generation.provenance.backendIdentifier {
+        case mlxBackendIdentifier:
+            return mlxGenerator
         case appleBackendIdentifier:
             return appleGenerator
         case openAIBackendIdentifier:

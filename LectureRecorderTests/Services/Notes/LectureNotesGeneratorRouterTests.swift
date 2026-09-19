@@ -16,14 +16,19 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         )
     }
 
-    private func makeRouter(apple: RecordingLectureNotesGenerator, openAI: RecordingLectureNotesGenerator) -> LectureNotesGeneratorRouter {
-        LectureNotesGeneratorRouter(appleGenerator: apple, openAIGenerator: openAI)
+    private func makeRouter(
+        apple: RecordingLectureNotesGenerator,
+        openAI: RecordingLectureNotesGenerator,
+        mlx: RecordingLectureNotesGenerator
+    ) -> LectureNotesGeneratorRouter {
+        LectureNotesGeneratorRouter(appleGenerator: apple, openAIGenerator: openAI, mlxGenerator: mlx)
     }
 
     func testAppleProvenanceRoutesOnlyToApple() async throws {
         let apple = RecordingLectureNotesGenerator()
         let openAI = RecordingLectureNotesGenerator()
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: FoundationModelsNotesConfiguration.backendIdentifier)
 
         _ = try await router.analyzeWindow(units: [], window: window(), generation: generationRecord)
@@ -33,12 +38,15 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         XCTAssertEqual(apple.synthesizeCallCount, 1)
         XCTAssertEqual(openAI.analyzeCallCount, 0)
         XCTAssertEqual(openAI.synthesizeCallCount, 0)
+        XCTAssertEqual(mlx.analyzeCallCount, 0)
+        XCTAssertEqual(mlx.synthesizeCallCount, 0)
     }
 
     func testOpenAIProvenanceRoutesOnlyToOpenAI() async throws {
         let apple = RecordingLectureNotesGenerator()
         let openAI = RecordingLectureNotesGenerator()
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: OpenAINotesConfiguration.backendIdentifier)
 
         _ = try await router.analyzeWindow(units: [], window: window(), generation: generationRecord)
@@ -48,12 +56,33 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         XCTAssertEqual(openAI.synthesizeCallCount, 1)
         XCTAssertEqual(apple.analyzeCallCount, 0)
         XCTAssertEqual(apple.synthesizeCallCount, 0)
+        XCTAssertEqual(mlx.analyzeCallCount, 0)
+        XCTAssertEqual(mlx.synthesizeCallCount, 0)
+    }
+
+    func testMLXProvenanceRoutesOnlyToMLX() async throws {
+        let apple = RecordingLectureNotesGenerator()
+        let openAI = RecordingLectureNotesGenerator()
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
+        let generationRecord = generation(backendIdentifier: MLXNotesConfiguration.backendIdentifier)
+
+        _ = try await router.analyzeWindow(units: [], window: window(), generation: generationRecord)
+        _ = try await router.synthesize(analyses: [], generation: generationRecord)
+
+        XCTAssertEqual(mlx.analyzeCallCount, 1)
+        XCTAssertEqual(mlx.synthesizeCallCount, 1)
+        XCTAssertEqual(apple.analyzeCallCount, 0)
+        XCTAssertEqual(apple.synthesizeCallCount, 0)
+        XCTAssertEqual(openAI.analyzeCallCount, 0)
+        XCTAssertEqual(openAI.synthesizeCallCount, 0)
     }
 
     func testUnknownProvenanceFailsClosed() async throws {
         let apple = RecordingLectureNotesGenerator()
         let openAI = RecordingLectureNotesGenerator()
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: "some-unregistered-backend")
 
         do {
@@ -64,12 +93,14 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         }
         XCTAssertEqual(apple.analyzeCallCount, 0)
         XCTAssertEqual(openAI.analyzeCallCount, 0)
+        XCTAssertEqual(mlx.analyzeCallCount, 0)
     }
 
     func testNilProvenanceFailsClosed() async throws {
         let apple = RecordingLectureNotesGenerator()
         let openAI = RecordingLectureNotesGenerator()
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: nil)
 
         do {
@@ -80,11 +111,12 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         }
     }
 
-    func testAppleFailureDoesNotFallBackToOpenAI() async throws {
+    func testAppleFailureDoesNotFallBackToOpenAIOrMLX() async throws {
         let apple = RecordingLectureNotesGenerator()
         apple.synthesizeFailure = RecordingGeneratorFailure(message: "apple unavailable")
         let openAI = RecordingLectureNotesGenerator()
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: FoundationModelsNotesConfiguration.backendIdentifier)
 
         do {
@@ -94,13 +126,15 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
             XCTAssertEqual(error as? RecordingGeneratorFailure, RecordingGeneratorFailure(message: "apple unavailable"))
         }
         XCTAssertEqual(openAI.synthesizeCallCount, 0)
+        XCTAssertEqual(mlx.synthesizeCallCount, 0)
     }
 
-    func testOpenAIFailureDoesNotFallBackToApple() async throws {
+    func testOpenAIFailureDoesNotFallBackToAppleOrMLX() async throws {
         let apple = RecordingLectureNotesGenerator()
         let openAI = RecordingLectureNotesGenerator()
         openAI.synthesizeFailure = RecordingGeneratorFailure(message: "openai failed")
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
         let generationRecord = generation(backendIdentifier: OpenAINotesConfiguration.backendIdentifier)
 
         do {
@@ -110,15 +144,36 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
             XCTAssertEqual(error as? RecordingGeneratorFailure, RecordingGeneratorFailure(message: "openai failed"))
         }
         XCTAssertEqual(apple.synthesizeCallCount, 0)
+        XCTAssertEqual(mlx.synthesizeCallCount, 0)
     }
 
-    func testAvailabilityForNewGenerationDelegatesOnlyToApple() {
+    func testMLXFailureDoesNotFallBackToAppleOrOpenAI() async throws {
         let apple = RecordingLectureNotesGenerator()
-        apple.availabilityResult = .unavailable(description: "assets not ready")
+        let openAI = RecordingLectureNotesGenerator()
+        let mlx = RecordingLectureNotesGenerator()
+        mlx.synthesizeFailure = RecordingGeneratorFailure(message: "mlx failed")
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
+        let generationRecord = generation(backendIdentifier: MLXNotesConfiguration.backendIdentifier)
+
+        do {
+            _ = try await router.synthesize(analyses: [], generation: generationRecord)
+            XCTFail("expected the MLX generator's failure to propagate")
+        } catch {
+            XCTAssertEqual(error as? RecordingGeneratorFailure, RecordingGeneratorFailure(message: "mlx failed"))
+        }
+        XCTAssertEqual(apple.synthesizeCallCount, 0)
+        XCTAssertEqual(openAI.synthesizeCallCount, 0)
+    }
+
+    func testAvailabilityForNewGenerationDelegatesOnlyToMLX() {
+        let apple = RecordingLectureNotesGenerator()
+        apple.availabilityResult = .available
         let openAI = RecordingLectureNotesGenerator()
         openAI.availabilityResult = .available
-        let router = makeRouter(apple: apple, openAI: openAI)
+        let mlx = RecordingLectureNotesGenerator()
+        mlx.availabilityResult = .unavailable(description: "model assets not ready")
+        let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
 
-        XCTAssertEqual(router.availabilityForNewGeneration(), .unavailable(description: "assets not ready"))
+        XCTAssertEqual(router.availabilityForNewGeneration(), .unavailable(description: "model assets not ready"))
     }
 }

@@ -270,6 +270,11 @@
 			);
 			name = LectureRecorder;
 			packageProductDependencies = (
+				C0A000000000000000000501 /* MLXRuntimeMLX */,
+				C0A000000000000000000502 /* MLXRuntimeLLM */,
+				C0A000000000000000000503 /* MLXRuntimeLMCommon */,
+				C0A000000000000000000504 /* MLXRuntimeGuidedGeneration */,
+				C0A000000000000000000505 /* MLXRuntimeTokenizers */,
 			);
 			productName = LectureRecorder;
 			productReference = CB7D0A2630447E7A008522B4 /* LectureRecorder.app */;
@@ -398,6 +403,9 @@
 			);
 			mainGroup = CB7D0A1D30447E7A008522B4;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = CB7D0A2730447E7A008522B4 /* Products */;
 			projectDirPath = "";
@@ -958,6 +966,41 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Dependencies/MLXRuntime;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C0A000000000000000000501 /* MLXRuntimeMLX */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */;
+			productName = MLXRuntimeMLX;
+		};
+		C0A000000000000000000502 /* MLXRuntimeLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */;
+			productName = MLXRuntimeLLM;
+		};
+		C0A000000000000000000503 /* MLXRuntimeLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */;
+			productName = MLXRuntimeLMCommon;
+		};
+		C0A000000000000000000504 /* MLXRuntimeGuidedGeneration */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */;
+			productName = MLXRuntimeGuidedGeneration;
+		};
+		C0A000000000000000000505 /* MLXRuntimeTokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C0A000000000000000000500 /* XCLocalSwiftPackageReference "Dependencies/MLXRuntime" */;
+			productName = MLXRuntimeTokenizers;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CB7D0A1E30447E7A008522B4 /* Project object */;
 }
