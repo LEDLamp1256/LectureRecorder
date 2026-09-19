@@ -35,15 +35,24 @@ final class NotesActionAvailabilityTests: XCTestCase {
 
     // MARK: - Generate: no generation exists
 
-    func testNoGenerationAllowsGenerateOnlyWhenNoOperationOwnsIt() {
-        let idle = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration, ownership: .none)
+    func testNoGenerationAllowsGenerateOnlyWhenNoOperationOwnsItAndTranscriptIsReady() {
+        let idle = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: true), ownership: .none)
         XCTAssertEqual(idle, NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
 
-        let activeHere = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration, ownership: .activeHere)
+        let activeHere = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: true), ownership: .activeHere)
         XCTAssertFalse(activeHere.canGenerate)
 
-        let busyElsewhere = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration, ownership: .busyElsewhere)
+        let busyElsewhere = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: true), ownership: .busyElsewhere)
         XCTAssertFalse(busyElsewhere.canGenerate)
+    }
+
+    /// Correction: a missing Notes generation alone must never enable
+    /// Generate — the transcript must also be a currently valid, completed
+    /// source. Covers the acceptance-diagnostics scenario where Generate
+    /// Notes was tapped while transcription was still processing.
+    func testNoGenerationDisablesGenerateWhileTranscriptIsNotReady() {
+        let idle = NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: false), ownership: .none)
+        XCTAssertEqual(idle, NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
     }
 
     // MARK: - Continue
@@ -128,7 +137,7 @@ final class NotesActionAvailabilityTests: XCTestCase {
     func testBusyElsewhereDisablesAllActionsRegardlessOfDisplayState() {
         let states: [SessionNotesDisplayState] = [
             .loading,
-            .noGeneration,
+            .noGeneration(transcriptSourceReady: true),
             .loadError("boom"),
             .loaded(record: makeRecord(), classification: .completed(document: makeCompletedDocument()), advisoryStateIntegrity: .normal),
         ]
