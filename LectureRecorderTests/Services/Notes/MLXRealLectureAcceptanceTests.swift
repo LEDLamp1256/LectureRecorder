@@ -18,11 +18,11 @@ import XCTest
 /// Bypasses `LectureNotesGenerationService`/`LectureSummaryGenerationService`
 /// entirely and drives `MLXLectureNotesGenerator`/`MLXLectureSummaryGenerator`
 /// directly — exactly as `MLXRealAcceptanceTests`/`MLXSummaryRealAcceptanceTests`
-/// already do. This measures generator quality/performance only: it proves
-/// nothing about either generation service's durable-recovery behavior, and
-/// nothing about `AppEnvironment`'s production provider routing (brand-new
-/// Notes generations there currently default to Apple Foundation Models,
-/// not MLX — see `AppEnvironment.swift`).
+/// already do. This measures generator quality/performance only: because it
+/// bypasses both generation services and `AppEnvironment` entirely, it
+/// proves nothing about either service's durable-recovery behavior, and
+/// nothing about `AppEnvironment`'s production provider routing — that
+/// routing is covered separately by `AppEnvironmentTests`.
 ///
 /// Never downloads or reprovisions the pinned model:
 /// `RealMLXSessionDriver.availability()` must already report `.available`,
