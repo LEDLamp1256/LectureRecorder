@@ -81,8 +81,10 @@ final class AppEnvironment: ObservableObject {
             configurationSource: openAINotesConfiguration,
             transport: URLSessionNotesHTTPTransport()
         )
-        // Local, $0 default backend for every brand-new generation. All
-        // real FoundationModels/LanguageModelSession calls stay inside
+        // Legacy backend, retained only for Continue/Retry of pre-existing
+        // Apple Foundation Models Notes generations — no longer the default
+        // for brand-new generations (mirrors `appleSummaryGenerator` below).
+        // All real FoundationModels/LanguageModelSession calls stay inside
         // `RealFoundationModelsSessionDriver`. `diagnosticRecorder` below is
         // purely additive (see the type's own doc comment) — it only
         // forwards already-computed preflight metadata into
@@ -149,7 +151,7 @@ final class AppEnvironment: ObservableObject {
             generator: notesGeneratorRouter,
             newGenerationAvailabilityChecker: notesGeneratorRouter,
             windowBudget: notesWindowBudget,
-            generationProvenance: FoundationModelsNotesConfiguration.generationProvenance
+            generationProvenance: MLXNotesConfiguration.generationProvenance
         )
 
         // T5-F3A: Summary orchestration. Deliberately its own independent

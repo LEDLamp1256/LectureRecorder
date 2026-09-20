@@ -265,6 +265,14 @@ final class LectureNotesGenerationService: ObservableObject {
         lastFailureDescriptionBySessionID[sessionID]
     }
 
+    /// Test-only: the provenance a brand-new generation will be minted
+    /// with. Exposed only so a composition-root test (see
+    /// `AppEnvironmentTests`) can prove which backend a fresh install
+    /// defaults new Notes generations to, without needing a real session,
+    /// model, or async generation run. Never consulted by any production
+    /// code path.
+    var generationProvenanceForTesting: LectureNotesGenerationProvenance { generationProvenance }
+
     // MARK: - Shutdown
 
     func beginShutdown() {

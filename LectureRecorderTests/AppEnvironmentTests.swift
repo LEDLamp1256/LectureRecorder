@@ -32,6 +32,24 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertTrue(notesServiceA === notesServiceB)
     }
 
+    /// MLX-3 regression coverage: proves the composition root defaults
+    /// every brand-new Notes generation to the current MLX backend,
+    /// mirroring Summary's own already-correct default
+    /// (`MLXSummaryConfiguration.generationProvenance` at the Summary
+    /// construction site in `AppEnvironment.init`). Before this fix,
+    /// `AppEnvironment` wired `FoundationModelsNotesConfiguration
+    /// .generationProvenance` here instead, so a brand-new Notes
+    /// generation from the real app silently routed to Apple Foundation
+    /// Models rather than MLX. Purely structural: never touches a real
+    /// session, model, or async generation run.
+    func testFreshEnvironmentDefaultsBrandNewNotesGenerationsToMLX() {
+        let environment = AppEnvironment()
+        XCTAssertEqual(
+            environment.lectureNotesGenerationService.generationProvenanceForTesting.backendIdentifier,
+            MLXNotesConfiguration.backendIdentifier
+        )
+    }
+
     /// This does **not** prove `CompletedSessionTranscriptionService` reads
     /// the *same* `SessionManager` instance as `environment.sessionManager`
     /// — a freshly constructed `SessionManager` would equally start
