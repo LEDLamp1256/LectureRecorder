@@ -113,6 +113,82 @@ enum SummaryTestSupport {
         )
     }
 
+    /// A one-section source of `count` distinguishable, transcript-supported
+    /// items — `item 0` … `item N-1`, each grounded in its own transcript
+    /// unit — for batch-coverage tests.
+    static func distinguishableSource(count: Int) throws -> (source: LectureSummarySourceSnapshot, itemIDs: [UUID]) {
+        try distinguishableSource(sectionSizes: [count])
+    }
+
+    /// Consecutive Notes sections `Section 0`, `Section 1`, … of the given
+    /// sizes, whose items `item 0` … `item N-1` are numbered globally.
+    static func distinguishableSource(sectionSizes: [Int]) throws -> (source: LectureSummarySourceSnapshot, itemIDs: [UUID]) {
+        let count = sectionSizes.reduce(0, +)
+        let units = (0..<count).map {
+            NotesTranscriptSourceUnit(
+                sequenceNumber: $0,
+                chunkFileName: TranscriptionArtifactPaths.canonicalChunkFileName(for: $0),
+                text: "transcript \($0)",
+                startOffsetSeconds: Double($0) * 30,
+                durationSeconds: 30
+            )
+        }
+        let transcript = NotesTranscriptSourceSnapshot(
+            schemaVersion: NotesTranscriptSourceSnapshot.currentSchemaVersion,
+            sessionID: sessionID,
+            units: units,
+            fingerprint: TranscriptSourceFingerprint.compute(sessionID: sessionID, units: units)
+        )
+        let generation = LectureNotesGenerationRecord.newGeneration(
+            generationID: notesGenerationID,
+            sessionID: sessionID,
+            transcriptFingerprint: transcript.fingerprint,
+            windowPlan: NotesWindowPlan(windows: [
+                NotesInputWindow(windowIndex: 0, firstSequenceNumber: 0, lastSequenceNumber: count - 1, unitCount: count, isOversizedSingleUnit: false)
+            ]),
+            provenance: LectureNotesGenerationProvenance(recipeVersion: "notes-recipe-v1"),
+            now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let items = (0..<count).map {
+            LectureNoteItem(
+                id: UUID(uuidString: String(format: "00000000-0000-0000-0001-%012d", $0))!,
+                kind: .keyConcept, body: "item \($0)", fidelity: .transcriptSupported,
+                sourceReferences: [NotesSourceReference(sessionID: sessionID, sequenceNumber: $0)]
+            )
+        }
+        var sections: [LectureNoteSection] = []
+        var next = 0
+        for (index, size) in sectionSizes.enumerated() {
+            sections.append(LectureNoteSection(
+                id: UUID(uuidString: String(format: "00000000-0000-0000-0002-%012d", index))!,
+                heading: "Section \(index)",
+                items: Array(items[next..<(next + size)])
+            ))
+            next += size
+        }
+        let document = LectureNotesDocument(
+            generationID: notesGenerationID,
+            sessionID: sessionID,
+            transcriptFingerprint: transcript.fingerprint,
+            provenance: generation.provenance,
+            createdDate: Date(timeIntervalSince1970: 1_700_000_001),
+            overview: "Overview.",
+            sections: sections
+        )
+        let analysis = LectureNotesWindowAnalysis(
+            generationID: generation.generationID,
+            sessionID: sessionID,
+            transcriptFingerprint: transcript.fingerprint,
+            windowIndex: 0,
+            ownedRange: NotesSourceReference(sessionID: sessionID, firstSequenceNumber: 0, lastSequenceNumber: count - 1),
+            items: items
+        )
+        let source = try LectureSummarySourceBuilder.build(
+            generation: generation, analyses: [analysis], document: document, transcriptSnapshot: transcript
+        )
+        return (source, items.map(\.id))
+    }
+
     static func generation(source: LectureSummarySourceSnapshot? = nil) throws -> LectureSummaryGenerationRecord {
         let source = try source ?? self.source()
         let plan = try LectureSummaryPlanner.plan(

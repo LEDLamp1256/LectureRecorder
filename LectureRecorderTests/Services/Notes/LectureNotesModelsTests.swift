@@ -89,6 +89,110 @@ final class LectureNotesModelsTests: XCTestCase {
         XCTAssertEqual(decoded.sections, document.sections)
     }
 
+    func testSectionTopicsRoundTripInOrder() throws {
+        let section = LectureNoteSection(heading: "Electric Fields", items: [], topics: ["Electric field", "Work", "Lumped circuit abstraction"])
+        let decoded = try decoder.decode(LectureNoteSection.self, from: encoder.encode(section))
+        XCTAssertEqual(decoded, section)
+        XCTAssertEqual(decoded.topics, ["Electric field", "Work", "Lumped circuit abstraction"])
+    }
+
+    func testSectionSavedBeforeTopicsExistedDecodesWithNoTopics() throws {
+        let id = UUID()
+        let legacy = #"{"id":"\#(id.uuidString)","heading":"Section 1","items":[]}"#
+        let decoded = try decoder.decode(LectureNoteSection.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.heading, "Section 1")
+        XCTAssertEqual(decoded.topics, [])
+    }
+
+    /// Empty topics are left out of the encoded section, exactly as sections
+    /// were encoded before `topics` existed; non-empty topics are written.
+    func testEmptyTopicsAreOmittedAndNonEmptyTopicsAreEncoded() throws {
+        let empty = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: encoder.encode(LectureNoteSection(heading: "Section 1", items: []))
+        ) as? [String: Any])
+        XCTAssertEqual(Set(empty.keys), ["id", "heading", "items"], "no \"topics\": [] is introduced")
+
+        let withTopics = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: encoder.encode(LectureNoteSection(heading: "Section 1", items: [], topics: ["Work"]))
+        ) as? [String: Any])
+        XCTAssertEqual(Set(withTopics.keys), ["id", "heading", "items", "topics"])
+        XCTAssertEqual(withTopics["topics"] as? [String], ["Work"])
+    }
+
+    /// A document persisted before `topics` existed decodes and re-encodes
+    /// to exactly its original JSON — no key added, removed, or changed —
+    /// so fingerprints computed from the re-encoding stay historical.
+    func testLegacyDocumentReEncodesToItsOriginalJSON() throws {
+        let legacy = """
+        {"createdDate":"2026-05-01T12:00:00.000Z","generationID":"00000000-0000-0000-0000-0000000000A2",\
+        "overview":"Legacy overview.","provenance":{"recipeVersion":"t5e-apple-local-notes-v3"},"schemaVersion":1,\
+        "sections":[{"heading":"Voltage","id":"00000000-0000-0000-0000-0000000000B1","items":[\
+        {"body":"Voltage is energy per unit charge.","fidelity":"transcriptSupported","id":"00000000-0000-0000-0000-0000000000C1",\
+        "kind":"definition","sourceReferences":[{"firstSequenceNumber":0,"lastSequenceNumber":0,"sessionID":"00000000-0000-0000-0000-0000000000A1"}]}]}],\
+        "sessionID":"00000000-0000-0000-0000-0000000000A1",\
+        "transcriptFingerprint":{"algorithmVersion":1,"digestHex":"\(String(repeating: "d", count: 64))"}}
+        """
+        let decoded = try decoder.decode(LectureNotesDocument.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.sections.map(\.topics), [[]])
+        let reEncoded = try encoder.encode(decoded)
+        XCTAssertFalse(String(decoding: reEncoded, as: UTF8.self).contains("topics"))
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(legacy.utf8)) as? NSDictionary)
+        let roundTripped = try XCTUnwrap(JSONSerialization.jsonObject(with: reEncoded) as? NSDictionary)
+        XCTAssertEqual(roundTripped, original)
+    }
+
+    func testDocumentSavedBeforeTopicsExistedStillDecodes() throws {
+        let sessionID = UUID()
+        let document = LectureNotesDocument(
+            generationID: UUID(),
+            sessionID: sessionID,
+            transcriptFingerprint: TranscriptSourceFingerprint(algorithmVersion: 1, digestHex: String(repeating: "d", count: 64)),
+            provenance: LectureNotesGenerationProvenance(recipeVersion: "fake-recipe-v1"),
+            overview: "Overview text",
+            sections: [LectureNoteSection(heading: "Section 1", items: [
+                LectureNoteItem(kind: .definition, body: "Definition body", fidelity: .transcriptSupported,
+                                sourceReferences: [NotesSourceReference(sessionID: sessionID, sequenceNumber: 0)])
+            ], topics: ["Topic"])]
+        )
+        // Strip `topics` to reproduce a document persisted by an earlier build.
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(document)) as? [String: Any])
+        var sections = try XCTUnwrap(object["sections"] as? [[String: Any]])
+        sections = sections.map { var section = $0; section.removeValue(forKey: "topics"); return section }
+        object["sections"] = sections
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertFalse(String(decoding: legacyData, as: UTF8.self).contains("topics"))
+
+        let decoded = try decoder.decode(LectureNotesDocument.self, from: legacyData)
+        XCTAssertEqual(decoded.schemaVersion, LectureNotesDocument.currentSchemaVersion)
+        XCTAssertEqual(decoded.sections.map(\.topics), [[]])
+        XCTAssertEqual(decoded.sections.map(\.heading), ["Section 1"])
+        XCTAssertEqual(decoded.sections[0].items.count, 1)
+    }
+
+    /// New MLX v8 generation never creates reconstructed items, but Notes
+    /// persisted by earlier recipes or other backends keep decoding with
+    /// their fidelity and reconstruction or uncertainty notes intact.
+    func testHistoricalReconstructedAndUncertainItemsStillDecodeWithTheirNotes() throws {
+        let sessionID = UUID()
+        let legacy = """
+        {"id":"\(UUID().uuidString)","heading":"Legacy","items":[
+          {"id":"\(UUID().uuidString)","kind":"formula","body":"v = dx/dt","fidelity":"reconstructed",
+           "sourceReferences":[{"sessionID":"\(sessionID.uuidString)","firstSequenceNumber":0,"lastSequenceNumber":0}],
+           "uncertaintyNote":"Transcript wording \\"dee ex\\" was repaired as \\"dx\\"."},
+          {"id":"\(UUID().uuidString)","kind":"explanation","body":"Possibly a boundary condition.","fidelity":"uncertain",
+           "sourceReferences":[{"sessionID":"\(sessionID.uuidString)","firstSequenceNumber":1,"lastSequenceNumber":1}],
+           "uncertaintyNote":"Garbled wording."}
+        ]}
+        """
+        let section = try decoder.decode(LectureNoteSection.self, from: Data(legacy.utf8))
+        XCTAssertEqual(section.items.map(\.fidelity), [.reconstructed, .uncertain])
+        XCTAssertEqual(section.items.map(\.uncertaintyNote), ["Transcript wording \"dee ex\" was repaired as \"dx\".", "Garbled wording."])
+        XCTAssertEqual(section.topics, [])
+        let roundTripped = try decoder.decode(LectureNoteSection.self, from: encoder.encode(section))
+        XCTAssertEqual(roundTripped, section)
+    }
+
     func testCurrentSchemaVersionsAreOne() {
         XCTAssertEqual(LectureNotesGenerationRecord.currentSchemaVersion, 1)
         XCTAssertEqual(LectureNotesWindowAnalysis.currentSchemaVersion, 1)

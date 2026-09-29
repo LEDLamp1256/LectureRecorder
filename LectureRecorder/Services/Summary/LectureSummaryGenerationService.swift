@@ -57,6 +57,10 @@ final class LectureSummaryGenerationService: ObservableObject {
         /// reached only once a Summary generation record already exists and
         /// its *own* previously-valid source has since stopped matching.
         case sourceNotesUnavailable(description: String)
+        /// The generation was created by a Summary backend version this build
+        /// cannot resume. Reached for Continue/Retry before any generator
+        /// call, with its artifacts untouched; only Generate can proceed.
+        case incompatibleProvenance
     }
 
     enum AdmissionResult: Sendable, Equatable {
@@ -115,7 +119,7 @@ final class LectureSummaryGenerationService: ObservableObject {
                     metadata: ["sessionID": .uuid(activeSessionID), "generationID": .uuid(activeGenerationID)],
                     elapsedSeconds: elapsed
                 )
-            case .staleSource, .damaged, .failed, .backendUnavailable, .sourceNotesUnavailable:
+            case .staleSource, .damaged, .failed, .backendUnavailable, .sourceNotesUnavailable, .incompatibleProvenance:
                 AcceptanceDiagnosticLogger.shared.log(
                     AcceptanceDiagnosticEvent.Summary.failed,
                     metadata: [
@@ -578,6 +582,8 @@ final class LectureSummaryGenerationService: ObservableObject {
             publish { self.phase = .finished(.staleSource) }
         case .damaged(let reason):
             publish { self.phase = .finished(.damaged(reason: reason)) }
+        case .incompatibleProvenance:
+            publish { self.phase = .finished(.incompatibleProvenance) }
         case .readyForSynthesis(let analyses):
             switch nextRunAttemptCount(after: operationState) {
             case .failure(let error):
@@ -1031,6 +1037,7 @@ final class LectureSummaryGenerationService: ObservableObject {
         case .failed: return "failed"
         case .backendUnavailable: return "backendUnavailable"
         case .sourceNotesUnavailable: return "sourceNotesUnavailable"
+        case .incompatibleProvenance: return "incompatibleProvenance"
         }
     }
 

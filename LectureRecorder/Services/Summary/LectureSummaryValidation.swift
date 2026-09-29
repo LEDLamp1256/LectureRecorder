@@ -83,8 +83,9 @@ nonisolated enum LectureSummaryIntegrityValidator {
         guard let budget = try? LectureSummaryBatchBudget(
             maxSerializedBytesPerBatch: generation.batchPlan.maxSerializedBytesPerBatch,
             maxItemsPerBatch: generation.batchPlan.maxItemsPerBatch
-        ), let expected = try? LectureSummaryPlanner.plan(source: source, budget: budget),
-              expected == generation.batchPlan else {
+        ), let expected = try? LectureSummaryPlanner.plan(
+            source: source, budget: budget, partition: .forProvenance(generation.provenance)
+        ), expected == generation.batchPlan else {
             throw LectureSummaryIntegrityError.planDoesNotMatchSource
         }
     }

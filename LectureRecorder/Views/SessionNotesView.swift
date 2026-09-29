@@ -217,6 +217,9 @@ struct SessionNotesView: View {
         case .damaged:
             Label("This generation's saved data is damaged and cannot be resumed", systemImage: "exclamationmark.octagon.fill")
                 .foregroundStyle(.red)
+        case .incompatibleProvenance:
+            Label(NotesRecoveryMessage.incompatibleProvenance, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
         }
     }
 

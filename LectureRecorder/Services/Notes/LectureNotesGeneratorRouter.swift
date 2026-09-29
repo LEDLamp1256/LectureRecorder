@@ -72,6 +72,18 @@ nonisolated struct LectureNotesGeneratorRouter: LectureNotesGenerating, NewLectu
         try await route(for: generation).synthesize(analyses: analyses, generation: generation)
     }
 
+    /// Whether an existing generation can still be resumed by the Notes
+    /// backend this build ships. An MLX generation resumes only when its
+    /// provenance exactly matches the production MLX provenance (backend,
+    /// model identifier, exact model revision, and recipe) — anything else,
+    /// such as a generation from an earlier recipe, would deterministically
+    /// fail inside the generator, so it must be started over instead. Other
+    /// backends keep enforcing their own compatibility at run time.
+    static func canResume(_ provenance: LectureNotesGenerationProvenance) -> Bool {
+        guard provenance.backendIdentifier == MLXNotesConfiguration.backendIdentifier else { return true }
+        return provenance == MLXNotesConfiguration.generationProvenance
+    }
+
     private func route(for generation: LectureNotesGenerationRecord) throws -> any LectureNotesGenerating {
         switch generation.provenance.backendIdentifier {
         case mlxBackendIdentifier:

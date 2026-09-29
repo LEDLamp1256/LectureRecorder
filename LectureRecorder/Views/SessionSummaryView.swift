@@ -182,6 +182,9 @@ struct SessionSummaryView: View {
         case .damaged:
             Label("This generation's saved data is damaged and cannot be resumed", systemImage: "exclamationmark.octagon.fill")
                 .foregroundStyle(.red)
+        case .incompatibleProvenance:
+            Label(SummaryRecoveryMessage.incompatibleProvenance, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
         }
     }
 

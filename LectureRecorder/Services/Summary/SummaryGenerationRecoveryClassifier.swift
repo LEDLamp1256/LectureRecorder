@@ -76,6 +76,12 @@ nonisolated enum SummaryGenerationRecoveryClassification: Equatable, Sendable {
     case staleSource
     /// Canonical artifacts do not form a valid, resumable state.
     case damaged(reason: SummaryGenerationDamageReason)
+    /// The generation is otherwise resumable, but was created by a Summary
+    /// backend version this build cannot resume (see
+    /// `LectureSummaryGeneratorRouter.canResume`). Its artifacts are kept
+    /// untouched; only a fresh generation can proceed. A completed
+    /// generation is never classified this way — it stays viewable.
+    case incompatibleProvenance
 }
 
 /// Deterministic, pure recovery/classification layer for one Summary
@@ -91,7 +97,8 @@ nonisolated enum SummaryGenerationRecoveryClassifier {
         source: LectureSummarySourceSnapshot,
         analyses: [LectureSummaryAnalysis],
         document: LectureSummaryDocument?,
-        operationState: SummaryGenerationOperationState?
+        operationState: SummaryGenerationOperationState?,
+        canResume: (LectureNotesGenerationProvenance) -> Bool = LectureSummaryGeneratorRouter.canResume
     ) -> SummaryGenerationRecoveryClassification {
         do {
             try generation.batchPlan.validateStructure()
@@ -156,11 +163,13 @@ nonisolated enum SummaryGenerationRecoveryClassifier {
             guard document == nil else {
                 return .damaged(reason: .documentWithoutCompleteCoverage)
             }
+            guard canResume(generation.provenance) else { return .incompatibleProvenance }
             return .resumable(nextBatchIndex: prefixCount, interruption: interruptionReason(from: operationState))
         }
 
         // `prefixCount == totalBatches`: full, individually-valid coverage.
         guard let document else {
+            guard canResume(generation.provenance) else { return .incompatibleProvenance }
             return .readyForSynthesis(analyses: analyses.sorted { $0.batchIndex < $1.batchIndex })
         }
 

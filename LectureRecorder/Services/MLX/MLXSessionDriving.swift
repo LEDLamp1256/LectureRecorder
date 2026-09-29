@@ -57,12 +57,16 @@ nonisolated protocol MLXSessionDriving: Sendable {
     /// `maxOutputTokens`. `jsonSchema` is a JSON Schema string describing
     /// exactly the structured shape the caller expects back; the returned
     /// `jsonText` is the model's raw (unvalidated) JSON — the caller
-    /// decodes and validates it.
+    /// decodes and validates it. `sampling` chooses token selection for
+    /// this call only: `nil` is greedy; otherwise a fresh sampler seeded
+    /// from it serves exactly this call. Required, so every forwarding
+    /// conformer must pass it on.
     func respond(
         instructions: String,
         prompt: String,
         jsonSchema: String,
-        maxOutputTokens: Int
+        maxOutputTokens: Int,
+        sampling: MLXGuidedSampling?
     ) async throws -> MLXGuidedGenerationOutcome
 }
 
@@ -144,6 +148,22 @@ nonisolated enum MLXGuidedGenerationRuntimeError: LocalizedError, Sendable, Equa
     }
 }
 
+/// Sampled token selection for one guided-generation call, applied after
+/// grammar masking and the loop's biases. Callers that pass none stay
+/// greedy.
+nonisolated struct MLXGuidedSampling: Sendable, Equatable, Codable {
+    var temperature: Float
+    var topP: Float
+    var topK: Int
+    var minP: Float
+    var seed: UInt64
+
+    /// A fresh sampler per call, so every call starts from `seed`.
+    func makeSampler() -> any LogitSampler {
+        TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP, seed: seed)
+    }
+}
+
 /// Production driver. Owns local model verification/loading, tokenizer
 /// access, exact token counting, chat-template request preparation,
 /// grammar-constrained generation, and best-effort timing/memory
@@ -214,7 +234,8 @@ actor RealMLXSessionDriver: MLXSessionDriving {
         instructions: String,
         prompt: String,
         jsonSchema: String,
-        maxOutputTokens: Int
+        maxOutputTokens: Int,
+        sampling: MLXGuidedSampling?
     ) async throws -> MLXGuidedGenerationOutcome {
         try Task.checkCancellation()
         let container = try await loadedModelContainer()
@@ -279,7 +300,10 @@ actor RealMLXSessionDriver: MLXSessionDriving {
                     hardReserve: hardReserve,
                     closingBias: bias.closing,
                     whitespaceBias: bias.whitespace,
-                    whitespaceTokenIDs: bias.whitespaceTokenIDs
+                    whitespaceTokenIDs: bias.whitespaceTokenIDs,
+                    // Built inside this call: every request starts from its
+                    // own seed and never depends on earlier requests.
+                    sampler: sampling?.makeSampler()
                 ) { delta in
                     jsonText += delta
                     return true

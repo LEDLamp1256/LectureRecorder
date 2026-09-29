@@ -22,6 +22,7 @@ final class FakeMLXSessionDriver: MLXSessionDriving, @unchecked Sendable {
     private var _respondCallCount = 0
     private var _tokenCountCallCount = 0
     private var respondArgumentLog: [(instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int)] = []
+    private var respondSamplingLog: [MLXGuidedSampling?] = []
 
     init(nativeContextLength: Int = 32_768, operationalContextCeiling: Int = 24_576) {
         self.nativeContextLength = nativeContextLength
@@ -68,6 +69,12 @@ final class FakeMLXSessionDriver: MLXSessionDriving, @unchecked Sendable {
         return respondArgumentLog
     }
 
+    /// The sampling each successive `respond` call received (nil = greedy).
+    var respondSamplings: [MLXGuidedSampling?] {
+        lock.lock(); defer { lock.unlock() }
+        return respondSamplingLog
+    }
+
     func availability() -> LectureNotesGenerationAvailability {
         lock.lock(); defer { lock.unlock() }
         return scriptedAvailability
@@ -90,12 +97,14 @@ final class FakeMLXSessionDriver: MLXSessionDriving, @unchecked Sendable {
     }
 
     func respond(
-        instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int
+        instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int,
+        sampling: MLXGuidedSampling?
     ) async throws -> MLXGuidedGenerationOutcome {
         lock.lock()
         let index = _respondCallCount
         _respondCallCount += 1
         respondArgumentLog.append((instructions, prompt, jsonSchema, maxOutputTokens))
+        respondSamplingLog.append(sampling)
         lock.unlock()
 
         guard index < respondQueue.count else {

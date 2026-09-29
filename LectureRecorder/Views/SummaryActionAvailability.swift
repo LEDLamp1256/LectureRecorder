@@ -120,6 +120,19 @@ nonisolated enum SummaryActionAvailabilityCalculator {
                 canCancel: false,
                 continueOrRetryIsRetry: false
             )
+        case .incompatibleProvenance:
+            // Created by an earlier, incompatible Summary version: never
+            // Continue/Retry (the generator would deterministically reject
+            // it), and its artifacts are kept untouched. Only a fresh
+            // Generate against the currently usable Notes generation, which
+            // mints a new generation ID — mirrors Notes' own handling.
+            return SummaryActionAvailability(
+                canGenerate: currentUsableNotesGenerationID != nil,
+                generateNotesGenerationID: currentUsableNotesGenerationID,
+                canContinueOrRetry: false,
+                canCancel: false,
+                continueOrRetryIsRetry: false
+            )
         case .damaged:
             // No UI-side recovery is attempted for this damaged generation's
             // own artifacts — they are preserved untouched, and
@@ -135,6 +148,10 @@ nonisolated enum SummaryActionAvailabilityCalculator {
             )
         }
     }
+}
+
+nonisolated enum SummaryRecoveryMessage {
+    static let incompatibleProvenance = "This generation was created by an earlier, incompatible Summary version and can't be resumed. Choose Generate Summary to start a new generation."
 }
 
 /// Pure mapping from a `LectureSummaryGenerationService.AdmissionResult` to
