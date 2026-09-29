@@ -81,6 +81,19 @@ final class NotesWindowPlannerTests: XCTestCase {
         assertFullContiguousCoverage(windows, unitCount: units.count)
     }
 
+    func testMLXConfigurationCapsOrdinaryWindowsAtEightUnits() {
+        let units = makeUnits(texts: (0..<9).map { "small-unit-\($0)" })
+        let windows = NotesWindowPlanner.plan(units: units, budget: MLXNotesConfiguration.windowBudget)
+
+        XCTAssertEqual(windows.count, 2)
+        XCTAssertEqual(windows.map(\.windowIndex), [0, 1])
+        XCTAssertEqual(windows.map(\.firstSequenceNumber), [0, 8])
+        XCTAssertEqual(windows.map(\.lastSequenceNumber), [7, 8])
+        XCTAssertEqual(windows.map(\.unitCount), [8, 1])
+        XCTAssertEqual(windows.map(\.isOversizedSingleUnit), [false, false])
+        assertFullContiguousCoverage(windows, unitCount: units.count)
+    }
+
     func testEmptyUnitsProducesNoWindows() throws {
         XCTAssertEqual(NotesWindowPlanner.plan(units: [], budget: try NotesWindowBudget(maxUTF8BytesPerWindow: 100)), [])
     }

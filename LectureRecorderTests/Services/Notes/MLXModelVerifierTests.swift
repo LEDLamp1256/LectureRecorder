@@ -246,4 +246,111 @@ final class MLXModelVerifierTests: XCTestCase {
         // of this test suite's injected fixture lookups above.
         XCTAssertNotNil(MLXPinnedModelManifests.manifest(for: .qwen3_8b_4bit))
     }
+
+    // MARK: - Pinned 8B / 14B descriptors
+
+    /// Uses the real production lookup against an empty-but-present model
+    /// directory: a trusted descriptor gets past the manifest lookup and
+    /// fails only on its first missing file, while an untrusted one fails
+    /// at the lookup itself. No real weights are needed.
+    private func productionVerificationError(for descriptor: MLXModelDescriptor, root: URL) throws -> MLXModelVerificationError? {
+        let modelDirectory = MLXModelCatalog.modelDirectory(applicationSupportRoot: root, descriptor: descriptor)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        do {
+            _ = try MLXModelVerifier.verify(descriptor: descriptor, applicationSupportRoot: root)
+            return nil
+        } catch {
+            return error as? MLXModelVerificationError
+        }
+    }
+
+    func testBothPinnedDescriptorsAreTrustedByTheProductionLookup() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for pinned in [MLXModelDescriptor.qwen3_8b_4bit, .qwen3_14b_4bit] {
+            let manifest = try XCTUnwrap(MLXPinnedModelManifests.manifest(for: pinned))
+            XCTAssertEqual(manifest.modelIdentifier, pinned.modelIdentifier)
+            XCTAssertEqual(manifest.modelRevision, pinned.modelRevision)
+            XCTAssertEqual(
+                try productionVerificationError(for: pinned, root: root),
+                .fileMissingOrUnsafe("config.json"),
+                "\(pinned.modelIdentifier) must pass the trust lookup and then require real files"
+            )
+        }
+    }
+
+    func testUnpinnedModelsRemainRejectedByTheProductionLookup() throws {
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var wrongRevision14B = MLXModelDescriptor.qwen3_14b_4bit
+        wrongRevision14B.modelRevision = "main"
+
+        for unpinned in [descriptor, wrongRevision14B] {
+            XCTAssertNil(MLXPinnedModelManifests.manifest(for: unpinned))
+            XCTAssertEqual(
+                try productionVerificationError(for: unpinned, root: root),
+                .noAuthoritativeManifestForDescriptor
+            )
+        }
+    }
+
+    func testQwen3_14BManifestPinsImmutableRevisionAndEveryShard() throws {
+        let manifest = MLXPinnedModelManifests.qwen3_14b_4bit_a4d9b2df
+        XCTAssertEqual(manifest.modelIdentifier, "mlx-community/Qwen3-14B-4bit")
+        XCTAssertEqual(manifest.modelRevision, "a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4")
+        XCTAssertEqual(
+            manifest.files.map(\.filename),
+            [
+                "config.json", "tokenizer_config.json", "special_tokens_map.json",
+                "model.safetensors.index.json", "tokenizer.json",
+                "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
+            ]
+        )
+        XCTAssertEqual(
+            manifest.files.filter { $0.filename.hasSuffix(".safetensors") }.map(\.byteCount),
+            [5_354_381_380, 2_953_517_134]
+        )
+        let hexDigits = Set("0123456789abcdef")
+        for entry in manifest.files {
+            XCTAssertEqual(entry.sha256.count, 64, entry.filename)
+            XCTAssertTrue(entry.sha256.allSatisfy(hexDigits.contains), entry.filename)
+            XCTAssertGreaterThan(entry.byteCount, 0, entry.filename)
+        }
+        for suffix in MLXModelVerifier.requiredFilenameSuffixes {
+            XCTAssertTrue(manifest.files.contains { $0.filename.hasSuffix(suffix) }, suffix)
+        }
+    }
+
+    func testQwen3_14BDescriptorUsesTheSameContextPolicyAs8B() throws {
+        let descriptor14B = MLXModelDescriptor.qwen3_14b_4bit
+        XCTAssertNoThrow(try descriptor14B.validate())
+        XCTAssertEqual(descriptor14B.nativeContextLength, 32_768)
+        XCTAssertEqual(descriptor14B.operationalContextCeiling, 24_576)
+        XCTAssertEqual(descriptor14B.operationalContextCeiling, MLXModelDescriptor.qwen3_8b_4bit.operationalContextCeiling)
+        XCTAssertNotEqual(descriptor14B.modelIdentifier, MLXModelDescriptor.qwen3_8b_4bit.modelIdentifier)
+    }
+
+    func testProductionRealSessionDriverDefaultsTo8B() throws {
+        // Only the 8B directory exists (empty). The default driver must look
+        // there (and fail on a missing file); a 14B driver on the same root
+        // would instead report its own directory missing.
+        let root = try makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: MLXModelCatalog.modelDirectory(applicationSupportRoot: root, descriptor: .qwen3_8b_4bit),
+            withIntermediateDirectories: true
+        )
+        let defaultDriver = RealMLXSessionDriver(applicationSupportRootResolver: { root })
+        let driver14B = RealMLXSessionDriver(descriptor: .qwen3_14b_4bit, applicationSupportRootResolver: { root })
+
+        XCTAssertEqual(
+            defaultDriver.availability(),
+            .unavailable(description: "The local MLX model is not ready: \(MLXModelVerificationError.fileMissingOrUnsafe("config.json").localizedDescription)")
+        )
+        XCTAssertEqual(
+            driver14B.availability(),
+            .unavailable(description: "The local MLX model is not ready: \(MLXModelVerificationError.modelDirectoryMissingOrUnsafe.localizedDescription)")
+        )
+    }
 }

@@ -332,4 +332,69 @@ final class NotesGenerationRecoveryClassifierTests: XCTestCase {
             return XCTFail("expected .damaged(.invalidDocument), got \(result)")
         }
     }
+
+    // MARK: - Incompatible provenance
+
+    func testOtherwiseResumableGenerationWithIncompatibleProvenanceCannotResume() {
+        let generation = makeGeneration(windowCount: 3)
+        let snapshot = makeSnapshot(unitCount: 3)
+        let analyses = [makeAnalysis(windowIndex: 0, generation: generation)]
+        let failed = makeOperationState(lifecycle: .failed, failureDescription: "incompatible", generation: generation)
+        let result = NotesGenerationRecoveryClassifier.classify(
+            generation: generation, sourceSnapshot: snapshot, analyses: analyses, document: nil, operationState: failed,
+            canResume: { _ in false }
+        )
+        XCTAssertEqual(result, .incompatibleProvenance)
+    }
+
+    func testFullyAnalyzedGenerationWithIncompatibleProvenanceIsNotSynthesized() {
+        let generation = makeGeneration(windowCount: 2)
+        let snapshot = makeSnapshot(unitCount: 2)
+        let analyses = (0..<2).map { makeAnalysis(windowIndex: $0, generation: generation) }
+        let result = NotesGenerationRecoveryClassifier.classify(
+            generation: generation, sourceSnapshot: snapshot, analyses: analyses, document: nil, operationState: nil,
+            canResume: { _ in false }
+        )
+        XCTAssertEqual(result, .incompatibleProvenance)
+    }
+
+    /// Only resuming is blocked: a completed generation from an old recipe
+    /// stays viewable.
+    func testCompletedGenerationWithIncompatibleProvenanceStaysViewable() {
+        let generation = makeGeneration(windowCount: 2)
+        let snapshot = makeSnapshot(unitCount: 2)
+        let analyses = (0..<2).map { makeAnalysis(windowIndex: $0, generation: generation) }
+        let document = makeDocument(generation: generation, analyses: analyses)
+        let result = NotesGenerationRecoveryClassifier.classify(
+            generation: generation, sourceSnapshot: snapshot, analyses: analyses, document: document, operationState: nil,
+            canResume: { _ in false }
+        )
+        XCTAssertEqual(result, .completed(document: document))
+    }
+
+    func testProductionResumeRuleRequiresTheExactCurrentMLXProvenance() {
+        let current = MLXNotesConfiguration.generationProvenance
+        XCTAssertTrue(LectureNotesGeneratorRouter.canResume(current))
+        var v7 = current
+        v7.recipeVersion = "mlx1-notes-v7"
+        XCTAssertFalse(LectureNotesGeneratorRouter.canResume(v7))
+        var v8 = current
+        v8.recipeVersion = "mlx1-notes-v8"
+        XCTAssertFalse(LectureNotesGeneratorRouter.canResume(v8), "greedy v8 partial work is never continued under the current recipe")
+        var v10 = current
+        v10.recipeVersion = "mlx1-notes-v10"
+        XCTAssertFalse(LectureNotesGeneratorRouter.canResume(v10), "v10 (batched synthesis) work is never finished with v15 synthesis")
+        for recipe in ["mlx1-notes-v11", "mlx1-notes-v12", "mlx1-notes-v13", "mlx1-notes-v14"] {
+            var older = current
+            older.recipeVersion = recipe
+            XCTAssertFalse(LectureNotesGeneratorRouter.canResume(older), "\(recipe) work is never finished with v15 synthesis")
+        }
+        var otherRevision = current
+        otherRevision.generatorVersion = "0000000000000000000000000000000000000000"
+        XCTAssertFalse(LectureNotesGeneratorRouter.canResume(otherRevision))
+        XCTAssertFalse(LectureNotesGeneratorRouter.canResume(MLXNotesConfiguration.generationProvenance(for: .qwen3_14b_4bit)))
+        // Other backends keep enforcing their own compatibility at run time.
+        XCTAssertTrue(LectureNotesGeneratorRouter.canResume(LectureNotesGenerationProvenance(recipeVersion: "t5-notes-v1")))
+        XCTAssertTrue(LectureNotesGeneratorRouter.canResume(FoundationModelsNotesConfiguration.generationProvenance))
+    }
 }

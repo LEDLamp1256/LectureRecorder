@@ -67,6 +67,12 @@ nonisolated enum NotesGenerationRecoveryClassification: Equatable, Sendable {
     case staleSource
     /// Canonical artifacts do not form a valid, resumable state.
     case damaged(reason: NotesGenerationDamageReason)
+    /// The generation is otherwise resumable, but was created by a Notes
+    /// backend version this build cannot resume (see
+    /// `LectureNotesGeneratorRouter.canResume`). Its artifacts are kept
+    /// untouched; only a fresh generation can proceed. A completed
+    /// generation is never classified this way — it stays viewable.
+    case incompatibleProvenance
 }
 
 /// Deterministic, pure recovery/classification layer for one notes
@@ -80,7 +86,8 @@ nonisolated enum NotesGenerationRecoveryClassifier {
         sourceSnapshot: NotesTranscriptSourceSnapshot,
         analyses: [LectureNotesWindowAnalysis],
         document: LectureNotesDocument?,
-        operationState: NotesGenerationOperationState?
+        operationState: NotesGenerationOperationState?,
+        canResume: (LectureNotesGenerationProvenance) -> Bool = LectureNotesGeneratorRouter.canResume
     ) -> NotesGenerationRecoveryClassification {
         do {
             try generation.windowPlan.validateStructure()
@@ -139,11 +146,13 @@ nonisolated enum NotesGenerationRecoveryClassifier {
             guard document == nil else {
                 return .damaged(reason: .documentWithoutCompleteCoverage)
             }
+            guard canResume(generation.provenance) else { return .incompatibleProvenance }
             return .resumable(nextWindowIndex: prefixCount, interruption: interruptionReason(from: operationState))
         }
 
         // `prefixCount == totalWindows`: full, individually-valid coverage.
         guard let document else {
+            guard canResume(generation.provenance) else { return .incompatibleProvenance }
             return .readyForSynthesis(analyses: analyses.sorted { $0.windowIndex < $1.windowIndex })
         }
 

@@ -593,6 +593,67 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         XCTAssertEqual(synthCount, 1)
     }
 
+    /// Continuing a generation created by an incompatible Notes version (an
+    /// MLX v7 generation under this v8 build) is refused deterministically
+    /// before any generator call, with its artifacts left untouched — and a
+    /// fresh Generate still mints the current provenance.
+    func testIncompatibleGenerationIsNeverResumedAndItsArtifactsAreUntouched() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 2)
+        let generator = ControllableFakeLectureNotesGenerator()
+        await generator.armGate(beforeWindowIndex: 1)
+        let oldService = makeService(generator: generator, windowBudget: try oneUnitPerWindowBudget(),
+                                     generationProvenance: MLXNotesConfiguration.generationProvenance)
+
+        XCTAssertEqual(oldService.generate(sessionID: sessionID), .admitted)
+        await waitUntil { await generator.hasEnteredGate(forWindowIndex: 1) }
+        oldService.cancel(sessionID: sessionID)
+        let cancelledPhase = await waitUntilFinished(oldService)
+        XCTAssertEqual(cancelledPhase, .finished(.cancelled))
+        let generationID = try onlyGenerationID()
+        let paths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generationID)
+        // Leave the record exactly as the previous greedy v8 build would have.
+        var record = try XCTUnwrap(notesStore.loadGeneration(paths: paths))
+        record.provenance.recipeVersion = "mlx1-notes-v8"
+        try AtomicFileWriter.writeJSON(record, to: paths.generationRecordURL)
+        let recordBefore = try XCTUnwrap(notesStore.loadGeneration(paths: paths))
+        XCTAssertEqual(recordBefore.provenance.recipeVersion, "mlx1-notes-v8")
+        let analysesBefore = try analysisSnapshot(paths: paths)
+        XCTAssertEqual(analysesBefore.count, 1)
+        let callsBefore = await generator.analyzeCalls
+
+        let currentGenerator = ControllableFakeLectureNotesGenerator()
+        let service = makeService(generator: currentGenerator, windowBudget: try oneUnitPerWindowBudget(),
+                                  generationProvenance: MLXNotesConfiguration.generationProvenance)
+        XCTAssertEqual(service.continueGeneration(sessionID: sessionID, generationID: generationID), .admitted)
+        let continuePhase = await waitUntilFinished(service)
+        XCTAssertEqual(continuePhase, .finished(.incompatibleProvenance))
+        XCTAssertEqual(service.retry(sessionID: sessionID, generationID: generationID), .admitted)
+        let retryPhase = await waitUntilFinished(service)
+        XCTAssertEqual(retryPhase, .finished(.incompatibleProvenance), "retry is the same deterministic refusal")
+
+        let currentCalls = await currentGenerator.analyzeCalls
+        let currentSynth = await currentGenerator.synthesizeCallCount
+        XCTAssertEqual(currentCalls, [], "no generator work for an incompatible generation")
+        XCTAssertEqual(currentSynth, 0)
+        let oldCallsAfter = await generator.analyzeCalls
+        XCTAssertEqual(oldCallsAfter, callsBefore)
+        XCTAssertEqual(try notesStore.loadGeneration(paths: paths), recordBefore, "the old generation record is untouched")
+        XCTAssertEqual(try analysisSnapshot(paths: paths), analysesBefore, "its committed analyses are untouched")
+    }
+
+    /// Each committed window analysis as (window index, analysis), failing on
+    /// any unreadable one.
+    private func analysisSnapshot(paths: NotesArtifactPaths) throws -> [LectureNotesWindowAnalysis] {
+        try notesStore.loadAllWindowAnalyses(paths: paths).map { result -> LectureNotesWindowAnalysis in
+            switch result {
+            case .success(_, let value): return value
+            case .failure(let windowIndex, let error):
+                XCTFail("window \(windowIndex) failed to load: \(error)")
+                throw CancellationError()
+            }
+        }
+    }
+
     // MARK: - Cancellation
 
     func testCancelBeforeFirstCommit() async throws {

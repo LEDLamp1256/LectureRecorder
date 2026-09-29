@@ -279,6 +279,71 @@ final class LectureSummaryGenerationServiceTests: XCTestCase {
         XCTAssertEqual(calls, [1])
     }
 
+    /// A partial MLX Summary made by an earlier recipe is never resumed:
+    /// Continue and Retry both end `.incompatibleProvenance` before any
+    /// generator call, leaving its record, analysis, and run state byte for
+    /// byte untouched, while a fresh Generate still mints a new generation.
+    func testIncompatiblePartialSummaryIsNeverResumedAndItsArtifactsAreUntouched() async throws {
+        let source = try SummaryTestSupport.source()
+        var generation = try SummaryTestSupport.generation(source: source)
+        var v2 = MLXSummaryConfiguration.generationProvenance
+        v2.recipeVersion = "mlx2-summary-v2"
+        generation.provenance = v2
+        let paths = try SummaryArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generation.generationID)
+        _ = try summaryStore.createGenerationIfAbsent(generation, paths: paths)
+        let firstBatch = generation.batchPlan.batches.sorted { $0.batchIndex < $1.batchIndex }[0]
+        let firstItem = source.sourceItems.first { firstBatch.sourceItemIDs.contains($0.item.id) }!
+        _ = try summaryStore.commitAnalysis(LectureSummaryAnalysis(
+            generationID: generation.generationID, sessionID: sessionID, sourceNotesGenerationID: generation.sourceNotesGenerationID,
+            transcriptFingerprint: generation.transcriptFingerprint, sourceNotesDocumentFingerprint: generation.sourceNotesDocumentFingerprint,
+            batchID: firstBatch.batchID, batchIndex: firstBatch.batchIndex,
+            passages: [LectureSummaryPassage(
+                text: "pre-committed by v2",
+                supportingNoteItemIDs: [firstItem.item.id],
+                sourceReferences: try LectureSummaryIntegrityValidator.derivedSourceReferences(supportingItemIDs: [firstItem.item.id], source: source),
+                fidelity: firstItem.item.fidelity,
+                uncertaintyNote: firstItem.item.fidelity == .transcriptSupported ? nil : "uncertainty"
+            )],
+            provenance: generation.provenance
+        ), paths: paths)
+        try operationStateStore.saveOperationState(
+            SummaryGenerationOperationState(
+                sessionID: sessionID, generationID: generation.generationID,
+                sourceNotesGenerationID: generation.sourceNotesGenerationID,
+                transcriptFingerprint: generation.transcriptFingerprint,
+                sourceNotesDocumentFingerprint: generation.sourceNotesDocumentFingerprint,
+                activeRunID: UUID(), runAttemptCount: 1, lifecycle: .failed,
+                currentStage: .analyzingBatch(batchIndex: 1), failureDescription: "boom"
+            ),
+            paths: paths
+        )
+        let artifactURLs = [paths.generationRecordURL, paths.batchAnalysisURL(batchIndex: 0), paths.operationStateURL]
+        let bytesBefore = try artifactURLs.map { try Data(contentsOf: $0) }
+
+        let loader = FakeSummarySourceLoader()
+        await loader.setResult(.success(source), forNotesGenerationID: generation.sourceNotesGenerationID)
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 2)
+        let service = makeService(sourceLoader: loader, generator: generator)
+
+        XCTAssertEqual(service.continueGeneration(sessionID: sessionID, generationID: generation.generationID), .admitted)
+        let continuePhase = await waitUntilFinished(service)
+        XCTAssertEqual(continuePhase, .finished(.incompatibleProvenance))
+        XCTAssertEqual(service.retry(sessionID: sessionID, generationID: generation.generationID), .admitted)
+        let retryPhase = await waitUntilFinished(service)
+        XCTAssertEqual(retryPhase, .finished(.incompatibleProvenance), "retry is the same deterministic refusal")
+        let analyzeCalls = await generator.analyzeCalls
+        XCTAssertEqual(analyzeCalls, [], "no generator work for an incompatible generation")
+        XCTAssertEqual(try artifactURLs.map { try Data(contentsOf: $0) }, bytesBefore, "record, analysis, and run state are untouched")
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: generation.sourceNotesGenerationID), .admitted)
+        let generatePhase = await waitUntilFinished(service)
+        guard case .finished(.completed(let document)) = generatePhase else {
+            return XCTFail("expected a fresh completed generation, got \(generatePhase)")
+        }
+        XCTAssertNotEqual(document.generationID, generation.generationID, "a new generation ID, never the old one")
+        XCTAssertEqual(try artifactURLs.map { try Data(contentsOf: $0) }, bytesBefore, "the old generation stays untouched")
+    }
+
     func testRetryAfterRecoverableFailureResumesAndClearsFailure() async throws {
         let source = try SummaryTestSupport.source()
         let generation = try SummaryTestSupport.generation(source: source)

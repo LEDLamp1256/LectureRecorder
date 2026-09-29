@@ -134,6 +134,24 @@ final class SummaryActionAvailabilityTests: XCTestCase {
 
     // MARK: - Stale source: never Continue/Retry, fresh Generate only when a current Notes generation exists
 
+    func testIncompatibleProvenanceOffersOnlyFreshGenerate() throws {
+        let generation = try makeGeneration()
+        let availability = SummaryActionAvailabilityCalculator.availability(
+            displayState: .loaded(record: generation, classification: .incompatibleProvenance, advisoryStateIntegrity: .normal),
+            currentUsableNotesGenerationID: currentNotesID,
+            ownership: .none
+        )
+        XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: true, generateNotesGenerationID: currentNotesID, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        let noNotes = SummaryActionAvailabilityCalculator.availability(
+            displayState: .loaded(record: generation, classification: .incompatibleProvenance, advisoryStateIntegrity: .normal),
+            currentUsableNotesGenerationID: nil,
+            ownership: .none
+        )
+        XCTAssertEqual(noNotes, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        XCTAssertTrue(SummaryRecoveryMessage.incompatibleProvenance.contains("start a new generation"))
+        XCTAssertTrue(SummaryRecoveryMessage.incompatibleProvenance.contains("Generate Summary"))
+    }
+
     func testStaleSourceWithCurrentNotesOffersFreshGenerateNeverContinueOrRetry() throws {
         let generation = try makeGeneration()
         let availability = SummaryActionAvailabilityCalculator.availability(

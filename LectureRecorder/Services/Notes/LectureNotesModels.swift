@@ -71,11 +71,44 @@ nonisolated struct LectureNoteSection: Codable, Equatable, Sendable {
     var id: UUID
     var heading: String
     var items: [LectureNoteItem]
+    /// The section's study topics, in lecture order — detail that a concise
+    /// `heading` need not repeat. Empty for documents that predate it or for
+    /// generators that do not produce topics.
+    var topics: [String]
 
-    init(id: UUID = UUID(), heading: String, items: [LectureNoteItem]) {
+    init(id: UUID = UUID(), heading: String, items: [LectureNoteItem], topics: [String] = []) {
         self.id = id
         self.heading = heading
         self.items = items
+        self.topics = topics
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, heading, items, topics
+    }
+
+    /// Decodes documents saved before `topics` existed as having no topics.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        heading = try container.decode(String.self, forKey: .heading)
+        items = try container.decode([LectureNoteItem].self, forKey: .items)
+        topics = try container.decodeIfPresent([String].self, forKey: .topics) ?? []
+    }
+
+    /// Omits `topics` when empty, so a section without topics encodes
+    /// exactly as it did before `topics` existed. Summary source identity
+    /// fingerprints the re-encoded document; an added `"topics": []` would
+    /// otherwise make every older Notes document look changed and its
+    /// completed Summaries stale.
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(heading, forKey: .heading)
+        try container.encode(items, forKey: .items)
+        if !topics.isEmpty {
+            try container.encode(topics, forKey: .topics)
+        }
     }
 }
 

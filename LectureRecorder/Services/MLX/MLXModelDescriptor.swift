@@ -77,4 +77,19 @@ nonisolated struct MLXModelDescriptor: Sendable, Equatable {
         // independent of any one stage's own response reserve.
         operationalContextCeiling: 24_576
     )
+
+    /// The MLX-3 comparison candidate, selectable only by the opt-in
+    /// real-lecture acceptance harness — production construction always
+    /// uses `qwen3_8b_4bit`. Deliberately the same context policy as 8B so
+    /// the comparison measures model capability, not a larger budget:
+    /// Qwen3-14B's model card documents the same 32,768-token native
+    /// context (its `config.json` `max_position_embeddings` of 40,960 is
+    /// not treated as the native ceiling, exactly as for 8B), YaRN stays
+    /// disabled, and the operational ceiling stays 24,576.
+    static let qwen3_14b_4bit = MLXModelDescriptor(
+        modelIdentifier: "mlx-community/Qwen3-14B-4bit",
+        modelRevision: "a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4",
+        nativeContextLength: 32_768,
+        operationalContextCeiling: 24_576
+    )
 }

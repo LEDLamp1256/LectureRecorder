@@ -80,9 +80,11 @@ nonisolated enum NotesActionAvailabilityCalculator {
             let isRetry: Bool
             if case .recoverableFailure = interruption { isRetry = true } else { isRetry = false }
             return NotesActionAvailability(canGenerate: false, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: isRetry)
-        case .staleSource:
-            // This generation can never safely resume once the transcript
-            // has moved on — only a fresh Generate is offered.
+        case .staleSource, .incompatibleProvenance:
+            // This generation can never safely resume — the transcript has
+            // moved on, or it was created by a Notes version this build
+            // cannot resume — so Retry would only repeat a deterministic
+            // failure. Only a fresh Generate is offered.
             return NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
         case .damaged:
             // No UI-side recovery is attempted for this damaged
@@ -94,6 +96,11 @@ nonisolated enum NotesActionAvailabilityCalculator {
             return NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
         }
     }
+}
+
+/// User-facing recovery wording shared by the Notes view and its tests.
+nonisolated enum NotesRecoveryMessage {
+    static let incompatibleProvenance = "This generation was created by an earlier, incompatible Notes version and can't be resumed. Choose Generate Notes to start a new generation."
 }
 
 /// Pure mapping from a `LectureNotesGenerationService.AdmissionResult` to

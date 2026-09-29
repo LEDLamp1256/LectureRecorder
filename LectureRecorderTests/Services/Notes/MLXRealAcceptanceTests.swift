@@ -46,10 +46,12 @@ final class MLXRealAcceptanceTests: XCTestCase {
         }
 
         func respond(
-            instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int
+            instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int,
+            sampling: MLXGuidedSampling?
         ) async throws -> MLXGuidedGenerationOutcome {
             let outcome = try await wrapped.respond(
-                instructions: instructions, prompt: prompt, jsonSchema: jsonSchema, maxOutputTokens: maxOutputTokens
+                instructions: instructions, prompt: prompt, jsonSchema: jsonSchema, maxOutputTokens: maxOutputTokens,
+                sampling: sampling
             )
             if AcceptanceDiagnosticLogger.isEnabled {
                 print("[MLX acceptance] promptTokenCount=\(outcome.promptTokenCount) generatedTokenCount=\(outcome.generatedTokenCount) generationSeconds=\(String(describing: outcome.generationSeconds)) memory=\(String(describing: outcome.memory))")

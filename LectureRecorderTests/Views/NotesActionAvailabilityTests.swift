@@ -213,4 +213,28 @@ final class NotesActionAvailabilityTests: XCTestCase {
             sections: []
         )
     }
+
+    // MARK: - Incompatible provenance
+
+    func testIncompatibleGenerationOffersOnlyAFreshGenerateNeverRetry() {
+        let record = LectureNotesGenerationRecord.newGeneration(
+            sessionID: UUID(),
+            transcriptFingerprint: TranscriptSourceFingerprint(algorithmVersion: 1, digestHex: String(repeating: "a", count: 64)),
+            windowPlan: NotesWindowPlan(windows: []),
+            provenance: MLXNotesConfiguration.generationProvenance
+        )
+        let availability = NotesActionAvailabilityCalculator.availability(
+            displayState: .loaded(record: record, classification: .incompatibleProvenance, advisoryStateIntegrity: .normal),
+            ownership: .none
+        )
+        XCTAssertEqual(availability, NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+    }
+
+    func testIncompatibleGenerationMessageTellsTheUserToStartANewGeneration() {
+        let message = NotesRecoveryMessage.incompatibleProvenance
+        XCTAssertTrue(message.contains("incompatible Notes version"))
+        XCTAssertTrue(message.contains("can't be resumed"))
+        XCTAssertTrue(message.contains("Generate Notes"))
+        XCTAssertTrue(message.contains("new generation"))
+    }
 }

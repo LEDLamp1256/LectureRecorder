@@ -36,6 +36,9 @@ final class LectureNotesGenerationService: ObservableObject {
         case cancelled
         case staleSource
         case damaged(reason: NotesGenerationDamageReason)
+        /// The generation was created by a Notes backend version this build
+        /// cannot resume; nothing ran and its artifacts are untouched.
+        case incompatibleProvenance
         case failed(description: String)
         /// The backend a brand-new generation would use is not ready right
         /// now (e.g. Apple Intelligence disabled, model assets not ready).
@@ -110,7 +113,7 @@ final class LectureNotesGenerationService: ObservableObject {
                     metadata: ["sessionID": .uuid(activeSessionID), "generationID": .uuid(activeGenerationID)],
                     elapsedSeconds: elapsed
                 )
-            case .staleSource, .damaged, .failed, .backendUnavailable:
+            case .staleSource, .damaged, .incompatibleProvenance, .failed, .backendUnavailable:
                 AcceptanceDiagnosticLogger.shared.log(
                     AcceptanceDiagnosticEvent.Notes.failed,
                     metadata: [
@@ -525,6 +528,8 @@ final class LectureNotesGenerationService: ObservableObject {
             publish { self.phase = .finished(.staleSource) }
         case .damaged(let reason):
             publish { self.phase = .finished(.damaged(reason: reason)) }
+        case .incompatibleProvenance:
+            publish { self.phase = .finished(.incompatibleProvenance) }
         case .readyForSynthesis(let analyses):
             switch nextRunAttemptCount(after: operationState) {
             case .failure(let error):
@@ -963,6 +968,7 @@ final class LectureNotesGenerationService: ObservableObject {
         case .cancelled: return "cancelled"
         case .staleSource: return "staleSource"
         case .damaged(let reason): return "damaged(\(diagnosticCaseName(for: reason)))"
+        case .incompatibleProvenance: return "incompatibleProvenance"
         case .failed: return "failed"
         case .backendUnavailable: return "backendUnavailable"
         }

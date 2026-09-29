@@ -23,9 +23,13 @@ let package = Package(
         .library(name: "MLXRuntimeTokenizers", targets: ["MLXRuntimeTokenizers"]),
     ],
     dependencies: [
+        // Fork of ml-explore/mlx-swift-lm at
+        // c6446cf7bfb7cea76408013b614d4b2c530eaa03 plus one commit whose only
+        // library change lets guided generation accept an optional sampler
+        // (nil keeps greedy argmax; masking and closing bias apply first).
         .package(
-            url: "https://github.com/ml-explore/mlx-swift-lm",
-            revision: "c6446cf7bfb7cea76408013b614d4b2c530eaa03",
+            url: "https://github.com/LEDLamp1256/mlx-swift-lm",
+            revision: "f58eab3ee7b81788a59d8e5a1ee57dcba2cbed72",
             traits: []
         ),
         // Already a transitive dependency of mlx-swift-lm (its `MLX` product

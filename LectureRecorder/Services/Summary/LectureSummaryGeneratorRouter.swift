@@ -81,6 +81,18 @@ nonisolated struct LectureSummaryGeneratorRouter: LectureSummaryGenerating, NewL
         try await route(for: generation).generateDocument(from: analyses, generation: generation, source: source)
     }
 
+    /// Whether a partial generation with `provenance` may be continued: an
+    /// MLX generation only with exactly the current production provenance
+    /// (backend, model identifier, exact model revision, and recipe) —
+    /// anything else, such as a generation from an earlier recipe, would
+    /// deterministically fail inside the generator, so it must be started
+    /// over instead. Other backends keep enforcing their own compatibility
+    /// at run time. Mirrors `LectureNotesGeneratorRouter.canResume`.
+    static func canResume(_ provenance: LectureNotesGenerationProvenance) -> Bool {
+        guard provenance.backendIdentifier == MLXSummaryConfiguration.backendIdentifier else { return true }
+        return provenance == MLXSummaryConfiguration.generationProvenance
+    }
+
     private func route(for generation: LectureSummaryGenerationRecord) throws -> any LectureSummaryGenerating {
         switch generation.provenance.backendIdentifier {
         case mlxBackendIdentifier:

@@ -1,5 +1,5 @@
 {
-  "originHash" : "3bb05e81a7f019e5aefa186e794cd78b9212bd7f436debb7797923cdd5f02de2",
+  "originHash" : "02452608c1e3867082583e5637457ce2c90e269f3e24d2d5ba8f4aa51b5e6291",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -22,9 +22,9 @@
     {
       "identity" : "mlx-swift-lm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/ml-explore/mlx-swift-lm",
+      "location" : "https://github.com/LEDLamp1256/mlx-swift-lm",
       "state" : {
-        "revision" : "c6446cf7bfb7cea76408013b614d4b2c530eaa03"
+        "revision" : "f58eab3ee7b81788a59d8e5a1ee57dcba2cbed72"
       }
     },
     {

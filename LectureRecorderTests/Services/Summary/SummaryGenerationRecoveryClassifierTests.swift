@@ -173,6 +173,73 @@ final class SummaryGenerationRecoveryClassifierTests: XCTestCase {
         XCTAssertEqual(result, .resumable(nextBatchIndex: 1, interruption: .recoverableFailure(description: "batch 1 boom")))
     }
 
+    // MARK: - Incompatible provenance
+
+    /// A partial generation — including one whose last run failed
+    /// recoverably — that the current build cannot resume is classified
+    /// incompatible, never resumable/retryable.
+    func testPartialGenerationWithUnresumableProvenanceIsIncompatible() throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try singleItemBatchGeneration(source: source)
+        let analyses = [try makeAnalysis(batchIndex: 0, generation: generation, source: source)]
+        let state = makeOperationState(lifecycle: .failed, failureDescription: "batch 1 boom", generation: generation)
+        for operationState in [nil, state] {
+            let result = SummaryGenerationRecoveryClassifier.classify(
+                generation: generation, source: source, analyses: analyses, document: nil, operationState: operationState,
+                canResume: { _ in false }
+            )
+            XCTAssertEqual(result, .incompatibleProvenance)
+        }
+        XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+            generation: generation, source: source, analyses: [], document: nil, operationState: nil, canResume: { _ in false }
+        ), .incompatibleProvenance)
+    }
+
+    func testFullCoverageWithoutDocumentAndUnresumableProvenanceIsIncompatible() throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try singleItemBatchGeneration(source: source)
+        let analyses = try (0..<generation.batchPlan.batches.count).map { try makeAnalysis(batchIndex: $0, generation: generation, source: source) }
+        XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+            generation: generation, source: source, analyses: analyses, document: nil, operationState: nil, canResume: { _ in false }
+        ), .incompatibleProvenance)
+    }
+
+    /// Completed (and damaged) generations are classified before
+    /// compatibility is consulted: a completed historical Summary stays
+    /// viewable whatever produced it.
+    func testCompletedGenerationStaysCompletedWhateverItsProvenance() throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try singleItemBatchGeneration(source: source)
+        let analyses = try (0..<generation.batchPlan.batches.count).map { try makeAnalysis(batchIndex: $0, generation: generation, source: source) }
+        let document = makeDocument(generation: generation, analyses: analyses)
+        XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+            generation: generation, source: source, analyses: analyses, document: document, operationState: nil, canResume: { _ in false }
+        ), .completed(document: document))
+        let partialWithDocument = [analyses[0]]
+        XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+            generation: generation, source: source, analyses: partialWithDocument, document: document, operationState: nil, canResume: { _ in false }
+        ), .damaged(reason: .documentWithoutCompleteCoverage))
+    }
+
+    /// The production rule: only exactly the current MLX provenance can be
+    /// resumed; older recipes, other model revisions, and other selectable
+    /// models cannot; non-MLX backends keep their own runtime checks.
+    func testProductionSummaryResumeRuleRequiresTheExactCurrentMLXProvenance() {
+        let current = MLXSummaryConfiguration.generationProvenance
+        XCTAssertTrue(LectureSummaryGeneratorRouter.canResume(current))
+        for recipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4", "mlx2-summary-v5"] {
+            var old = current
+            old.recipeVersion = recipe
+            XCTAssertFalse(LectureSummaryGeneratorRouter.canResume(old), recipe)
+        }
+        var otherRevision = current
+        otherRevision.generatorVersion = "0000000000000000000000000000000000000000"
+        XCTAssertFalse(LectureSummaryGeneratorRouter.canResume(otherRevision))
+        XCTAssertFalse(LectureSummaryGeneratorRouter.canResume(MLXSummaryConfiguration.generationProvenance(for: .qwen3_14b_4bit)))
+        XCTAssertTrue(LectureSummaryGeneratorRouter.canResume(SummaryTestSupport.provenance))
+        XCTAssertTrue(LectureSummaryGeneratorRouter.canResume(FoundationModelsSummaryConfiguration.generationProvenance))
+    }
+
     // MARK: - Operation-state precedence
 
     func testStaleCompletedOperationStateIgnoredWhenPrefixIncomplete() throws {
@@ -249,6 +316,108 @@ final class SummaryGenerationRecoveryClassifierTests: XCTestCase {
             generation: generation, source: mismatched, analyses: [], document: nil, operationState: nil
         )
         XCTAssertEqual(result, .staleSource)
+    }
+
+    // MARK: - Historical Notes fingerprints (topics compatibility)
+
+    /// The Notes document fingerprint of `SummaryTestSupport`'s fixture — a
+    /// document with no topics, which the pre-`topics` encoder wrote
+    /// without a `topics` key. A regression that re-introduces
+    /// `"topics": []` changes this digest.
+    private static let historicalFixtureNotesFingerprint = "8fc2d0b43ce6422c61e6e59343be69c6281397f0d42f1942f548ad7173df7fec"
+
+    func testNotesWithoutTopicsKeepTheirHistoricalFingerprint() throws {
+        let evidence = SummaryTestSupport.notesEvidence()
+        XCTAssertTrue(evidence.1.sections.allSatisfy(\.topics.isEmpty))
+        XCTAssertFalse(String(decoding: try AtomicFileWriter.defaultEncoder.encode(evidence.1), as: UTF8.self).contains("topics"))
+        XCTAssertEqual(try LectureSummarySourceBuilder.fingerprint(document: evidence.1).digestHex, Self.historicalFixtureNotesFingerprint)
+    }
+
+    /// A completed Summary that pinned the historical fingerprint of Notes
+    /// saved before topics existed stays completed — never `.staleSource`.
+    func testCompletedSummaryOfNotesSavedBeforeTopicsStaysCompleted() throws {
+        let source = try SummaryTestSupport.source()
+        var generation = try singleItemBatchGeneration(source: source)
+        generation.sourceNotesDocumentFingerprint = NotesDocumentFingerprint(algorithmVersion: 1, digestHex: Self.historicalFixtureNotesFingerprint)
+        let analyses = try (0..<generation.batchPlan.batches.count).map { try makeAnalysis(batchIndex: $0, generation: generation, source: source) }
+        let document = makeDocument(generation: generation, analyses: analyses)
+
+        XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+            generation: generation, source: source, analyses: analyses, document: document, operationState: nil
+        ), .completed(document: document))
+    }
+
+    /// A real change to the Notes still makes the Summary stale, and real
+    /// non-empty topics are part of the Notes identity.
+    func testChangedNotesOrRealTopicsStillMakeTheSummaryStale() throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try singleItemBatchGeneration(source: source)
+        let evidence = SummaryTestSupport.notesEvidence()
+
+        var changedItem = evidence.1
+        changedItem.sections[0].items[0].body = "A different first concept"
+        var withTopics = evidence.1
+        withTopics.sections[0].topics = ["Voltage"]
+        for changed in [changedItem, withTopics] {
+            var moved = source
+            moved.sourceNotesDocumentFingerprint = try LectureSummarySourceBuilder.fingerprint(document: changed)
+            XCTAssertNotEqual(moved.sourceNotesDocumentFingerprint, source.sourceNotesDocumentFingerprint)
+            XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+                generation: generation, source: moved, analyses: [], document: nil, operationState: nil
+            ), .staleSource)
+        }
+    }
+
+    // MARK: - Plan partition by provenance (Summary v5)
+
+    private func mlxGeneration(
+        source: LectureSummarySourceSnapshot, recipe: String, partition: LectureSummaryPlanPartition
+    ) throws -> LectureSummaryGenerationRecord {
+        var provenance = MLXSummaryConfiguration.generationProvenance
+        provenance.recipeVersion = recipe
+        return LectureSummaryGenerationRecord.newGeneration(
+            generationID: SummaryTestSupport.summaryGenerationID,
+            sessionID: source.sessionID,
+            sourceNotesGenerationID: source.sourceNotesGenerationID,
+            transcriptFingerprint: source.transcriptFingerprint,
+            sourceNotesDocumentFingerprint: source.sourceNotesDocumentFingerprint,
+            batchPlan: try LectureSummaryPlanner.plan(
+                source: source,
+                budget: LectureSummaryBatchBudget(maxSerializedBytesPerBatch: 10_000, maxItemsPerBatch: 3),
+                partition: partition
+            ),
+            provenance: provenance,
+            now: Date(timeIntervalSince1970: 1_700_000_010)
+        )
+    }
+
+    /// A completed MLX v4 Summary keeps its contiguous plan valid; a v5
+    /// Summary is valid with its Notes-section plan. Each is damaged only
+    /// under the other's partition — historical plans are never
+    /// reinterpreted.
+    func testEachRecipeReplansWithItsOwnPartition() throws {
+        let source = try SummaryTestSupport.source()
+        let v4 = try mlxGeneration(source: source, recipe: "mlx2-summary-v4", partition: .contiguous)
+        let v5 = try mlxGeneration(source: source, recipe: "mlx2-summary-v5", partition: .notesSections)
+        XCTAssertEqual(v4.batchPlan.batches.count, 1, "fixture: the contiguous plan spans both Notes sections")
+        XCTAssertEqual(v5.batchPlan.batches.count, 2)
+
+        for valid in [v4, v5] {
+            let analyses = try (0..<valid.batchPlan.batches.count).map { try makeAnalysis(batchIndex: $0, generation: valid, source: source) }
+            let document = makeDocument(generation: valid, analyses: analyses)
+            XCTAssertEqual(SummaryGenerationRecoveryClassifier.classify(
+                generation: valid, source: source, analyses: analyses, document: document, operationState: nil
+            ), .completed(document: document), valid.provenance.recipeVersion)
+        }
+        var v4WithSectionPlan = v4
+        v4WithSectionPlan.batchPlan = v5.batchPlan
+        var v5WithContiguousPlan = v5
+        v5WithContiguousPlan.batchPlan = v4.batchPlan
+        for mismatched in [v4WithSectionPlan, v5WithContiguousPlan] {
+            guard case .damaged(.planDoesNotMatchSource) = SummaryGenerationRecoveryClassifier.classify(
+                generation: mismatched, source: source, analyses: [], document: nil, operationState: nil
+            ) else { return XCTFail("\(mismatched.provenance.recipeVersion) must replan with its own partition") }
+        }
     }
 
     // MARK: - Damage
