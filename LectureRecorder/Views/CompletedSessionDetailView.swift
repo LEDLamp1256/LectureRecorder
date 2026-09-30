@@ -19,6 +19,11 @@ import SwiftUI
 /// The exact breakpoint and per-pane minimum widths are placeholder
 /// constants, chosen only so three panes are never mounted below a readable
 /// width — precise tuning is deferred to a later, dedicated visual pass.
+///
+/// Also owns this window's `SessionTranscriptRevealPresenter`: a Notes
+/// Source activation resolves here, and a ready target is handed to the
+/// Transcript pane. Owning it here — not in either pane — lets a pending
+/// target survive the narrow layout's Notes → Transcript remount.
 struct CompletedSessionDetailView: View {
     private enum ContentSelection: Hashable {
         case transcript
@@ -49,6 +54,7 @@ struct CompletedSessionDetailView: View {
     private let transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
 
     @State private var contentSelection: ContentSelection = .transcript
+    @StateObject private var revealPresenter: SessionTranscriptRevealPresenter
 
     init(
         entry: CompletedSessionEntry,
@@ -74,7 +80,10 @@ struct CompletedSessionDetailView: View {
         self.summaryOperationStateStore = summaryOperationStateStore
         self.summarySourceLoader = summarySourceLoader
         self.transcriptNavigationLoader = transcriptNavigationLoader
+        _revealPresenter = StateObject(wrappedValue: SessionTranscriptRevealPresenter(sourceLoader: notesSourceLoader))
     }
+
+    private var sessionID: UUID { entry.manifest.sessionID }
 
     var body: some View {
         GeometryReader { proxy in
@@ -109,13 +118,31 @@ struct CompletedSessionDetailView: View {
                 }
             }
         }
+        .onChange(of: sessionID) {
+            revealPresenter.invalidate()
+        }
+        .onChange(of: revealPresenter.pendingTarget) { _, target in
+            // Only a successful, current resolution for this session moves
+            // the narrow layout to Transcript; failures stay on Notes.
+            // Harmless while wide, where every pane is already visible.
+            guard let target, target.sessionID == sessionID else { return }
+            contentSelection = .transcript
+        }
+    }
+
+    /// The newest reveal failure for this session, as user-facing text.
+    private var revealFailureMessage: String? {
+        guard revealPresenter.sessionID == sessionID,
+              case .failed(let failure) = revealPresenter.state else { return nil }
+        return TranscriptRevealFailureMessage.message(for: failure)
     }
 
     private var transcriptView: some View {
         SessionTranscriptView(
             entry: entry,
             service: transcriptionService,
-            navigationLoader: transcriptNavigationLoader
+            navigationLoader: transcriptNavigationLoader,
+            revealPresenter: revealPresenter
         )
     }
 
@@ -126,7 +153,13 @@ struct CompletedSessionDetailView: View {
             transcriptionService: transcriptionService,
             notesStore: notesStore,
             operationStateStore: notesOperationStateStore,
-            sourceLoader: notesSourceLoader
+            sourceLoader: notesSourceLoader,
+            revealFailureMessage: revealFailureMessage,
+            onSourceActivated: { reference, transcriptFingerprint in
+                Task {
+                    await revealPresenter.requestReveal(reference: reference, generatedFrom: transcriptFingerprint, for: entry)
+                }
+            }
         )
     }
 

@@ -19,7 +19,21 @@ import SwiftUI
 /// appears (never auto-playing) and stops it when the view disappears. A
 /// completed transcript with loaded navigation shows each passage with a
 /// timestamp button that plays from that passage.
+///
+/// A Notes Source reveal arrives through the parent-owned
+/// `SessionTranscriptRevealPresenter`. Once this session's navigation is
+/// loaded and the target passes its application-time revalidation, the
+/// transcript scrolls to the first row of the referenced chunks and
+/// highlights every row of those chunks — whole-chunk evidence, never one
+/// segment. Revealing never touches playback: only timestamp buttons seek.
 struct SessionTranscriptView: View {
+    /// Re-runs reveal application when a new target arrives or this
+    /// session's navigation becomes available.
+    private struct RevealTrigger: Equatable {
+        let target: TranscriptRevealTarget?
+        let hasNavigation: Bool
+    }
+
     let entry: CompletedSessionEntry
     @ObservedObject var service: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionTranscriptPresenter
@@ -28,14 +42,25 @@ struct SessionTranscriptView: View {
     /// UI-only: the presenter's position stays authoritative, and one seek
     /// is issued when the drag ends.
     @State private var scrubPreviewSeconds: Double?
+    @ObservedObject var revealPresenter: SessionTranscriptRevealPresenter
+    /// Rows of the last applied reveal; kept until another reveal replaces
+    /// it, the session or navigation changes, or this view unmounts.
+    @State private var revealedItemIDs: Set<TranscriptPlaybackItem.ID> = []
+    @State private var revealScrollTargetID: TranscriptPlaybackItem.ID?
+    /// Bumped once per applied reveal so the same row can be scrolled to
+    /// again by a later activation.
+    @State private var revealScrollRequest = 0
+    @State private var revealMessage: String?
 
     init(
         entry: CompletedSessionEntry,
         service: CompletedSessionTranscriptionService,
-        navigationLoader: any CompletedTranscriptNavigationLoading
+        navigationLoader: any CompletedTranscriptNavigationLoading,
+        revealPresenter: SessionTranscriptRevealPresenter
     ) {
         self.entry = entry
         self.service = service
+        self.revealPresenter = revealPresenter
         _presenter = StateObject(wrappedValue: SessionTranscriptPresenter(loader: service, navigationLoader: navigationLoader))
     }
 
@@ -68,7 +93,15 @@ struct SessionTranscriptView: View {
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: sessionID) {
+            clearReveal()
             await presenter.refresh(for: entry)
+        }
+        .task(id: RevealTrigger(target: revealPresenter.pendingTarget, hasNavigation: displayedNavigation != nil)) {
+            await applyPendingReveal()
+        }
+        .onChange(of: presenter.navigation) {
+            // Highlighted IDs belong to the navigation they were mapped in.
+            clearReveal()
         }
         .task(id: sessionID) {
             scrubPreviewSeconds = nil
@@ -311,16 +344,69 @@ struct SessionTranscriptView: View {
         return navigation
     }
 
+    // MARK: - Note source reveal
+
+    private func clearReveal() {
+        revealedItemIDs = []
+        revealScrollTargetID = nil
+        revealMessage = nil
+    }
+
+    /// Applies the pending reveal once it is for this session and navigation
+    /// is loaded. Never partially applies: a target the navigation cannot
+    /// fully represent is rejected, which also stops it being retried.
+    private func applyPendingReveal() async {
+        guard let target = revealPresenter.pendingTarget,
+              TranscriptRevealApplicationPlanner.outcome(for: target, sessionID: sessionID, navigation: displayedNavigation) != .notApplicable else {
+            return
+        }
+        guard let application = await revealPresenter.revalidateReadyTarget(for: entry) else {
+            if !Task.isCancelled, revealPresenter.sessionID == sessionID, case .failed(let failure) = revealPresenter.state {
+                revealMessage = TranscriptRevealFailureMessage.message(for: failure)
+            }
+            return
+        }
+        // A superseded run leaves the still-ready target to the newer run.
+        guard !Task.isCancelled else { return }
+        switch TranscriptRevealApplicationPlanner.outcome(for: application.target, sessionID: sessionID, navigation: displayedNavigation) {
+        case .notApplicable:
+            return
+        case .locationUnavailable:
+            revealPresenter.reject(application, with: .locationUnavailable)
+            revealMessage = TranscriptRevealFailureMessage.message(for: .locationUnavailable)
+        case .apply(let selection):
+            revealedItemIDs = Set(selection.selectedItemIDs)
+            revealScrollTargetID = selection.scrollTargetID
+            revealMessage = nil
+            revealScrollRequest += 1
+            revealPresenter.consume(application)
+        }
+    }
+
     @ViewBuilder private var transcriptSection: some View {
         let segments = isActiveOperation ? service.displayedSegments : (presenter.displayedSessionID == sessionID ? presenter.segments : [])
+        if let revealMessage {
+            Label(revealMessage, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
         if let navigation = displayedNavigation {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(navigation.items) { item in
-                        navigationRow(item, in: navigation)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(navigation.items) { item in
+                            navigationRow(item, in: navigation)
+                                .id(item.id)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onChange(of: revealScrollRequest) {
+                    guard let revealScrollTargetID else { return }
+                    withAnimation {
+                        proxy.scrollTo(revealScrollTargetID, anchor: .top)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else if !segments.isEmpty {
             ScrollView {
@@ -339,6 +425,7 @@ struct SessionTranscriptView: View {
     private func navigationRow(_ item: TranscriptPlaybackItem, in navigation: TranscriptPlaybackNavigation) -> some View {
         let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let isEnabled = playbackForThisSession && playback.canPlayOrPause
+        let isRevealed = revealedItemIDs.contains(item.id)
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Button(PlaybackTimeFormatting.label(forSeconds: navigation.startTime(of: item))) {
                 playback.navigate(to: item, in: navigation)
@@ -354,6 +441,17 @@ struct SessionTranscriptView: View {
                 .foregroundStyle(text.isEmpty ? .secondary : .primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // Drawn outside the row's bounds so revealing never shifts layout;
+        // every row of a revealed chunk gets the same treatment.
+        .background {
+            if isRevealed {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.accentColor.opacity(0.12))
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
+                    .padding(-4)
+            }
+        }
+        .accessibilityAddTraits(isRevealed ? .isSelected : [])
     }
 
     @ViewBuilder private func segmentView(_ segment: OrderedSegment) -> some View {

@@ -39,6 +39,11 @@ struct SessionNotesView: View {
     /// Notes' own operations.
     @ObservedObject var transcriptionService: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionNotesPresenter
+    /// Forwards a Source activation to the parent, which owns transcript
+    /// reveal; this view never resolves references itself.
+    private let onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)?
+    /// The parent's current reveal failure for this session, if any.
+    private let revealFailureMessage: String?
 
     init(
         entry: CompletedSessionEntry,
@@ -46,11 +51,15 @@ struct SessionNotesView: View {
         transcriptionService: CompletedSessionTranscriptionService,
         notesStore: any LectureNotesStoring,
         operationStateStore: any LectureNotesOperationStateStoring,
-        sourceLoader: any NotesTranscriptSourceLoading
+        sourceLoader: any NotesTranscriptSourceLoading,
+        revealFailureMessage: String? = nil,
+        onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)? = nil
     ) {
         self.entry = entry
         self.service = service
         self.transcriptionService = transcriptionService
+        self.revealFailureMessage = revealFailureMessage
+        self.onSourceActivated = onSourceActivated
         _presenter = StateObject(wrappedValue: SessionNotesPresenter(
             notesStore: notesStore,
             operationStateStore: operationStateStore,
@@ -273,8 +282,13 @@ struct SessionNotesView: View {
     @ViewBuilder private var contentSection: some View {
         switch presenter.displayState {
         case .loaded(_, .completed(let document), _):
+            if let revealFailureMessage {
+                Label(revealFailureMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             ScrollView {
-                NotesDocumentView(document: document)
+                NotesDocumentView(document: document, onSourceActivated: onSourceActivated)
             }
         case .noGeneration:
             ContentUnavailableView(
