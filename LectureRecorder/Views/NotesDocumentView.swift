@@ -3,12 +3,13 @@ import SwiftUI
 /// Read-only, structured renderer for one `LectureNotesDocument` — never a
 /// Markdown/plain-text blob (see the model's own contract). Each
 /// `LectureNoteItem` is passed through unmodified, including its
-/// `sourceReferences`: this view performs no flattening transformation, so
-/// a future Note -> transcript-location feature has the same source
-/// references available here that `LectureNotesGenerationService` already
-/// validated when the item was committed.
+/// `sourceReferences`: this view performs no flattening transformation.
+/// When `onSourceActivated` is set, each stored reference becomes a Source
+/// action that hands back that exact reference together with the document's
+/// `transcriptFingerprint`; resolving it is entirely the caller's job.
 struct NotesDocumentView: View {
     let document: LectureNotesDocument
+    var onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)?
 
     var body: some View {
         if NotesDocumentPresentation.hasNoStudyNotes(document) {
@@ -57,7 +58,9 @@ struct NotesDocumentView: View {
                 }
             }
             ForEach(section.items, id: \.id) { item in
-                NotesItemView(item: item)
+                NotesItemView(item: item, onSourceActivated: onSourceActivated.map { activate in
+                    { reference in activate(reference, document.transcriptFingerprint) }
+                })
             }
         }
     }
@@ -91,12 +94,31 @@ nonisolated enum NotesSectionTopicsFormatting {
     }
 }
 
-/// One structured note item, preserving `sourceReferences` in memory (never
-/// rendered as visible text here — see the type's own header comment) so a
-/// future Note -> transcript jump/highlight feature can be added without
-/// this view needing to change what it holds onto.
+/// One labeled Source action for a stored `NotesSourceReference`.
+nonisolated struct NotesSourceAction: Equatable {
+    let label: String
+    let reference: NotesSourceReference
+}
+
+/// The Source actions for a note item, one per stored reference in stored
+/// order: none for no references, "Source" for exactly one, and "Source 1",
+/// "Source 2", … otherwise. Never reconstructs or previews source text.
+nonisolated enum NotesSourceActions {
+    static func actions(for references: [NotesSourceReference]) -> [NotesSourceAction] {
+        guard references.count > 1 else {
+            return references.map { NotesSourceAction(label: "Source", reference: $0) }
+        }
+        return references.enumerated().map { index, reference in
+            NotesSourceAction(label: "Source \(index + 1)", reference: reference)
+        }
+    }
+}
+
+/// One structured note item. Its `sourceReferences` are never rendered as
+/// text — only as Source actions, and only when `onSourceActivated` is set.
 private struct NotesItemView: View {
     let item: LectureNoteItem
+    let onSourceActivated: ((NotesSourceReference) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -126,10 +148,29 @@ private struct NotesItemView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+
+            sourceActions
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder private var sourceActions: some View {
+        let actions = NotesSourceActions.actions(for: item.sourceReferences)
+        if let onSourceActivated, !actions.isEmpty {
+            HStack(spacing: 10) {
+                ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                    Button(action.label) {
+                        onSourceActivated(action.reference)
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .pointerStyle(.link)
+                    .help("Show the supporting transcript")
+                }
+            }
+        }
     }
 
     @ViewBuilder private var bodyText: some View {
@@ -245,7 +286,7 @@ private enum NotesDocumentPreviewFixture {
 
 #Preview("Notes – title and topics") {
     ScrollView {
-        NotesDocumentView(document: NotesDocumentPreviewFixture.document)
+        NotesDocumentView(document: NotesDocumentPreviewFixture.document, onSourceActivated: { _, _ in })
             .padding()
     }
     .frame(width: 720, height: 800)
