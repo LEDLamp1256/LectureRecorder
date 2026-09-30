@@ -80,7 +80,9 @@ nonisolated enum SessionNotesGenerationSelection {
 /// Stale-load protection mirrors `SessionTranscriptPresenter` exactly: an
 /// explicit generation counter, incremented up front and re-checked after
 /// the sole `await` point, so a load already in flight when the selection
-/// changes can never overwrite a newer selection's result.
+/// changes can never overwrite a newer selection's result. The counter is
+/// shared by `refresh(for:)` and `refresh(for:generationID:)`, so a newer
+/// request of either kind supersedes any older one.
 @MainActor
 final class SessionNotesPresenter: ObservableObject {
     private let notesStore: any LectureNotesStoring
@@ -178,20 +180,76 @@ final class SessionNotesPresenter: ObservableObject {
             return
         }
 
+        publish(await classifiedState(of: chosen, sessionID: sessionID, sessionPaths: sessionPaths))
+    }
+
+    /// Displays exactly the Notes generation `generationID` — for navigation
+    /// that must show the generation a Summary was derived from, even when a
+    /// newer one exists. Never falls back to another generation: a missing,
+    /// unreadable, or mismatched record publishes `.loadError`. Once the
+    /// record loads, classification is identical to `refresh(for:)`.
+    func refresh(for entry: CompletedSessionEntry, generationID: UUID) async {
+        generation += 1
+        let myGeneration = generation
+        let sessionID = entry.manifest.sessionID
+        let sessionPaths = entry.sessionPaths
+
+        func publish(_ state: SessionNotesDisplayState) {
+            guard myGeneration == generation else { return }
+            displayedSessionID = sessionID
+            displayState = state
+        }
+
+        let paths: NotesArtifactPaths
+        do {
+            paths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generationID)
+        } catch {
+            publish(.loadError("Notes generation \(generationID.uuidString) could not be validated: \(error.localizedDescription)"))
+            return
+        }
+        let record: LectureNotesGenerationRecord
+        do {
+            guard let loaded = try notesStore.loadGeneration(paths: paths) else {
+                publish(.loadError("Notes generation \(generationID.uuidString) is unavailable."))
+                return
+            }
+            record = loaded
+        } catch {
+            publish(.loadError("Notes generation \(generationID.uuidString) could not be loaded: \(error.localizedDescription)"))
+            return
+        }
+        // `loadGeneration` already verifies identity against `paths`; kept
+        // so this route can never display any generation but the one asked for.
+        guard record.generationID == generationID, record.sessionID == sessionID else {
+            publish(.loadError("Notes generation \(generationID.uuidString) does not match the requested generation."))
+            return
+        }
+
+        publish(await classifiedState(of: record, sessionID: sessionID, sessionPaths: sessionPaths))
+    }
+
+    /// Loads `record`'s analyses, document, advisory operation state, and the
+    /// current transcript source, and classifies them — the one load/classify
+    /// path shared by both refresh routes. Contains the sole `await` of a
+    /// refresh that reaches a generation; callers publish its result through
+    /// their own stale-load guard.
+    private func classifiedState(
+        of chosen: LectureNotesGenerationRecord,
+        sessionID: UUID,
+        sessionPaths: SessionPaths
+    ) async -> SessionNotesDisplayState {
         let paths: NotesArtifactPaths
         do {
             paths = try NotesArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: chosen.generationID)
         } catch {
-            publish(.loadError(error.localizedDescription))
-            return
+            return .loadError(error.localizedDescription)
         }
 
         let analysisResults: [NotesArtifactLoadResult<LectureNotesWindowAnalysis>]
         do {
             analysisResults = try notesStore.loadAllWindowAnalyses(paths: paths)
         } catch {
-            publish(.loadError(error.localizedDescription))
-            return
+            return .loadError(error.localizedDescription)
         }
 
         var analyses: [LectureNotesWindowAnalysis] = []
@@ -204,12 +262,11 @@ final class SessionNotesPresenter: ObservableObject {
                 // handling of this exact case: a corrupt committed analysis
                 // is reported as damaged, never silently dropped from
                 // coverage.
-                publish(.loaded(
+                return .loaded(
                     record: chosen,
                     classification: .damaged(reason: .corruptOrInvalidAnalysis(windowIndex: windowIndex, underlying: underlying)),
                     advisoryStateIntegrity: .normal
-                ))
-                return
+                )
             }
         }
 
@@ -217,8 +274,7 @@ final class SessionNotesPresenter: ObservableObject {
         do {
             document = try notesStore.loadDocument(paths: paths)
         } catch {
-            publish(.loadError(error.localizedDescription))
-            return
+            return .loadError(error.localizedDescription)
         }
 
         // Advisory-only (see `NotesGenerationOperationState`'s own header
@@ -258,8 +314,7 @@ final class SessionNotesPresenter: ObservableObject {
         do {
             sourceSnapshot = try await sourceLoader.loadCurrentSnapshot(sessionID: sessionID)
         } catch {
-            publish(.loadError(error.localizedDescription))
-            return
+            return .loadError(error.localizedDescription)
         }
 
         let classification = NotesGenerationRecoveryClassifier.classify(
@@ -269,6 +324,6 @@ final class SessionNotesPresenter: ObservableObject {
             document: document,
             operationState: operationStateForClassification
         )
-        publish(.loaded(record: chosen, classification: classification, advisoryStateIntegrity: advisoryStateIntegrity))
+        return .loaded(record: chosen, classification: classification, advisoryStateIntegrity: advisoryStateIntegrity)
     }
 }

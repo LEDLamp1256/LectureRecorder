@@ -80,6 +80,38 @@ private actor StubNotesTranscriptSourceLoader: NotesTranscriptSourceLoading {
     }
 }
 
+/// Returns one fixed snapshot for every call, suspending only the *first*
+/// call until the test releases it — lets two refreshes of the same session
+/// (default and exact-generation) race deterministically, with no sleeps.
+private actor FirstCallGatedNotesTranscriptSourceLoader: NotesTranscriptSourceLoading {
+    private let snapshot: NotesTranscriptSourceSnapshot
+    private var callCount = 0
+    private var pendingContinuation: CheckedContinuation<Void, Never>?
+    private var hasEnteredGateFlag = false
+
+    init(snapshot: NotesTranscriptSourceSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    var hasEnteredGate: Bool { hasEnteredGateFlag }
+
+    func releaseGate() {
+        pendingContinuation?.resume()
+        pendingContinuation = nil
+    }
+
+    func loadCurrentSnapshot(sessionID: UUID) async throws -> NotesTranscriptSourceSnapshot {
+        callCount += 1
+        if callCount == 1 {
+            hasEnteredGateFlag = true
+            await withCheckedContinuation { continuation in
+                self.pendingContinuation = continuation
+            }
+        }
+        return snapshot
+    }
+}
+
 @MainActor
 final class SessionNotesPresenterTests: XCTestCase {
     private var tempDirectory: URL!
@@ -630,5 +662,195 @@ final class SessionNotesPresenterTests: XCTestCase {
         // session B's newer, already-published result.
         XCTAssertEqual(presenter.displayedSessionID, sessionB)
         XCTAssertEqual(presenter.displayState, .noGeneration(transcriptSourceReady: false))
+    }
+
+    // MARK: - Exact-generation refresh
+
+    /// Writes a completed generation (record, one analysis, document) and
+    /// returns its record and document.
+    private func writeCompletedGeneration(
+        sessionID: UUID,
+        sessionPaths: SessionPaths,
+        fingerprint: TranscriptSourceFingerprint,
+        createdDate: Date
+    ) throws -> (record: LectureNotesGenerationRecord, document: LectureNotesDocument) {
+        let record = try writeGeneration(sessionID: sessionID, sessionPaths: sessionPaths, windowCount: 1, fingerprint: fingerprint, createdDate: createdDate)
+        let analysis = makeAnalysis(windowIndex: 0, generation: record)
+        try commitAnalysis(analysis, sessionPaths: sessionPaths, generation: record)
+        let document = makeDocument(generation: record, analyses: [analysis])
+        try commitDocument(document, sessionPaths: sessionPaths, generation: record)
+        return (record, document)
+    }
+
+    private func loadedGenerationID(_ state: SessionNotesDisplayState) -> UUID? {
+        guard case .loaded(let record, _, _) = state else { return nil }
+        return record.generationID
+    }
+
+    func testExactRefreshLoadsRequestedOlderGenerationEvenWhenNewerExists() async throws {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let snapshot = makeSnapshot(sessionID: sessionID, unitCount: 1)
+        let older = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 1_000))
+        let newer = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 2_000))
+
+        let loader = StubNotesTranscriptSourceLoader()
+        await loader.setSnapshot(snapshot, forSessionID: sessionID)
+        let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
+
+        await presenter.refresh(for: entry, generationID: older.record.generationID)
+
+        guard case .loaded(let loadedRecord, .completed(let loadedDocument), .normal) = presenter.displayState else {
+            return XCTFail("expected .loaded(.completed), got \(presenter.displayState)")
+        }
+        XCTAssertEqual(presenter.displayedSessionID, sessionID)
+        XCTAssertEqual(loadedRecord.generationID, older.record.generationID)
+        XCTAssertEqual(loadedDocument, older.document)
+        XCTAssertEqual(loadedDocument.generationID, older.record.generationID)
+        XCTAssertNotEqual(loadedDocument.generationID, newer.record.generationID)
+
+        // The default route is unaffected and still picks the newest.
+        await presenter.refresh(for: entry)
+        XCTAssertEqual(loadedGenerationID(presenter.displayState), newer.record.generationID)
+    }
+
+    func testExactRefreshOfMissingGenerationNeverFallsBack() async throws {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let snapshot = makeSnapshot(sessionID: sessionID, unitCount: 1)
+        _ = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 1_000))
+
+        let loader = StubNotesTranscriptSourceLoader()
+        await loader.setSnapshot(snapshot, forSessionID: sessionID)
+        let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
+
+        await presenter.refresh(for: entry, generationID: UUID())
+
+        guard case .loadError = presenter.displayState else {
+            return XCTFail("expected .loadError, never another generation, got \(presenter.displayState)")
+        }
+        XCTAssertEqual(presenter.displayedSessionID, sessionID)
+    }
+
+    func testExactRefreshOfCorruptGenerationFailsClosed() async throws {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let snapshot = makeSnapshot(sessionID: sessionID, unitCount: 1)
+        _ = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 1_000))
+
+        let corruptGenerationID = UUID()
+        let corruptPaths = try NotesArtifactPaths.validated(sessionPaths: entry.sessionPaths, sessionID: sessionID, generationID: corruptGenerationID)
+        try FileManager.default.createDirectory(at: corruptPaths.generationDirectory, withIntermediateDirectories: true)
+        try Data("not valid json".utf8).write(to: corruptPaths.generationRecordURL)
+
+        let loader = StubNotesTranscriptSourceLoader()
+        await loader.setSnapshot(snapshot, forSessionID: sessionID)
+        let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
+
+        await presenter.refresh(for: entry, generationID: corruptGenerationID)
+
+        guard case .loadError = presenter.displayState else {
+            return XCTFail("expected .loadError, got \(presenter.displayState)")
+        }
+    }
+
+    /// A corrupt document in the requested generation fails closed through
+    /// the shared load path rather than substituting another generation.
+    func testExactRefreshWithCorruptDocumentFailsClosed() async throws {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let snapshot = makeSnapshot(sessionID: sessionID, unitCount: 1)
+        let older = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 1_000))
+        _ = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 2_000))
+        let olderPaths = try NotesArtifactPaths.validated(sessionPaths: entry.sessionPaths, sessionID: sessionID, generationID: older.record.generationID)
+        try Data("not valid json".utf8).write(to: olderPaths.documentURL)
+
+        let loader = StubNotesTranscriptSourceLoader()
+        await loader.setSnapshot(snapshot, forSessionID: sessionID)
+        let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
+
+        await presenter.refresh(for: entry, generationID: older.record.generationID)
+
+        guard case .loadError = presenter.displayState else {
+            return XCTFail("expected .loadError, got \(presenter.displayState)")
+        }
+    }
+
+    // MARK: - Stale async protection across refresh routes
+
+    private struct TwoGenerationFixture {
+        let entry: CompletedSessionEntry
+        let older: LectureNotesGenerationRecord
+        let newer: LectureNotesGenerationRecord
+        let loader: FirstCallGatedNotesTranscriptSourceLoader
+        let presenter: SessionNotesPresenter
+    }
+
+    private func makeTwoGenerationFixture() throws -> TwoGenerationFixture {
+        let sessionID = UUID()
+        let entry = makeEntry(sessionID: sessionID)
+        let snapshot = makeSnapshot(sessionID: sessionID, unitCount: 1)
+        let older = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 1_000))
+        let newer = try writeCompletedGeneration(sessionID: sessionID, sessionPaths: entry.sessionPaths, fingerprint: snapshot.fingerprint, createdDate: Date(timeIntervalSince1970: 2_000))
+        let loader = FirstCallGatedNotesTranscriptSourceLoader(snapshot: snapshot)
+        let presenter = SessionNotesPresenter(notesStore: notesStore, operationStateStore: operationStateStore, sourceLoader: loader)
+        return TwoGenerationFixture(entry: entry, older: older.record, newer: newer.record, loader: loader, presenter: presenter)
+    }
+
+    /// Starts `staleRefresh`, waits until it is suspended at the source load,
+    /// runs `newerRefresh` to completion, then releases the stale one.
+    private func runStaleThenNewer(
+        _ fixture: TwoGenerationFixture,
+        staleRefresh: @escaping @MainActor () async -> Void,
+        newerRefresh: () async -> Void
+    ) async -> (afterNewer: UUID?, afterStale: UUID?) {
+        let staleLoad = Task { await staleRefresh() }
+        while await !fixture.loader.hasEnteredGate {
+            await Task.yield()
+        }
+        await newerRefresh()
+        let afterNewer = loadedGenerationID(fixture.presenter.displayState)
+        await fixture.loader.releaseGate()
+        _ = await staleLoad.value
+        return (afterNewer, loadedGenerationID(fixture.presenter.displayState))
+    }
+
+    func testLateDefaultRefreshCannotOverwriteNewerExactRefresh() async throws {
+        let fixture = try makeTwoGenerationFixture()
+
+        let result = await runStaleThenNewer(
+            fixture,
+            staleRefresh: { await fixture.presenter.refresh(for: fixture.entry) },
+            newerRefresh: { await fixture.presenter.refresh(for: fixture.entry, generationID: fixture.older.generationID) }
+        )
+
+        XCTAssertEqual(result.afterNewer, fixture.older.generationID)
+        XCTAssertEqual(result.afterStale, fixture.older.generationID)
+    }
+
+    func testLateExactRefreshCannotOverwriteNewerDefaultRefresh() async throws {
+        let fixture = try makeTwoGenerationFixture()
+
+        let result = await runStaleThenNewer(
+            fixture,
+            staleRefresh: { await fixture.presenter.refresh(for: fixture.entry, generationID: fixture.older.generationID) },
+            newerRefresh: { await fixture.presenter.refresh(for: fixture.entry) }
+        )
+
+        XCTAssertEqual(result.afterNewer, fixture.newer.generationID)
+        XCTAssertEqual(result.afterStale, fixture.newer.generationID)
+    }
+
+    func testOutOfOrderExactRefreshesPublishOnlyTheNewerRequest() async throws {
+        let fixture = try makeTwoGenerationFixture()
+
+        let result = await runStaleThenNewer(
+            fixture,
+            staleRefresh: { await fixture.presenter.refresh(for: fixture.entry, generationID: fixture.older.generationID) },
+            newerRefresh: { await fixture.presenter.refresh(for: fixture.entry, generationID: fixture.newer.generationID) }
+        )
+
+        XCTAssertEqual(result.afterNewer, fixture.newer.generationID)
+        XCTAssertEqual(result.afterStale, fixture.newer.generationID)
     }
 }
