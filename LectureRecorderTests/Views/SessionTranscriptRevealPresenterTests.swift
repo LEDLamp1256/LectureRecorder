@@ -522,6 +522,106 @@ extension SessionTranscriptRevealPresenterTests {
         XCTAssertNil(presenter.pendingTarget, "a rejected target is never retried")
     }
 
+    // MARK: Plain-transcript fallback application
+
+    private func completedSegments(_ sequenceNumbers: ClosedRange<Int>) -> [OrderedSegment] {
+        sequenceNumbers.map { OrderedSegment(sequenceNumber: $0, state: .completed(text: "unit \($0)")) }
+    }
+
+    func testFallbackApplicationConsumesItsExactApplication() async throws {
+        let entry = makeEntry()
+        let sessionID = entry.manifest.sessionID
+        let snapshot = makeSnapshot(sessionID: sessionID)
+        let (presenter, _) = await makeReadyPresenter(entry: entry, snapshot: snapshot, range: 1...2)
+
+        let applicationRevalidation = await presenter.revalidateReadyTarget(for: entry)
+
+        let application = try XCTUnwrap(applicationRevalidation)
+        let outcome = TranscriptRevealApplicationPlanner.outcome(
+            for: application.target, sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: completedSegments(0...2))
+        )
+        XCTAssertEqual(outcome, .applyFallback(TranscriptFallbackRevealSelection(scrollTargetSequenceNumber: 1, selectedSequenceNumbers: [1, 2])))
+        presenter.consume(application)
+
+        XCTAssertEqual(presenter.state, .idle, "applied once; never re-applied on remount")
+        XCTAssertEqual(presenter.sessionID, sessionID)
+    }
+
+    func testUnrepresentableFallbackIsRejectedAndNotRetried() async throws {
+        let entry = makeEntry()
+        let sessionID = entry.manifest.sessionID
+        let snapshot = makeSnapshot(sessionID: sessionID)
+        let (presenter, _) = await makeReadyPresenter(entry: entry, snapshot: snapshot, range: 1...2)
+
+        let applicationRevalidation = await presenter.revalidateReadyTarget(for: entry)
+
+        let application = try XCTUnwrap(applicationRevalidation)
+        let segments = [OrderedSegment(sequenceNumber: 0, state: .completed(text: "unit 0")), OrderedSegment(sequenceNumber: 1, state: .missing)]
+        let outcome = TranscriptRevealApplicationPlanner.outcome(for: application.target, sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: segments))
+        XCTAssertEqual(outcome, .locationUnavailable)
+        presenter.reject(application, with: .locationUnavailable)
+
+        XCTAssertEqual(presenter.state, .failed(.locationUnavailable))
+        XCTAssertNil(presenter.pendingTarget)
+    }
+
+    func testTargetWaitsWhileTranscriptIsStillLoading() async throws {
+        let entry = makeEntry()
+        let sessionID = entry.manifest.sessionID
+        let snapshot = makeSnapshot(sessionID: sessionID)
+        let (presenter, _) = await makeReadyPresenter(entry: entry, snapshot: snapshot)
+        let pendingTarget = try XCTUnwrap(presenter.pendingTarget)
+
+        XCTAssertEqual(TranscriptRevealApplicationPlanner.outcome(for: pendingTarget, sessionID: sessionID, transcript: .loading), .notApplicable)
+        // Nothing was revalidated, consumed, or rejected: still ready.
+        XCTAssertEqual(presenter.state, .ready(pendingTarget))
+    }
+
+    func testStaleFallbackApplicationCannotApplyOverANewerRequest() async throws {
+        let entry = makeEntry()
+        let sessionID = entry.manifest.sessionID
+        let snapshot = makeSnapshot(sessionID: sessionID)
+        let (presenter, _) = await makeReadyPresenter(entry: entry, snapshot: snapshot, range: 1...1)
+        let olderApplicationRevalidation = await presenter.revalidateReadyTarget(for: entry)
+        let olderApplication = try XCTUnwrap(olderApplicationRevalidation)
+
+        // A newer Source click supersedes the older application.
+        await presenter.requestReveal(reference: reference(sessionID, 2...2), generatedFrom: snapshot.fingerprint, for: entry)
+        presenter.consume(olderApplication)
+        presenter.reject(olderApplication, with: .locationUnavailable)
+        XCTAssertEqual(presenter.state, .ready(target(snapshot, 2...2)), "the stale token neither consumed nor rejected the newer target")
+
+        let newerApplicationRevalidation = await presenter.revalidateReadyTarget(for: entry)
+
+        let newerApplication = try XCTUnwrap(newerApplicationRevalidation)
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: newerApplication.target, sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: completedSegments(0...2))),
+            .applyFallback(TranscriptFallbackRevealSelection(scrollTargetSequenceNumber: 2, selectedSequenceNumbers: [2]))
+        )
+        presenter.consume(newerApplication)
+        XCTAssertEqual(presenter.state, .idle)
+    }
+
+    func testFallbackCannotApplyAcrossSessions() async {
+        let entry = makeEntry()
+        let otherEntry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let (presenter, _) = await makeReadyPresenter(entry: entry, snapshot: snapshot)
+        let readyTarget = target(snapshot, 1...1)
+
+        // Another session's pane never applies this target to its plain rows…
+        let otherSessionID = otherEntry.manifest.sessionID
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: readyTarget, sessionID: otherSessionID, transcript: .plain(sessionID: otherSessionID, segments: completedSegments(0...2))),
+            .notApplicable
+        )
+        XCTAssertEqual(presenter.state, .ready(readyTarget))
+        // …and revalidation from another session's entry authorizes nothing.
+        let application = await presenter.revalidateReadyTarget(for: otherEntry)
+        XCTAssertNil(application)
+        XCTAssertEqual(presenter.state, .failed(.unresolvable(.sessionMismatch)))
+    }
+
     func testReadyTargetWaitsForALaterMountedTranscriptPane() async {
         // Narrow layout: the request completes while Notes is shown; the
         // Transcript pane only mounts (and revalidates) afterwards.
@@ -601,7 +701,7 @@ final class TranscriptRevealApplicationPlannerTests: XCTestCase {
     }
 
     func testSingleChunkRevealScrollsToItsFirstRowAndHighlightsEveryRowOfThatChunk() {
-        let outcome = TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, navigation: navigation)
+        let outcome = TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, transcript: .navigation(navigation))
         XCTAssertEqual(outcome, .apply(TranscriptRevealSelection(
             scrollTargetID: id(1, 0),
             selectedItemIDs: [id(1, 0), id(1, 1), id(1, 2)]
@@ -609,7 +709,7 @@ final class TranscriptRevealApplicationPlannerTests: XCTestCase {
     }
 
     func testMultiChunkRevealHighlightsAllRowsOfAllChunksAndNothingOutside() {
-        let outcome = TranscriptRevealApplicationPlanner.outcome(for: target(1...2), sessionID: sessionID, navigation: navigation)
+        let outcome = TranscriptRevealApplicationPlanner.outcome(for: target(1...2), sessionID: sessionID, transcript: .navigation(navigation))
         guard case .apply(let selection) = outcome else {
             return XCTFail("expected .apply, got \(outcome)")
         }
@@ -624,22 +724,71 @@ final class TranscriptRevealApplicationPlannerTests: XCTestCase {
     func testUnmappableRangeIsLocationUnavailableNeverPartial() {
         // Chunk 4 has no rows: the whole mapping fails even though 3 exists.
         XCTAssertEqual(
-            TranscriptRevealApplicationPlanner.outcome(for: target(3...4), sessionID: sessionID, navigation: navigation),
+            TranscriptRevealApplicationPlanner.outcome(for: target(3...4), sessionID: sessionID, transcript: .navigation(navigation)),
             .locationUnavailable
         )
     }
 
     func testTargetForAnotherSessionIsNotApplicableInThisPane() {
         XCTAssertEqual(
-            TranscriptRevealApplicationPlanner.outcome(for: target(1...1, sessionID: UUID()), sessionID: sessionID, navigation: navigation),
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...1, sessionID: UUID()), sessionID: sessionID, transcript: .navigation(navigation)),
             .notApplicable
         )
     }
 
-    func testMissingOrForeignNavigationLeavesTargetPending() {
-        XCTAssertEqual(TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, navigation: nil), .notApplicable)
+    func testLoadingOrForeignTranscriptLeavesTargetPending() {
+        XCTAssertEqual(TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, transcript: .loading), .notApplicable)
         let foreign = TranscriptPlaybackNavigation(sessionID: UUID(), sampleRate: 16_000, items: navigation.items)
-        XCTAssertEqual(TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, navigation: foreign), .notApplicable)
+        XCTAssertEqual(TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, transcript: .navigation(foreign)), .notApplicable)
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, transcript: .plain(sessionID: UUID(), segments: plainSegments)),
+            .notApplicable
+        )
+    }
+
+    // MARK: Plain-transcript fallback
+
+    /// One completed row per chunk 0...3, matching `navigation`'s chunks.
+    private var plainSegments: [OrderedSegment] {
+        (0...3).map { OrderedSegment(sequenceNumber: $0, state: .completed(text: "chunk \($0)")) }
+    }
+
+    func testNavigationWinsOverPlainRowsWhenAvailable() {
+        // The view reports `.navigation` whenever navigation is loaded, even
+        // though plain segments exist too; the preferred selection is used.
+        let outcome = TranscriptRevealApplicationPlanner.outcome(for: target(1...1), sessionID: sessionID, transcript: .navigation(navigation))
+        guard case .apply(let selection) = outcome else {
+            return XCTFail("expected navigation .apply, got \(outcome)")
+        }
+        XCTAssertEqual(selection.scrollTargetID, id(1, 0))
+    }
+
+    func testWithoutNavigationCompletedPlainRowsAreRevealedByWholeChunk() {
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...2), sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: plainSegments)),
+            .applyFallback(TranscriptFallbackRevealSelection(scrollTargetSequenceNumber: 1, selectedSequenceNumbers: [1, 2]))
+        )
+    }
+
+    func testWithoutNavigationUnusablePlainRowsAreLocationUnavailable() {
+        var segments = plainSegments
+        segments[2] = OrderedSegment(sequenceNumber: 2, state: .inProgress)
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...2), sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: segments)),
+            .locationUnavailable
+        )
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...2), sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: [])),
+            .locationUnavailable,
+            "a loaded transcript with no rows is final, not pending"
+        )
+    }
+
+    func testTargetForAnotherSessionIsNotApplicableToPlainRows() {
+        XCTAssertEqual(
+            TranscriptRevealApplicationPlanner.outcome(for: target(1...1, sessionID: UUID()), sessionID: sessionID, transcript: .plain(sessionID: sessionID, segments: plainSegments)),
+            .notApplicable
+        )
     }
 
     func testFailureMessagesDistinguishChangedUnavailableLocationAndSource() {

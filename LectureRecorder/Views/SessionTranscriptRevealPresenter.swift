@@ -45,31 +45,57 @@ struct TranscriptRevealApplication: Equatable {
     fileprivate let requestGeneration: Int
 }
 
+/// The transcript representation the Transcript pane is currently showing,
+/// as far as revealing a target is concerned.
+nonisolated enum TranscriptRevealDisplayedTranscript: Equatable {
+    /// Nothing loaded for the session yet, or its own operation is live:
+    /// a target must wait rather than fail.
+    case loading
+    /// The preferred, T6-C playback navigation rows.
+    case navigation(TranscriptPlaybackNavigation)
+    /// Loaded, but without navigation: the plain per-chunk rows (possibly
+    /// none). Final for that load, not a temporary state.
+    case plain(sessionID: UUID, segments: [OrderedSegment])
+}
+
 /// What the Transcript pane should do with a pending target. Pure.
 nonisolated enum TranscriptRevealApplicationOutcome: Equatable {
-    /// Not for this pane (another session) or navigation not loaded yet:
-    /// leave the target pending.
+    /// Not for this pane (another session) or its transcript is still
+    /// loading: leave the target pending.
     case notApplicable
-    /// Scroll to `scrollTargetID` and highlight every selected row.
+    /// Scroll to `scrollTargetID` and highlight every selected navigation row.
     case apply(TranscriptRevealSelection)
-    /// Navigation is loaded but cannot represent every referenced chunk.
+    /// No navigation: scroll to and highlight every selected plain chunk row.
+    case applyFallback(TranscriptFallbackRevealSelection)
+    /// The loaded transcript cannot represent every referenced chunk.
     case locationUnavailable
 }
 
 nonisolated enum TranscriptRevealApplicationPlanner {
+    /// Navigation always wins when present; plain rows are used only when
+    /// the loaded transcript has no navigation.
     static func outcome(
         for target: TranscriptRevealTarget,
         sessionID: UUID,
-        navigation: TranscriptPlaybackNavigation?
+        transcript: TranscriptRevealDisplayedTranscript
     ) -> TranscriptRevealApplicationOutcome {
-        guard target.sessionID == sessionID,
-              let navigation, navigation.sessionID == sessionID else {
+        guard target.sessionID == sessionID else { return .notApplicable }
+        switch transcript {
+        case .loading:
             return .notApplicable
+        case .navigation(let navigation):
+            guard navigation.sessionID == sessionID else { return .notApplicable }
+            guard let selection = TranscriptRevealSelectionBuilder.select(target, in: navigation) else {
+                return .locationUnavailable
+            }
+            return .apply(selection)
+        case .plain(let transcriptSessionID, let segments):
+            guard transcriptSessionID == sessionID else { return .notApplicable }
+            guard let selection = TranscriptFallbackRevealSelectionBuilder.select(target, in: segments) else {
+                return .locationUnavailable
+            }
+            return .applyFallback(selection)
         }
-        guard let selection = TranscriptRevealSelectionBuilder.select(target, in: navigation) else {
-            return .locationUnavailable
-        }
-        return .apply(selection)
     }
 }
 
