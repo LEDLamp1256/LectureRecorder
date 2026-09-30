@@ -68,7 +68,7 @@ nonisolated enum MLXLectureSummaryBackendError: LocalizedError, Sendable, Equata
         case .integrityValidationFailed(let reason):
             return "The generated Summary failed integrity validation: \(reason)"
         case .invalidGeneratedText(let detail):
-            return "The local MLX model produced Summary text with an unexpected control character: \(detail)."
+            return "The local MLX model produced Summary text with an unsupported generated character: \(detail)."
         }
     }
 }
@@ -687,17 +687,17 @@ nonisolated struct MLXLectureSummaryGenerator: LectureSummaryGenerating, NewLect
 
     /// Rejects generated passage text that is not one plain paragraph: any
     /// C0 control (line feed, carriage return, and tab included), DEL, or C1
-    /// control, and any `$` or backslash — never deleting or repairing it. A
-    /// LaTeX command such as `\nabla` decodes from JSON as a line feed plus
-    /// `abla`, so no line feed is ever accepted. Greek letters, mathematical
-    /// symbols such as ∇, superscripts, and other printable non-ASCII text
-    /// are unaffected. Applied at generation only; completed documents are
-    /// read without it.
+    /// control, and any backslash — never deleting or repairing it. A LaTeX
+    /// command such as `\nabla` decodes from JSON as a line feed plus
+    /// `abla`, so no line feed is ever accepted. A printable `$` (v7), Greek
+    /// letters, mathematical symbols such as ∇, superscripts, and other
+    /// printable non-ASCII text are accepted unchanged. Applied at generation
+    /// only; completed documents are read without it.
     static func requireIntactGeneratedText(_ text: String) throws {
         for scalar in text.unicodeScalars {
             let value = scalar.value
             let isControl = value < 0x20 || (0x7F...0x9F).contains(value)
-            guard isControl || scalar == "$" || scalar == "\\" else { continue }
+            guard isControl || scalar == "\\" else { continue }
             throw MLXLectureSummaryBackendError.invalidGeneratedText(String(format: "U+%04X", value))
         }
     }

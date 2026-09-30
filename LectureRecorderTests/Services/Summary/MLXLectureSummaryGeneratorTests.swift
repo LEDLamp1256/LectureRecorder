@@ -121,13 +121,12 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
         XCTAssertEqual(MLXSummaryConfiguration.generationProvenance.generatorVersion, "545dc4251c05440727734bcd94334791f6ab0192")
     }
 
-    /// v6 holds generated passages to one plain paragraph; v1–v5
-    /// generations are never resumed under v6 — rejected before inference
-    /// in both paths.
-    func testSummaryRecipeIsV6AndOlderGenerationsAreRejectedBeforeInference() async throws {
-        XCTAssertEqual(MLXSummaryConfiguration.recipeVersion, "mlx2-summary-v6")
-        XCTAssertEqual(MLXSummaryConfiguration.generationProvenance.recipeVersion, "mlx2-summary-v6")
-        for oldRecipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4", "mlx2-summary-v5"] {
+    /// v7 accepts a printable `$` that v6 rejected; v1–v6 generations are
+    /// never resumed under v7 — rejected before inference in both paths.
+    func testSummaryRecipeIsV7AndOlderGenerationsAreRejectedBeforeInference() async throws {
+        XCTAssertEqual(MLXSummaryConfiguration.recipeVersion, "mlx2-summary-v7")
+        XCTAssertEqual(MLXSummaryConfiguration.generationProvenance.recipeVersion, "mlx2-summary-v7")
+        for oldRecipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4", "mlx2-summary-v5", "mlx2-summary-v6"] {
             try await assertOldSummaryRecipeIsRejectedBeforeInference(oldRecipe)
         }
     }
@@ -393,10 +392,13 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
         let budget = try LectureSummaryBatchBudget(maxSerializedBytesPerBatch: 100_000, maxItemsPerBatch: 12)
         XCTAssertEqual(try LectureSummaryPlanner.plan(source: source, budget: budget),
                        try LectureSummaryPlanner.plan(source: source, budget: budget, partition: .contiguous))
+        XCTAssertEqual(MLXSummaryConfiguration.generationProvenance.recipeVersion, "mlx2-summary-v7")
         XCTAssertEqual(LectureSummaryPlanPartition.forProvenance(MLXSummaryConfiguration.generationProvenance), .notesSections)
-        var v5 = MLXSummaryConfiguration.generationProvenance
-        v5.recipeVersion = "mlx2-summary-v5"
-        XCTAssertEqual(LectureSummaryPlanPartition.forProvenance(v5), .notesSections, "completed v5 plans still replan by Notes section")
+        for historical in ["mlx2-summary-v5", "mlx2-summary-v6"] {
+            var provenance = MLXSummaryConfiguration.generationProvenance
+            provenance.recipeVersion = historical
+            XCTAssertEqual(LectureSummaryPlanPartition.forProvenance(provenance), .notesSections, "completed \(historical) plans still replan by Notes section")
+        }
         for recipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4"] {
             var old = MLXSummaryConfiguration.generationProvenance
             old.recipeVersion = recipe
@@ -547,15 +549,50 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
         }
     }
 
-    /// v6: a passage is one plain paragraph. Line breaks, tabs, every other
-    /// control character, `$`, and backslashes are rejected, never repaired.
-    func testGeneratedTextRejectsLineBreaksControlsDollarsAndBackslashesWithoutRepair() {
-        for scalar: UInt32 in [0x00, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1B, 0x1F, 0x24, 0x5C, 0x7F, 0x85, 0x9F] {
+    /// A passage is one plain paragraph. Line breaks, tabs, every other C0
+    /// control, DEL, every C1 control, and backslashes are rejected, never
+    /// repaired.
+    func testGeneratedTextRejectsEveryControlAndBackslashWithoutRepair() {
+        let rejected: [UInt32] = Array(0x00...0x1F) + [0x5C, 0x7F] + Array(0x80...0x9F)
+        for scalar in rejected {
             let text = "Before" + String(Character(Unicode.Scalar(scalar)!)) + "after."
             XCTAssertThrowsError(try MLXLectureSummaryGenerator.requireIntactGeneratedText(text)) {
                 XCTAssertEqual($0 as? MLXLectureSummaryBackendError, .invalidGeneratedText(String(format: "U+%04X", scalar)))
             }
         }
+        XCTAssertEqual(
+            MLXLectureSummaryBackendError.invalidGeneratedText("U+005C").errorDescription,
+            "The local MLX model produced Summary text with an unsupported generated character: U+005C."
+        )
+    }
+
+    /// v7: a printable `$` — alone or as delimiters — is accepted as is.
+    func testGeneratedTextAcceptsPrintableDollarSigns() {
+        for text in [
+            "The kit costs $5.",
+            "$x$ is the unknown.",
+            "Energy is $ E = mc² $ in plain text.",
+            "$$ Δx → 0 $$",
+        ] {
+            XCTAssertNoThrow(try MLXLectureSummaryGenerator.requireIntactGeneratedText(text), text)
+        }
+    }
+
+    /// v6 rejected this passage on its `$`; v7 maps it with the text
+    /// exactly as generated — no repair, stripping, or retry.
+    func testPassageWithOnlyPrintableDollarsMapsUnchanged() async throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try mlxGeneration(source: source)
+        let text = "Energy is $ E = mc² $, and the kit costs $5."
+        let driver = FakeMLXSessionDriver()
+        driver.enqueueRespond(.success(.stub(jsonText: #"{"passages":[{"text":"\#(text)","supportIndices":[1]}]}"#)))
+
+        let analysis = try await makeGenerator(driver: driver).generateAnalysis(
+            for: generation.batchPlan.batches[0], generation: generation, source: source
+        )
+
+        XCTAssertEqual(analysis.passages.map(\.text), [text])
+        XCTAssertEqual(driver.respondCallCount, 1)
     }
 
     /// The v5 acceptance defect: the model wrote `$ E = -\nabla V $`; JSON
@@ -566,14 +603,17 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
     func testLatexCommandsDecodedToLineFeedsFailClosedWithoutRepair() async throws {
         let source = try SummaryTestSupport.source()
         let generation = try mlxGeneration(source: source)
-        // The exact persisted v5 text: a real line feed where `\n` was.
+        // The exact persisted v5 text: a real line feed where `\n` was. It
+        // fails on that line feed, not on its now-accepted `$`.
         let decodedV5 = "$ E = -" + "\u{0A}" + "abla V $"
-        XCTAssertThrowsError(try MLXLectureSummaryGenerator.requireIntactGeneratedText(decodedV5))
+        XCTAssertThrowsError(try MLXLectureSummaryGenerator.requireIntactGeneratedText(decodedV5)) {
+            XCTAssertEqual($0 as? MLXLectureSummaryBackendError, .invalidGeneratedText("U+000A"))
+        }
         XCTAssertThrowsError(try MLXLectureSummaryGenerator.requireIntactGeneratedText("E = -" + "\u{0A}" + "abla V")) {
             XCTAssertEqual($0 as? MLXLectureSummaryBackendError, .invalidGeneratedText("U+000A"))
         }
         let cases: [(json: String, expected: String)] = [
-            (#"$ E = -\nabla V $"#, "U+0024"),
+            (#"$ E = -\nabla V $"#, "U+000A"),
             (#"E = -\nabla V"#, "U+000A"),
             (#"x \neq 0"#, "U+000A"),
             (#"a \ne b"#, "U+000A"),
@@ -631,9 +671,9 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
     }
 
     /// The v10 acceptance defect: single-backslash LaTeX inside a JSON
-    /// string decodes `\f` and `\t` to U+000C and U+0009; since v6 its `$`
-    /// delimiter is rejected first. The batch path fails closed on the first
-    /// response — no identical greedy retry.
+    /// string decodes `\f` and `\t` to U+000C and U+0009. Since v7 its `$`
+    /// delimiter is accepted, so the decoded control fails it. The batch path
+    /// fails closed on the first response — no identical greedy retry.
     func testLatexEscapesDecodedToControlCharactersFailBatchAnalysisWithoutRetry() async throws {
         let source = try SummaryTestSupport.source()
         let generation = try mlxGeneration(source: source)
@@ -644,7 +684,7 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
             _ = try await makeGenerator(driver: driver).generateAnalysis(for: generation.batchPlan.batches[0], generation: generation, source: source)
             XCTFail("expected invalidGeneratedText")
         } catch let error as MLXLectureSummaryBackendError {
-            XCTAssertEqual(error, .invalidGeneratedText("U+0024"))
+            XCTAssertEqual(error, .invalidGeneratedText("U+000C"))
         }
         XCTAssertEqual(driver.respondCallCount, 1, "deterministic greedy output is never retried")
     }
@@ -674,7 +714,7 @@ final class MLXLectureSummaryGeneratorTests: XCTestCase {
             _ = try await makeGenerator(driver: driver).generateDocument(from: analyses, generation: generation, source: source)
             XCTFail("expected invalidGeneratedText")
         } catch let error as MLXLectureSummaryBackendError {
-            XCTAssertEqual(error, .invalidGeneratedText("U+0024"))
+            XCTAssertEqual(error, .invalidGeneratedText("U+0009"))
         }
         XCTAssertEqual(driver.respondCallCount, 1, "one final-section call, not retried; no structure call exists")
     }
