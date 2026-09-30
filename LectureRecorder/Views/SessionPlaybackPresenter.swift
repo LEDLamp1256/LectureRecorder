@@ -140,6 +140,8 @@ final class SessionPlaybackPresenter: ObservableObject {
         }
     }
 
+    var canSeek: Bool { canPlayOrPause }
+
     // MARK: - Lifecycle
 
     /// Stops any previous session's playback, then prepares `entry`'s audio.
@@ -211,6 +213,20 @@ final class SessionPlaybackPresenter: ObservableObject {
     func stop() {
         controller?.stop()
         syncFromController()
+    }
+
+    /// Moves playback to `seconds` without changing whether it plays — the
+    /// time slider's seek. Delegates to `LecturePlaybackController.seek`, so
+    /// its semantics apply unchanged: ready and paused keep their phase,
+    /// playing reschedules and keeps playing, ended becomes paused, the time
+    /// is clamped to `0...duration` (the end itself settles as ended), and a
+    /// non-finite time is rejected. Returns `false` (changing nothing) when
+    /// there is no usable controller or the controller rejects the seek.
+    @discardableResult
+    func seek(toSessionTime seconds: Double) -> Bool {
+        guard let controller, controller.seek(toSessionTime: seconds) else { return false }
+        syncFromController()
+        return true
     }
 
     /// Seeks to `item`'s exact start and plays from there: from ready,

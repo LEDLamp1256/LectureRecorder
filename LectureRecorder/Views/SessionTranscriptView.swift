@@ -24,6 +24,10 @@ struct SessionTranscriptView: View {
     @ObservedObject var service: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionTranscriptPresenter
     @StateObject private var playback = SessionPlaybackPresenter()
+    /// While the time slider is being dragged, the position it previews.
+    /// UI-only: the presenter's position stays authoritative, and one seek
+    /// is issued when the drag ends.
+    @State private var scrubPreviewSeconds: Double?
 
     init(
         entry: CompletedSessionEntry,
@@ -67,9 +71,11 @@ struct SessionTranscriptView: View {
             await presenter.refresh(for: entry)
         }
         .task(id: sessionID) {
+            scrubPreviewSeconds = nil
             await playback.prepare(for: entry)
         }
         .onDisappear {
+            scrubPreviewSeconds = nil
             playback.tearDown()
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
@@ -184,16 +190,30 @@ struct SessionTranscriptView: View {
             Button {
                 playback.togglePlayPause()
             } label: {
-                Label(playback.isPlaying ? "Pause" : "Play", systemImage: playback.isPlaying ? "pause.fill" : "play.fill")
+                // Both labels are laid out so the button keeps the wider
+                // one's width and toggling never shifts the bar.
+                ZStack {
+                    Label("Play", systemImage: "play.fill")
+                        .opacity(playback.isPlaying ? 0 : 1)
+                        .accessibilityHidden(playback.isPlaying)
+                    Label("Pause", systemImage: "pause.fill")
+                        .opacity(playback.isPlaying ? 1 : 0)
+                        .accessibilityHidden(!playback.isPlaying)
+                }
             }
             .disabled(!playbackForThisSession || !playback.canPlayOrPause)
 
+            // Stops playback and returns to the beginning (`stop()` resets
+            // the controller to frame 0, ready).
             Button {
                 playback.stop()
             } label: {
-                Label("Stop", systemImage: "stop.fill")
+                Label("Reset", systemImage: "arrow.counterclockwise")
             }
             .disabled(!playbackForThisSession || !playback.canStop)
+            .help("Stop playback and return to the beginning")
+
+            playbackSlider
 
             Text(playbackTimeLabel)
                 .font(.body.monospacedDigit())
@@ -204,9 +224,60 @@ struct SessionTranscriptView: View {
         .buttonStyle(.bordered)
     }
 
+    /// The slider's range end, or `nil` when there is nothing seekable.
+    private var sliderDuration: Double? {
+        guard playbackForThisSession, playback.canSeek,
+              let duration = playback.durationSeconds, duration.isFinite, duration > 0 else {
+            return nil
+        }
+        return duration
+    }
+
+    /// Follows the presenter's position except while dragging, when it shows
+    /// the local preview so position samples never move the thumb. Releasing
+    /// issues exactly one seek; a value change outside a drag (keyboard or
+    /// accessibility adjustment) seeks immediately. Seeking keeps the play
+    /// state — unlike transcript timestamps, the slider never starts playback.
+    private var playbackSlider: some View {
+        let duration = sliderDuration
+        let upperBound = duration ?? 1
+        let position = Binding<Double>(
+            get: {
+                let seconds = scrubPreviewSeconds ?? playback.currentSessionTime
+                guard duration != nil, seconds.isFinite else { return 0 }
+                return min(max(seconds, 0), upperBound)
+            },
+            set: { newValue in
+                guard duration != nil, newValue.isFinite else { return }
+                if scrubPreviewSeconds != nil {
+                    scrubPreviewSeconds = newValue
+                } else {
+                    playback.seek(toSessionTime: newValue)
+                }
+            }
+        )
+        return Slider(value: position, in: 0...upperBound) { isEditing in
+            if isEditing {
+                scrubPreviewSeconds = playback.currentSessionTime
+            } else if let target = scrubPreviewSeconds {
+                scrubPreviewSeconds = nil
+                playback.seek(toSessionTime: target)
+            }
+        }
+        .controlSize(.small)
+        .frame(minWidth: 160, maxWidth: .infinity)
+        .disabled(duration == nil)
+        .onChange(of: duration == nil) { _, isDisabled in
+            // A drag cut short by the slider disabling (e.g. playback
+            // failure) must not leave a stale preview behind.
+            if isDisabled { scrubPreviewSeconds = nil }
+        }
+    }
+
     private var playbackTimeLabel: String {
         guard playbackForThisSession, let duration = playback.durationSeconds else { return "–:– / –:–" }
-        return PlaybackTimeFormatting.progressLabel(elapsedSeconds: playback.currentSessionTime, totalSeconds: duration)
+        let elapsed = scrubPreviewSeconds ?? playback.currentSessionTime
+        return PlaybackTimeFormatting.progressLabel(elapsedSeconds: elapsed, totalSeconds: duration)
     }
 
     @ViewBuilder private var playbackStatusText: some View {
@@ -267,13 +338,15 @@ struct SessionTranscriptView: View {
     /// text stays selectable.
     private func navigationRow(_ item: TranscriptPlaybackItem, in navigation: TranscriptPlaybackNavigation) -> some View {
         let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isEnabled = playbackForThisSession && playback.canPlayOrPause
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Button(PlaybackTimeFormatting.label(forSeconds: navigation.startTime(of: item))) {
                 playback.navigate(to: item, in: navigation)
             }
             .buttonStyle(.link)
             .font(.caption.monospacedDigit())
-            .disabled(!playbackForThisSession || !playback.canPlayOrPause)
+            .disabled(!isEnabled)
+            .pointerStyle(isEnabled ? .link : nil)
             .help(item.target == .chunkStart ? "Play from the start of this chunk" : "Play from this passage")
 
             Text(text.isEmpty ? "(silence)" : text)

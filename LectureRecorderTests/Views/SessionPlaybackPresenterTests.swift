@@ -320,6 +320,103 @@ final class SessionPlaybackPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.status, .available(.ready))
     }
 
+    // MARK: - Slider seek (keeps the play state)
+
+    func testSeekWhileReadyMovesPositionWithoutPlaying() async throws {
+        let (presenter, _, backend) = try await preparedPresenter()
+        XCTAssertTrue(presenter.canSeek)
+
+        XCTAssertTrue(presenter.seek(toSessionTime: 1.5))
+
+        XCTAssertEqual(presenter.status, .available(.ready))
+        XCTAssertEqual(presenter.currentSessionFrame, 66_150)
+        XCTAssertEqual(presenter.currentSessionTime, 1.5, accuracy: 1e-12)
+        XCTAssertTrue(backend.playCalls.isEmpty, "the slider never starts playback")
+        XCTAssertFalse(presenter.isPolling)
+
+        presenter.play()
+        XCTAssertEqual(backend.playCalls, [66_150], "Play starts from the sought position")
+    }
+
+    func testSeekWhilePausedMovesPositionAndStaysPaused() async throws {
+        let (presenter, _, backend) = try await preparedPresenter()
+        presenter.play()
+        backend.renderedFrame = 10_000
+        presenter.pause()
+
+        XCTAssertTrue(presenter.seek(toSessionTime: 2.0))
+
+        XCTAssertEqual(presenter.status, .available(.paused))
+        XCTAssertEqual(presenter.currentSessionFrame, 88_200)
+        XCTAssertEqual(backend.playCalls, [0])
+        XCTAssertFalse(presenter.isPolling)
+
+        presenter.play()
+        XCTAssertEqual(backend.playCalls.last, 88_200, "resumes from the sought position")
+    }
+
+    func testSeekWhilePlayingReschedulesAndKeepsPlayingWithOnePoll() async throws {
+        let (presenter, _, backend) = try await preparedPresenter()
+        presenter.play()
+
+        XCTAssertTrue(presenter.seek(toSessionTime: 0.5))
+
+        XCTAssertEqual(backend.playCalls, [0, 22_050])
+        XCTAssertEqual(presenter.status, .available(.playing))
+        XCTAssertEqual(presenter.currentSessionFrame, 22_050)
+        XCTAssertEqual(scheduler.intervals.count, 1, "the running poll continues; no second poll")
+        XCTAssertEqual(scheduler.activePolls.count, 1)
+    }
+
+    func testSeekBackwardFromEndedMovesAwayWithoutPlaying() async throws {
+        let (presenter, source, backend) = try await preparedPresenter()
+        presenter.play()
+        backend.deliverToLatest(.reachedEnd)
+        XCTAssertEqual(presenter.currentSessionFrame, source.timeline.totalFrameCount)
+
+        XCTAssertTrue(presenter.seek(toSessionTime: 1.0))
+
+        XCTAssertEqual(presenter.status, .available(.paused), "T6-B: seeking from ended pauses at the target")
+        XCTAssertEqual(presenter.currentSessionFrame, 44_100)
+        XCTAssertEqual(backend.playCalls, [0], "no playback started")
+        XCTAssertFalse(presenter.isPolling)
+    }
+
+    func testNonFiniteSeekIsRejectedAndChangesNothing() async throws {
+        let (presenter, _, backend) = try await preparedPresenter()
+        XCTAssertTrue(presenter.seek(toSessionTime: 0.5))
+
+        for bad in [Double.nan, .infinity, -.infinity] {
+            XCTAssertFalse(presenter.seek(toSessionTime: bad), "\(bad)")
+        }
+
+        XCTAssertEqual(presenter.status, .available(.ready))
+        XCTAssertEqual(presenter.currentSessionFrame, 22_050)
+        XCTAssertTrue(backend.playCalls.isEmpty)
+    }
+
+    func testOutOfRangeSeekUsesControllerClamping() async throws {
+        let (presenter, source, _) = try await preparedPresenter()
+
+        XCTAssertTrue(presenter.seek(toSessionTime: -3))
+        XCTAssertEqual(presenter.currentSessionFrame, 0)
+        XCTAssertEqual(presenter.status, .available(.ready))
+
+        XCTAssertTrue(presenter.seek(toSessionTime: 1_000))
+        XCTAssertEqual(presenter.currentSessionFrame, source.timeline.totalFrameCount)
+        XCTAssertEqual(presenter.status, .available(.ended), "T6-B: seeking to the end settles as ended")
+        XCTAssertFalse(presenter.isPolling)
+    }
+
+    func testSeekWithoutControllerIsRejected() async throws {
+        let presenter = makePresenter()
+
+        XCTAssertFalse(presenter.canSeek)
+        XCTAssertFalse(presenter.seek(toSessionTime: 1))
+        XCTAssertEqual(presenter.status, .idle)
+        XCTAssertEqual(presenter.currentSessionFrame, 0)
+    }
+
     // MARK: - Stop / end / failure
 
     func testStopResetsDisplayToZero() async throws {
@@ -336,6 +433,28 @@ final class SessionPlaybackPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.currentSessionTime, 0)
         XCTAssertFalse(presenter.isPolling)
         XCTAssertFalse(presenter.canStop)
+    }
+
+    func testResetFromPausedAndEndedReturnsToReadyAtZero() async throws {
+        let (presenter, _, backend) = try await preparedPresenter()
+        presenter.play()
+        backend.renderedFrame = 30_000
+        presenter.pause()
+        XCTAssertEqual(presenter.currentSessionFrame, 30_000)
+
+        presenter.stop()
+        XCTAssertEqual(presenter.status, .available(.ready), "reset from paused")
+        XCTAssertEqual(presenter.currentSessionFrame, 0)
+
+        presenter.play()
+        backend.deliverToLatest(.reachedEnd)
+        XCTAssertEqual(presenter.status, .available(.ended))
+
+        presenter.stop()
+        XCTAssertEqual(presenter.status, .available(.ready), "reset from ended")
+        XCTAssertEqual(presenter.currentSessionFrame, 0)
+        XCTAssertEqual(presenter.currentSessionTime, 0)
+        XCTAssertFalse(presenter.isPolling)
     }
 
     func testNaturalEndShowsDurationAndStopsPolling() async throws {
