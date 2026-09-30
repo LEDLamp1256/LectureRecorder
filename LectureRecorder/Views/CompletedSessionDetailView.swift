@@ -46,6 +46,7 @@ struct CompletedSessionDetailView: View {
     private let summaryStore: any LectureSummaryStoring
     private let summaryOperationStateStore: any LectureSummaryOperationStateStoring
     private let summarySourceLoader: any LectureSummarySourceLoading
+    private let transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
 
     @State private var contentSelection: ContentSelection = .transcript
 
@@ -59,7 +60,8 @@ struct CompletedSessionDetailView: View {
         notesSourceLoader: any NotesTranscriptSourceLoading,
         summaryStore: any LectureSummaryStoring,
         summaryOperationStateStore: any LectureSummaryOperationStateStoring,
-        summarySourceLoader: any LectureSummarySourceLoading
+        summarySourceLoader: any LectureSummarySourceLoading,
+        transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
     ) {
         self.entry = entry
         self.transcriptionService = transcriptionService
@@ -71,6 +73,7 @@ struct CompletedSessionDetailView: View {
         self.summaryStore = summaryStore
         self.summaryOperationStateStore = summaryOperationStateStore
         self.summarySourceLoader = summarySourceLoader
+        self.transcriptNavigationLoader = transcriptNavigationLoader
     }
 
     var body: some View {
@@ -109,7 +112,11 @@ struct CompletedSessionDetailView: View {
     }
 
     private var transcriptView: some View {
-        SessionTranscriptView(entry: entry, service: transcriptionService)
+        SessionTranscriptView(
+            entry: entry,
+            service: transcriptionService,
+            navigationLoader: transcriptNavigationLoader
+        )
     }
 
     private var notesView: some View {

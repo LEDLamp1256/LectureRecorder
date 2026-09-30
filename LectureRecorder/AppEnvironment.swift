@@ -30,6 +30,8 @@ final class AppEnvironment: ObservableObject {
     let notesStore: LectureNotesStore
     let notesOperationStateStore: LectureNotesOperationStateStore
     let notesTranscriptSourceLoader: NotesTranscriptSourceLoader
+    /// T6-C: read-only transcript → playback navigation for completed sessions.
+    let transcriptNavigationLoader: CompletedTranscriptNavigationLoader
     let lectureSummaryGenerationService: LectureSummaryGenerationService
     /// The same read-only Summary durable-state collaborators wired into
     /// `lectureSummaryGenerationService` above, exposed separately for the
@@ -143,6 +145,7 @@ final class AppEnvironment: ObservableObject {
         self.notesStore = notesStore
         self.notesOperationStateStore = notesOperationStateStore
         self.notesTranscriptSourceLoader = notesTranscriptSourceLoader
+        self.transcriptNavigationLoader = CompletedTranscriptNavigationLoader(transcriptionStore: transcriptionStore)
 
         self.lectureNotesGenerationService = LectureNotesGenerationService(
             sourceLoader: notesTranscriptSourceLoader,

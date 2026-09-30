@@ -13,15 +13,26 @@ import SwiftUI
 /// `SessionActionAvailabilityCalculator` — this session's own saved status
 /// is never reinterpreted as an integrity problem merely because a
 /// *different* session currently owns the shared operation.
+///
+/// Playback is independent of transcription: a window-local
+/// `SessionPlaybackPresenter` prepares this session's audio when the view
+/// appears (never auto-playing) and stops it when the view disappears. A
+/// completed transcript with loaded navigation shows each passage with a
+/// timestamp button that plays from that passage.
 struct SessionTranscriptView: View {
     let entry: CompletedSessionEntry
     @ObservedObject var service: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionTranscriptPresenter
+    @StateObject private var playback = SessionPlaybackPresenter()
 
-    init(entry: CompletedSessionEntry, service: CompletedSessionTranscriptionService) {
+    init(
+        entry: CompletedSessionEntry,
+        service: CompletedSessionTranscriptionService,
+        navigationLoader: any CompletedTranscriptNavigationLoading
+    ) {
         self.entry = entry
         self.service = service
-        _presenter = StateObject(wrappedValue: SessionTranscriptPresenter(loader: service))
+        _presenter = StateObject(wrappedValue: SessionTranscriptPresenter(loader: service, navigationLoader: navigationLoader))
     }
 
     private var sessionID: UUID { entry.manifest.sessionID }
@@ -46,6 +57,7 @@ struct SessionTranscriptView: View {
             statusSection
             actionButtons
             Divider()
+            playbackBar
             transcriptSection
             Spacer()
         }
@@ -53,6 +65,12 @@ struct SessionTranscriptView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: sessionID) {
             await presenter.refresh(for: entry)
+        }
+        .task(id: sessionID) {
+            await playback.prepare(for: entry)
+        }
+        .onDisappear {
+            playback.tearDown()
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
             guard SessionOwnershipTransition.shouldRefreshDurableState(
@@ -157,9 +175,83 @@ struct SessionTranscriptView: View {
         return "Continue"
     }
 
+    // MARK: - Playback
+
+    private var playbackForThisSession: Bool { playback.displayedSessionID == sessionID }
+
+    private var playbackBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                playback.togglePlayPause()
+            } label: {
+                Label(playback.isPlaying ? "Pause" : "Play", systemImage: playback.isPlaying ? "pause.fill" : "play.fill")
+            }
+            .disabled(!playbackForThisSession || !playback.canPlayOrPause)
+
+            Button {
+                playback.stop()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+            .disabled(!playbackForThisSession || !playback.canStop)
+
+            Text(playbackTimeLabel)
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            playbackStatusText
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private var playbackTimeLabel: String {
+        guard playbackForThisSession, let duration = playback.durationSeconds else { return "–:– / –:–" }
+        return PlaybackTimeFormatting.progressLabel(elapsedSeconds: playback.currentSessionTime, totalSeconds: duration)
+    }
+
+    @ViewBuilder private var playbackStatusText: some View {
+        if playbackForThisSession {
+            switch playback.status {
+            case .idle, .available(.ready), .available(.playing), .available(.paused), .available(.ended):
+                EmptyView()
+            case .preparing:
+                ProgressView().controlSize(.small)
+            case .unavailable(let message):
+                Label("Playback unavailable: \(message)", systemImage: "speaker.slash")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            case .available(.failed(let failure)):
+                Label("Playback failed: \(failure.localizedDescription)", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .font(.caption)
+            }
+        }
+    }
+
+    // MARK: - Transcript
+
+    /// Navigation for this session's saved transcript — never while this
+    /// session's own operation is live (its segments are shown instead).
+    private var displayedNavigation: TranscriptPlaybackNavigation? {
+        guard !isActiveOperation, presenter.displayedSessionID == sessionID,
+              let navigation = presenter.navigation, navigation.sessionID == sessionID else {
+            return nil
+        }
+        return navigation
+    }
+
     @ViewBuilder private var transcriptSection: some View {
         let segments = isActiveOperation ? service.displayedSegments : (presenter.displayedSessionID == sessionID ? presenter.segments : [])
-        if !segments.isEmpty {
+        if let navigation = displayedNavigation {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(navigation.items) { item in
+                        navigationRow(item, in: navigation)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else if !segments.isEmpty {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(segments, id: \.sequenceNumber) { segment in
@@ -168,6 +260,26 @@ struct SessionTranscriptView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+        }
+    }
+
+    /// The timestamp button is the only navigation affordance; the passage
+    /// text stays selectable.
+    private func navigationRow(_ item: TranscriptPlaybackItem, in navigation: TranscriptPlaybackNavigation) -> some View {
+        let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Button(PlaybackTimeFormatting.label(forSeconds: navigation.startTime(of: item))) {
+                playback.navigate(to: item, in: navigation)
+            }
+            .buttonStyle(.link)
+            .font(.caption.monospacedDigit())
+            .disabled(!playbackForThisSession || !playback.canPlayOrPause)
+            .help(item.target == .chunkStart ? "Play from the start of this chunk" : "Play from this passage")
+
+            Text(text.isEmpty ? "(silence)" : text)
+                .textSelection(.enabled)
+                .foregroundStyle(text.isEmpty ? .secondary : .primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
