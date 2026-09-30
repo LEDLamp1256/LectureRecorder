@@ -14,6 +14,7 @@ struct CompletedSessionsView: View {
     let summaryStore: any LectureSummaryStoring
     let summaryOperationStateStore: any LectureSummaryOperationStateStoring
     let summarySourceLoader: any LectureSummarySourceLoading
+    let transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
     @ObservedObject var sessionManager: SessionManager
     @StateObject private var presenter: CompletedSessionsListPresenter
 
@@ -28,6 +29,7 @@ struct CompletedSessionsView: View {
         summaryStore: any LectureSummaryStoring,
         summaryOperationStateStore: any LectureSummaryOperationStateStoring,
         summarySourceLoader: any LectureSummarySourceLoading,
+        transcriptNavigationLoader: any CompletedTranscriptNavigationLoading,
         sessionManager: SessionManager
     ) {
         self.service = service
@@ -39,6 +41,7 @@ struct CompletedSessionsView: View {
         self.summaryStore = summaryStore
         self.summaryOperationStateStore = summaryOperationStateStore
         self.summarySourceLoader = summarySourceLoader
+        self.transcriptNavigationLoader = transcriptNavigationLoader
         self.sessionManager = sessionManager
         _presenter = StateObject(wrappedValue: CompletedSessionsListPresenter(catalog: catalog))
     }
@@ -89,7 +92,8 @@ struct CompletedSessionsView: View {
                     notesSourceLoader: notesSourceLoader,
                     summaryStore: summaryStore,
                     summaryOperationStateStore: summaryOperationStateStore,
-                    summarySourceLoader: summarySourceLoader
+                    summarySourceLoader: summarySourceLoader,
+                    transcriptNavigationLoader: transcriptNavigationLoader
                 )
                 .id(selectedEntry.manifest.sessionID)
             } else {
