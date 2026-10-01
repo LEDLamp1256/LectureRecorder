@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import LectureRecorder
 
@@ -697,5 +698,284 @@ final class LectureSummaryGenerationServiceTests: XCTestCase {
 
         XCTAssertNil(service.activeSessionID)
         XCTAssertNil(service.activeGenerationID)
+    }
+}
+
+/// Collects every `lastReleasedOperation` emission after the initial value,
+/// plus the service's ownership state at the exact moment each one is
+/// emitted — so a test can prove ownership was already relinquished when
+/// an observer first sees the release.
+@MainActor
+private final class SummaryReleaseRecorder {
+    typealias Release = LectureSummaryGenerationService.OperationRelease
+
+    private(set) var releases: [Release] = []
+    private(set) var activeSessionIDAtEmission: [UUID?] = []
+    private(set) var activeGenerationIDAtEmission: [UUID?] = []
+    private(set) var nilEmissionCount = 0
+    /// Invoked synchronously inside the emission, after it is recorded.
+    var onRelease: ((Release) -> Void)?
+    private var cancellable: AnyCancellable?
+
+    init(_ service: LectureSummaryGenerationService) {
+        cancellable = service.$lastReleasedOperation.dropFirst().sink { [weak self, weak service] release in
+            guard let self else { return }
+            guard let release else {
+                self.nilEmissionCount += 1
+                return
+            }
+            self.activeSessionIDAtEmission.append(service?.activeSessionID)
+            self.activeGenerationIDAtEmission.append(service?.activeGenerationID)
+            self.releases.append(release)
+            self.onRelease?(release)
+        }
+    }
+}
+
+// MARK: - Operation release signal
+
+extension LectureSummaryGenerationServiceTests {
+    /// Waits, event-driven (no polling, no sleeps), for the release whose
+    /// token is exactly `epoch`.
+    private func awaitRelease(
+        _ recorder: SummaryReleaseRecorder,
+        epoch: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> SummaryReleaseRecorder.Release? {
+        if let existing = recorder.releases.first(where: { $0.operationEpoch == epoch }) { return existing }
+        let released = expectation(description: "release of epoch \(epoch)")
+        recorder.onRelease = { release in
+            guard release.operationEpoch == epoch else { return }
+            recorder.onRelease = nil
+            released.fulfill()
+        }
+        await fulfillment(of: [released], timeout: 5)
+        recorder.onRelease = nil
+        let release = recorder.releases.first { $0.operationEpoch == epoch }
+        XCTAssertNotNil(release, "no release observed for epoch \(epoch)", file: file, line: line)
+        return release
+    }
+
+    private func makeReleaseTestService(
+        generator: ControllableFakeLectureSummaryGenerator? = nil,
+        loaderResult: Result<LectureSummarySourceSnapshot, Error>? = nil,
+        newGenerationAvailabilityChecker: any NewLectureNotesGenerationAvailabilityChecking = FakeNewGenerationAvailabilityChecker()
+    ) throws -> LectureSummaryGenerationService {
+        let loader = FakeSummarySourceLoader(defaultResult: try loaderResult ?? .success(SummaryTestSupport.source()))
+        return makeService(
+            sourceLoader: loader,
+            generator: generator ?? ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance),
+            newGenerationAvailabilityChecker: newGenerationAvailabilityChecker
+        )
+    }
+
+    func testLastReleasedOperationIsNilInitially() throws {
+        let service = try makeReleaseTestService()
+        XCTAssertNil(service.lastReleasedOperation)
+    }
+
+    func testCompletedGeneratePublishesExactlyOneMatchingReleaseWithTheMintedGenerationID() async throws {
+        let service = try makeReleaseTestService()
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release?.sessionID, sessionID)
+        XCTAssertEqual(release?.operationEpoch, epoch)
+        XCTAssertEqual(release?.generationID, try onlySummaryGenerationID())
+        guard case .completed(let document) = release?.outcome else {
+            return XCTFail("expected a completed outcome, got \(String(describing: release?.outcome))")
+        }
+        XCTAssertEqual(document.generationID, release?.generationID)
+        XCTAssertEqual(recorder.releases.count, 1, "exactly one release for one admitted operation")
+        XCTAssertEqual(recorder.nilEmissionCount, 0)
+        XCTAssertEqual(service.lastReleasedOperation, release)
+    }
+
+    func testOwnershipIsAlreadyReleasedWhenReleaseIsObserved() async throws {
+        let service = try makeReleaseTestService()
+        let recorder = SummaryReleaseRecorder(service)
+
+        // Attempt the next admission synchronously from inside A's emission
+        // itself — the earliest moment any observer can react — then wait
+        // for the follow-up operation's own release.
+        var admissionAtEmission: LectureSummaryGenerationService.AdmissionResult?
+        let followUpReleased = expectation(description: "follow-up operation released")
+        recorder.onRelease = { _ in
+            if admissionAtEmission == nil {
+                admissionAtEmission = service.generate(sessionID: self.sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID)
+            } else {
+                followUpReleased.fulfill()
+            }
+        }
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epochA = service.operationEpoch
+        await fulfillment(of: [followUpReleased], timeout: 5)
+
+        XCTAssertEqual(admissionAtEmission, .admitted, "the admission slot is free by the time the release is observable")
+        XCTAssertEqual(recorder.activeSessionIDAtEmission.first, .some(nil), "activeSessionID is cleared before the release is published")
+        XCTAssertEqual(recorder.activeGenerationIDAtEmission.first, .some(nil), "activeGenerationID is cleared before the release is published")
+        XCTAssertEqual(recorder.releases.map(\.operationEpoch), [epochA, epochA + 1])
+    }
+
+    func testSourceNotesUnavailablePublishesReleaseWithoutGenerationID() async throws {
+        let service = try makeReleaseTestService(loaderResult: .failure(LectureSummarySourceError.incompleteGeneration))
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release?.sessionID, sessionID)
+        XCTAssertNil(release?.generationID, "a Generate that ended before minting has no generation ID — the epoch alone identifies it")
+        guard case .sourceNotesUnavailable = release?.outcome else {
+            return XCTFail("expected sourceNotesUnavailable, got \(String(describing: release?.outcome))")
+        }
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testBackendUnavailableAfterAdmissionPublishesReleaseWithoutGenerationID() async throws {
+        let service = try makeReleaseTestService(
+            newGenerationAvailabilityChecker: FakeNewGenerationAvailabilityChecker(result: .unavailable(description: "model not ready"))
+        )
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release, .init(sessionID: sessionID, operationEpoch: epoch, generationID: nil, outcome: .backendUnavailable(description: "model not ready")))
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testFailedBatchPublishesReleaseWithTheGenerationID() async throws {
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 1)
+        await generator.setFailure(FakeSummaryGeneratorFailure(message: "batch exploded"), forBatchIndex: 0)
+        let service = try makeReleaseTestService(generator: generator)
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release?.generationID, try onlySummaryGenerationID())
+        guard case .failed = release?.outcome else {
+            return XCTFail("expected a failed outcome, got \(String(describing: release?.outcome))")
+        }
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testCancelledOperationPublishesExactlyOneRelease() async throws {
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 1)
+        await generator.armGate(beforeBatchIndex: 1)
+        let service = try makeReleaseTestService(generator: generator)
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        await waitUntil { await generator.hasEnteredGate(forBatchIndex: 1) }
+        XCTAssertTrue(recorder.releases.isEmpty, "no release while the operation still owns the slot")
+
+        service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release, .init(sessionID: sessionID, operationEpoch: epoch, generationID: try onlySummaryGenerationID(), outcome: .cancelled))
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testShutdownCancellationPublishesExactlyOneRelease() async throws {
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 1)
+        await generator.armGate(beforeBatchIndex: 0)
+        let service = try makeReleaseTestService(generator: generator)
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epoch = service.operationEpoch
+        await waitUntil { await generator.hasEnteredGate(forBatchIndex: 0) }
+
+        let outcome = await service.shutdown(timeout: 5)
+        XCTAssertEqual(outcome, .completed)
+        XCTAssertEqual(recorder.releases.map(\.operationEpoch), [epoch])
+        XCTAssertEqual(recorder.releases.first?.outcome, .cancelled)
+    }
+
+    func testStaleSourceContinuePublishesReleaseWithTheCallersGenerationID() async throws {
+        let source = try SummaryTestSupport.source()
+        let generation = try SummaryTestSupport.generation(source: source)
+        let paths = try SummaryArtifactPaths.validated(sessionPaths: sessionPaths, sessionID: sessionID, generationID: generation.generationID)
+        _ = try summaryStore.createGenerationIfAbsent(generation, paths: paths)
+
+        let service = try makeReleaseTestService(loaderResult: .failure(LectureSummarySourceError.incompleteGeneration))
+        let recorder = SummaryReleaseRecorder(service)
+        XCTAssertEqual(service.continueGeneration(sessionID: sessionID, generationID: generation.generationID), .admitted)
+        let epoch = service.operationEpoch
+        let release = await awaitRelease(recorder, epoch: epoch)
+
+        XCTAssertEqual(release, .init(sessionID: sessionID, operationEpoch: epoch, generationID: generation.generationID, outcome: .staleSource))
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testSequentialOperationsHaveDistinctEpochsAndAStaleReleaseNeverMatchesTheNewerOperation() async throws {
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 1)
+        await generator.armGate(beforeBatchIndex: 0)
+        let service = try makeReleaseTestService(generator: generator)
+        let recorder = SummaryReleaseRecorder(service)
+
+        // Operation A: a Generate cancelled in flight.
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epochA = service.operationEpoch
+        await waitUntil { await generator.hasEnteredGate(forBatchIndex: 0) }
+        service.cancel(sessionID: sessionID)
+        let releaseA = await awaitRelease(recorder, epoch: epochA)
+        let generationA = try XCTUnwrap(releaseA?.generationID)
+
+        // Operation B: a second Generate for the same session. At admission
+        // it has no generation ID yet, so only its epoch can identify it —
+        // and the still-visible release is A's, which must not match.
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epochB = service.operationEpoch
+        XCTAssertNotEqual(epochA, epochB)
+        XCTAssertNil(service.activeGenerationID, "B's generation ID is not minted at admission")
+        XCTAssertEqual(service.lastReleasedOperation, releaseA)
+        XCTAssertEqual(service.lastReleasedOperation?.sessionID, sessionID)
+        XCTAssertNotEqual(service.lastReleasedOperation?.operationEpoch, epochB)
+
+        let releaseB = await awaitRelease(recorder, epoch: epochB)
+        guard case .completed = releaseB?.outcome else {
+            return XCTFail("expected B to complete, got \(String(describing: releaseB?.outcome))")
+        }
+        XCTAssertNotNil(releaseB?.generationID)
+        XCTAssertNotEqual(releaseB?.generationID, generationA)
+        XCTAssertEqual(recorder.releases.map(\.operationEpoch), [epochA, epochB], "exactly one release per admitted operation, in order")
+    }
+
+    func testRejectedAdmissionsNeverPublishARelease() async throws {
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance, maxItemsPerBatch: 1)
+        await generator.armGate(beforeBatchIndex: 0)
+        let service = try makeReleaseTestService(generator: generator)
+        let recorder = SummaryReleaseRecorder(service)
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        let epochA = service.operationEpoch
+        await waitUntil { await generator.hasEnteredGate(forBatchIndex: 0) }
+
+        // `.busy`, while A holds the slot.
+        XCTAssertEqual(service.generate(sessionID: UUID(), notesGenerationID: UUID()), .busy)
+        XCTAssertEqual(service.continueGeneration(sessionID: sessionID, generationID: UUID()), .busy)
+        XCTAssertEqual(service.retry(sessionID: sessionID, generationID: UUID()), .busy)
+        XCTAssertEqual(service.operationEpoch, epochA, "a rejected admission never consumes an epoch")
+
+        // `.shuttingDown`: shutdown also cancels and releases A.
+        await service.shutdown(timeout: 5)
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .shuttingDown)
+        XCTAssertEqual(service.operationEpoch, epochA)
+
+        XCTAssertEqual(recorder.releases.map(\.operationEpoch), [epochA], "only the admitted operation was ever released")
+        XCTAssertEqual(recorder.nilEmissionCount, 0)
     }
 }
