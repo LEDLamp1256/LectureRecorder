@@ -1,5 +1,30 @@
 import SwiftUI
 
+/// Why `SessionNotesView` is refreshing its durable Notes display.
+nonisolated enum SessionNotesRefreshCause: Equatable, CaseIterable {
+    case sessionAppeared
+    case notesServiceReleased
+    case transcriptionServiceReleased
+    case pinChanged
+}
+
+/// Which Notes generation a refresh loads. Pure.
+nonisolated enum SessionNotesRefreshMode: Equatable {
+    /// The default, newest-generation selection.
+    case latest
+    /// Exactly this generation, never another.
+    case exact(generationID: UUID)
+
+    /// A Summary pin always wins, whatever caused the refresh: no automatic
+    /// event may silently switch a pinned Notes pane to the newest Notes.
+    /// `cause` is accepted so any future cause-specific rule has to live
+    /// here, next to the tests that pin this contract.
+    static func mode(for cause: SessionNotesRefreshCause, pinnedNotesGenerationID: UUID?) -> SessionNotesRefreshMode {
+        if let pinnedNotesGenerationID { return .exact(generationID: pinnedNotesGenerationID) }
+        return .latest
+    }
+}
+
 /// Displays one selected completed session's Notes: durable
 /// generation/recovery status, Generate/Continue/Retry/Cancel actions, and
 /// (once available) the structured `LectureNotesDocument`.
@@ -27,7 +52,30 @@ import SwiftUI
 /// `CompletedSessionTranscriptionService` beyond reading that one published
 /// property, and never couples `LectureNotesGenerationService` itself to
 /// transcription.
+///
+/// While the parent-owned `SessionSummaryNotesRevealPresenter` pins a Notes
+/// generation for this session, every refresh — initial, either service's
+/// ownership release, or the pin changing — loads exactly that generation
+/// (`refreshPresentedNotes()`), and the pane is read-only evidence browsing:
+/// Generate/Continue/Retry/Cancel are hidden, a "Viewing Notes used by this
+/// Summary" row offers Show Latest Notes, and Source actions still hand off
+/// to the Transcript reveal. A pending Summary reveal is applied once the
+/// pinned document has loaded and passes application-time revalidation:
+/// every supporting item is highlighted and the first is scrolled to.
 struct SessionNotesView: View {
+    /// Re-runs Summary reveal application when a new target arrives, the pin
+    /// changes, or the pinned Notes finish loading.
+    private struct SummaryRevealTrigger: Equatable {
+        enum NotesKind: Equatable {
+            case loading, unavailable
+            case completed(generationID: UUID)
+        }
+
+        let target: SummaryNotesRevealTarget?
+        let pinnedNotesGenerationID: UUID?
+        let notesKind: NotesKind
+    }
+
     let entry: CompletedSessionEntry
     @ObservedObject var service: LectureNotesGenerationService
     /// Observed only for its `activeSessionID` ownership-release signal —
@@ -44,6 +92,11 @@ struct SessionNotesView: View {
     private let onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)?
     /// The parent's current reveal failure for this session, if any.
     private let revealFailureMessage: String?
+    /// Parent-owned Summary → Notes reveal coordinator: the source of the
+    /// pin and of pending Summary reveals. This view owns neither.
+    @ObservedObject var summaryRevealPresenter: SessionSummaryNotesRevealPresenter
+    /// The parent's current Supporting Notes failure for this session, if any.
+    private let summaryRevealFailureMessage: String?
 
     init(
         entry: CompletedSessionEntry,
@@ -52,12 +105,16 @@ struct SessionNotesView: View {
         notesStore: any LectureNotesStoring,
         operationStateStore: any LectureNotesOperationStateStoring,
         sourceLoader: any NotesTranscriptSourceLoading,
+        summaryRevealPresenter: SessionSummaryNotesRevealPresenter,
+        summaryRevealFailureMessage: String? = nil,
         revealFailureMessage: String? = nil,
         onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)? = nil
     ) {
         self.entry = entry
         self.service = service
         self.transcriptionService = transcriptionService
+        self.summaryRevealPresenter = summaryRevealPresenter
+        self.summaryRevealFailureMessage = summaryRevealFailureMessage
         self.revealFailureMessage = revealFailureMessage
         self.onSourceActivated = onSourceActivated
         _presenter = StateObject(wrappedValue: SessionNotesPresenter(
@@ -84,7 +141,26 @@ struct SessionNotesView: View {
     /// selected).
     @State private var actionMessage: String?
 
+    /// The mode of the newest refresh that has finished; `nil` while one is
+    /// in flight, so a pending reveal never applies to an older display.
+    @State private var presentedRefreshMode: SessionNotesRefreshMode?
+    @State private var refreshRequestCount = 0
+    /// Supporting items of the last applied Summary reveal, and the
+    /// generation they were mapped in. Kept until the pin or session changes,
+    /// the displayed document changes, or this view unmounts.
+    @State private var summaryHighlightedItemIDs: Set<UUID> = []
+    @State private var summaryHighlightGenerationID: UUID?
+    @State private var summaryScrollTargetItemID: UUID?
+    /// Bumped once per applied reveal so a later activation scrolls again.
+    @State private var summaryScrollRequest = 0
+
     private var sessionID: UUID { entry.manifest.sessionID }
+
+    private var pinnedNotesGenerationID: UUID? {
+        summaryRevealPresenter.pinnedNotesGenerationID(forSessionID: sessionID)
+    }
+
+    private var isPinned: Bool { pinnedNotesGenerationID != nil }
 
     private var ownership: SessionOwnershipDisplay {
         SessionActionAvailabilityCalculator.ownershipDisplay(activeSessionID: service.activeSessionID, sessionID: sessionID)
@@ -107,17 +183,28 @@ struct SessionNotesView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
-            statusSection
-            actionButtons
-            if let actionMessage {
-                Text(actionMessage)
+            if isPinned {
+                // Historical evidence, not the active Notes workflow: no
+                // lifecycle status or Generate/Continue/Retry/Cancel here.
+                pinnedEvidenceRow
+            } else {
+                statusSection
+                actionButtons
+                if let actionMessage {
+                    Text(actionMessage)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if let terminalFailureMessage {
+                    Text(terminalFailureMessage)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+            if let summaryRevealFailureMessage {
+                Label(summaryRevealFailureMessage, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
-            }
-            if let terminalFailureMessage {
-                Text(terminalFailureMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
             }
             Divider()
             contentSection
@@ -126,7 +213,32 @@ struct SessionNotesView: View {
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: sessionID) {
-            await presenter.refresh(for: entry)
+            clearSummaryHighlight()
+            await refreshPresentedNotes(.sessionAppeared)
+        }
+        .onChange(of: pinnedNotesGenerationID) {
+            // Cleared, replaced by a newer reveal, or newly established:
+            // old highlighting never carries over, and the display follows.
+            clearSummaryHighlight()
+            Task { await refreshPresentedNotes(.pinChanged) }
+        }
+        .onChange(of: summaryRevealPresenter.revealRequestCount) {
+            // A newer Summary reveal began: its passage's support replaces
+            // the old highlight even when the pin itself is kept.
+            clearSummaryHighlight()
+        }
+        .onChange(of: displayedCompletedDocument) {
+            // Highlighted IDs belong to the document they were mapped in.
+            if displayedCompletedDocument?.generationID != summaryHighlightGenerationID {
+                clearSummaryHighlight()
+            }
+        }
+        .task(id: SummaryRevealTrigger(
+            target: summaryRevealPresenter.pendingTarget,
+            pinnedNotesGenerationID: pinnedNotesGenerationID,
+            notesKind: summaryRevealNotesKind
+        )) {
+            await applyPendingSummaryReveal()
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
             guard SessionOwnershipTransition.shouldRefreshDurableState(
@@ -134,7 +246,7 @@ struct SessionNotesView: View {
                 newActiveSessionID: newValue,
                 sessionID: sessionID
             ) else { return }
-            Task { await presenter.refresh(for: entry) }
+            Task { await refreshPresentedNotes(.notesServiceReleased) }
         }
         // A visible Notes pane must reflect transcription finishing for
         // this session without requiring the user to navigate away and
@@ -148,7 +260,124 @@ struct SessionNotesView: View {
                 newActiveSessionID: newValue,
                 sessionID: sessionID
             ) else { return }
-            Task { await presenter.refresh(for: entry) }
+            Task { await refreshPresentedNotes(.transcriptionServiceReleased) }
+        }
+    }
+
+    // MARK: - Refresh
+
+    /// The one refresh route: exact pinned generation while pinned, the
+    /// default newest selection otherwise.
+    private func refreshPresentedNotes(_ cause: SessionNotesRefreshCause) async {
+        let mode = SessionNotesRefreshMode.mode(for: cause, pinnedNotesGenerationID: pinnedNotesGenerationID)
+        refreshRequestCount += 1
+        let request = refreshRequestCount
+        presentedRefreshMode = nil
+        switch mode {
+        case .latest:
+            await presenter.refresh(for: entry)
+        case .exact(let generationID):
+            await presenter.refresh(for: entry, generationID: generationID)
+        }
+        guard request == refreshRequestCount else { return }
+        presentedRefreshMode = mode
+    }
+
+    // MARK: - Summary evidence
+
+    private var pinnedEvidenceRow: some View {
+        HStack(spacing: 12) {
+            Label("Viewing Notes used by this Summary", systemImage: "pin")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Button("Show Latest Notes") {
+                clearSummaryHighlight()
+                summaryRevealPresenter.clearPin()
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    /// The completed document the pane currently shows for this session.
+    private var displayedCompletedDocument: LectureNotesDocument? {
+        guard presenter.displayedSessionID == sessionID,
+              case .loaded(_, .completed(let document), _) = presenter.displayState else { return nil }
+        return document
+    }
+
+    /// What the pane shows for the pin. The pinned generation's completed
+    /// document stays visible across automatic refreshes; anything else is
+    /// `.unavailable` only once the newest refresh — the exact one — has
+    /// finished, and `.loading` before that.
+    private var pinnedNotes: SummaryNotesRevealDisplayedNotes {
+        guard let pinnedNotesGenerationID, presenter.displayedSessionID == sessionID else { return .loading }
+        if case .loaded(let record, .completed(let document), _) = presenter.displayState,
+           record.generationID == pinnedNotesGenerationID {
+            return .completed(document)
+        }
+        guard presentedRefreshMode == .exact(generationID: pinnedNotesGenerationID),
+              presenter.displayState != .loading else { return .loading }
+        return .unavailable
+    }
+
+    /// `pinnedNotes`, but only once the newest refresh — the exact one — has
+    /// finished, so a reveal is never applied to a display about to change.
+    private var summaryRevealNotes: SummaryNotesRevealDisplayedNotes {
+        guard let pinnedNotesGenerationID,
+              presentedRefreshMode == .exact(generationID: pinnedNotesGenerationID) else { return .loading }
+        return pinnedNotes
+    }
+
+    private var summaryRevealNotesKind: SummaryRevealTrigger.NotesKind {
+        switch summaryRevealNotes {
+        case .loading: .loading
+        case .unavailable: .unavailable
+        case .completed(let document): .completed(generationID: document.generationID)
+        }
+    }
+
+    private func clearSummaryHighlight() {
+        summaryHighlightedItemIDs = []
+        summaryHighlightGenerationID = nil
+        summaryScrollTargetItemID = nil
+    }
+
+    /// Applies the pending Summary reveal once the pinned document has
+    /// loaded. Never partially applies: a target the document cannot fully
+    /// represent is rejected (see `SessionSummaryNotesRevealPresenter.reject`
+    /// for when that also drops the pin).
+    private func applyPendingSummaryReveal() async {
+        guard let target = summaryRevealPresenter.pendingTarget,
+              SummaryNotesRevealApplicationPlanner.outcome(
+                  for: target,
+                  sessionID: sessionID,
+                  pinnedNotesGenerationID: pinnedNotesGenerationID,
+                  notes: summaryRevealNotes
+              ) != .notApplicable else {
+            return
+        }
+        // Failures are published by the coordinator and shown through
+        // `summaryRevealFailureMessage`.
+        guard let application = await summaryRevealPresenter.revalidateReadyTarget(for: entry) else { return }
+        // A superseded run leaves the still-ready target to the newer run.
+        guard !Task.isCancelled else { return }
+        switch SummaryNotesRevealApplicationPlanner.outcome(
+            for: application.target,
+            sessionID: sessionID,
+            pinnedNotesGenerationID: pinnedNotesGenerationID,
+            notes: summaryRevealNotes
+        ) {
+        case .notApplicable:
+            return
+        case .unavailable(let failure):
+            clearSummaryHighlight()
+            summaryRevealPresenter.reject(application, with: failure)
+        case .apply(let selection):
+            summaryHighlightedItemIDs = Set(selection.selectedItemIDs)
+            summaryHighlightGenerationID = application.target.sourceNotesGenerationID
+            summaryScrollTargetItemID = selection.scrollTargetItemID
+            summaryScrollRequest += 1
+            summaryRevealPresenter.consume(application)
         }
     }
 
@@ -280,16 +509,55 @@ struct SessionNotesView: View {
     }
 
     @ViewBuilder private var contentSection: some View {
+        if isPinned {
+            pinnedContentSection
+        } else {
+            latestContentSection
+        }
+    }
+
+    /// Only the exact pinned generation's completed document is ever shown
+    /// while pinned — never whatever an earlier refresh left displayed.
+    @ViewBuilder private var pinnedContentSection: some View {
+        switch pinnedNotes {
+        case .completed(let document):
+            notesDocument(document)
+        case .unavailable:
+            Label(SummaryNotesRevealFailureMessage.sourceUnavailable, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .loading:
+            ProgressView().controlSize(.small)
+        }
+    }
+
+    @ViewBuilder private func notesDocument(_ document: LectureNotesDocument) -> some View {
+        if let revealFailureMessage {
+            Label(revealFailureMessage, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        }
+        ScrollViewReader { proxy in
+            ScrollView {
+                NotesDocumentView(
+                    document: document,
+                    onSourceActivated: onSourceActivated,
+                    highlightedItemIDs: summaryHighlightGenerationID == document.generationID ? summaryHighlightedItemIDs : []
+                )
+            }
+            .onChange(of: summaryScrollRequest) {
+                guard let summaryScrollTargetItemID else { return }
+                withAnimation {
+                    proxy.scrollTo(summaryScrollTargetItemID, anchor: .top)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var latestContentSection: some View {
         switch presenter.displayState {
         case .loaded(_, .completed(let document), _):
-            if let revealFailureMessage {
-                Label(revealFailureMessage, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-            ScrollView {
-                NotesDocumentView(document: document, onSourceActivated: onSourceActivated)
-            }
+            notesDocument(document)
         case .noGeneration:
             ContentUnavailableView(
                 "No Notes Yet",

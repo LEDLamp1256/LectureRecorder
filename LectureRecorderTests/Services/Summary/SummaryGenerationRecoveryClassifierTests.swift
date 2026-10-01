@@ -227,7 +227,7 @@ final class SummaryGenerationRecoveryClassifierTests: XCTestCase {
     func testProductionSummaryResumeRuleRequiresTheExactCurrentMLXProvenance() {
         let current = MLXSummaryConfiguration.generationProvenance
         XCTAssertTrue(LectureSummaryGeneratorRouter.canResume(current))
-        for recipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4", "mlx2-summary-v5"] {
+        for recipe in ["mlx2-summary-v1", "mlx2-summary-v2", "mlx2-summary-v3", "mlx2-summary-v4", "mlx2-summary-v5", "mlx2-summary-v6"] {
             var old = current
             old.recipeVersion = recipe
             XCTAssertFalse(LectureSummaryGeneratorRouter.canResume(old), recipe)

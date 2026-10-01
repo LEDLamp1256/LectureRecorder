@@ -20,10 +20,15 @@ nonisolated enum MLXSummaryConfiguration {
     /// v6 = v5 with generated passages held to one plain paragraph: no line
     /// break, tab, `$`, or backslash (a JSON-decoded `\nabla` arrives as a
     /// line feed plus `abla`), rejected rather than repaired.
-    static let recipeVersion = "mlx2-summary-v6"
+    /// v7 = v6's one-paragraph integrity rule, still rejecting every control
+    /// character and backslash, but accepting a printable `$` unchanged: the
+    /// instructions still ask for no `$` delimiters, yet a harmless model
+    /// formatting deviation can no longer abort generation. v6 generations
+    /// are never reinterpreted as v7.
+    static let recipeVersion = "mlx2-summary-v7"
     /// Recipes whose batch plans are partitioned by Notes section (see
     /// `LectureSummaryPlanPartition`); every other plan stays contiguous.
-    static let notesSectionPartitionedRecipeVersions: Set<String> = ["mlx2-summary-v5", "mlx2-summary-v6"]
+    static let notesSectionPartitionedRecipeVersions: Set<String> = ["mlx2-summary-v5", "mlx2-summary-v6", "mlx2-summary-v7"]
     /// Same model identity fields as `MLXNotesConfiguration` — folded into
     /// the existing open-string `generatorIdentifier`/`generatorVersion`
     /// provenance fields, no storage-schema change. Both Notes and Summary

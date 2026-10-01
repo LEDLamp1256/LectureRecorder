@@ -7,9 +7,12 @@ import SwiftUI
 /// When `onSourceActivated` is set, each stored reference becomes a Source
 /// action that hands back that exact reference together with the document's
 /// `transcriptFingerprint`; resolving it is entirely the caller's job.
+/// Every item carries `.id(item.id)` so a surrounding `ScrollViewReader` can
+/// scroll to it; items in `highlightedItemIDs` all get the same highlight.
 struct NotesDocumentView: View {
     let document: LectureNotesDocument
     var onSourceActivated: ((NotesSourceReference, TranscriptSourceFingerprint) -> Void)?
+    var highlightedItemIDs: Set<UUID> = []
 
     var body: some View {
         if NotesDocumentPresentation.hasNoStudyNotes(document) {
@@ -58,9 +61,14 @@ struct NotesDocumentView: View {
                 }
             }
             ForEach(section.items, id: \.id) { item in
-                NotesItemView(item: item, onSourceActivated: onSourceActivated.map { activate in
-                    { reference in activate(reference, document.transcriptFingerprint) }
-                })
+                NotesItemView(
+                    item: item,
+                    isHighlighted: highlightedItemIDs.contains(item.id),
+                    onSourceActivated: onSourceActivated.map { activate in
+                        { reference in activate(reference, document.transcriptFingerprint) }
+                    }
+                )
+                .id(item.id)
             }
         }
     }
@@ -118,6 +126,8 @@ nonisolated enum NotesSourceActions {
 /// text — only as Source actions, and only when `onSourceActivated` is set.
 private struct NotesItemView: View {
     let item: LectureNoteItem
+    /// Supporting evidence for the Summary passage being revealed.
+    let isHighlighted: Bool
     let onSourceActivated: ((NotesSourceReference) -> Void)?
 
     var body: some View {
@@ -153,7 +163,17 @@ private struct NotesItemView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        .background(
+            isHighlighted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay {
+            if isHighlighted {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
+            }
+        }
+        .accessibilityAddTraits(isHighlighted ? .isSelected : [])
     }
 
     @ViewBuilder private var sourceActions: some View {
