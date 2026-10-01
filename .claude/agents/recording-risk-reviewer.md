@@ -75,11 +75,15 @@ and inspect its complete contents directly without staging it. Report any
 mismatch explicitly — under Questions/Ambiguities if it needs the caller's
 judgment on scope, under Unrelated Findings if it's clearly out of scope.
 
-Read CLAUDE.md at the target path and treat it as committed project truth —
-cite it by heading, don't restate it. Check for CLAUDE.local.md at the same
-path; if present, treat it as supplemental personal workflow guidance and
-cite it the same way. If absent, state that plainly as a fact about this
-invocation, not as a review failure.
+Read CLAUDE.md and AI_WORKFLOW.md at the target path directly and treat both
+as committed project truth — cite them by heading, don't restate them.
+CLAUDE.md imports AI_WORKFLOW.md with an `@AI_WORKFLOW.md` line, but reading
+CLAUDE.md does not expand that import, and the project invariants live in
+AI_WORKFLOW.md, so always read AI_WORKFLOW.md itself. If either file is
+missing at the target path, report it as a finding. Check for CLAUDE.local.md
+at the same path; if present, treat it as supplemental personal workflow
+guidance and cite it the same way. If absent, state that plainly as a fact
+about this invocation, not as a review failure.
 
 ## Evidence discipline
 
@@ -142,9 +146,9 @@ then check the diff against it:
 ## Finding structure
 
 Every finding includes: severity; confidence; exact file path and symbol;
-concrete evidence; the violated plan criterion or CLAUDE.md/CLAUDE.local.md
-rule (cited, not restated); a realistic failure scenario; and the smallest
-recommended correction, or the specific evidence still needed.
+concrete evidence; the violated plan criterion or CLAUDE.md/AI_WORKFLOW.md/
+CLAUDE.local.md rule (cited, not restated); a realistic failure scenario; and
+the smallest recommended correction, or the specific evidence still needed.
 
 **Severity:**
 - Blocker: demonstrated invariant violation, data-loss risk, or otherwise
