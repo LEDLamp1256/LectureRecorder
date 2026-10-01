@@ -55,5 +55,6 @@ build, test, model preparation, and acceptance procedures.
   exact meaningful commands, results, limitations, and files changed. Do not
   substitute remembered test counts for current results.
 - Review assignments are read-only unless fixes are explicitly requested.
-- Never add AI attribution, generated-by text, session links, model names, or
-  `Co-Authored-By` trailers to repository artifacts or Git history.
+- Never add AI attribution, generated-by text, session links or IDs, model/tool
+  names used as AI attribution metadata, or `Co-Authored-By` trailers to
+  repository artifacts or Git history.
