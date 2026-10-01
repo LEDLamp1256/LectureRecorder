@@ -56,6 +56,29 @@ final class LectureNotesGenerationService: ObservableObject {
         case shuttingDown
     }
 
+    /// Identifies exactly one admitted operation that has fully released
+    /// ownership — see `lastReleasedOperation`. A synchronization signal
+    /// only, never a source of truth: an observer that needs the session's
+    /// Notes state re-reads it from durable artifacts afterwards.
+    struct OperationRelease: Equatable, Sendable {
+        let sessionID: UUID
+        /// The `operationEpoch` this operation was admitted under — the
+        /// exact identity of the operation, unique per admission for this
+        /// instance's lifetime. Read `operationEpoch` synchronously right
+        /// after `.admitted` to learn the token to match. Never derived from
+        /// `generationID`, which a brand-new Generate has not minted yet at
+        /// admission.
+        let operationEpoch: Int
+        /// The generation this operation worked on, if it got far enough to
+        /// resolve one: always set for Continue/Retry; `nil` for a Generate
+        /// that ended before its generation ID was minted and published.
+        let generationID: UUID?
+        /// The terminal outcome this operation published. `nil` only if the
+        /// run ended without publishing a terminal phase, which no current
+        /// path does.
+        let outcome: NotesGenerationOutcome?
+    }
+
     enum ShutdownOutcome: Sendable, Equatable {
         case completed
         case timedOut
@@ -67,6 +90,14 @@ final class LectureNotesGenerationService: ObservableObject {
 
     @Published private(set) var activeSessionID: UUID?
     @Published private(set) var activeGenerationID: UUID?
+    /// The most recently released admitted operation, published exactly
+    /// once per admission, only after `currentTask`/`activeSessionID`/
+    /// `activeGenerationID` have already been cleared — so an observer that
+    /// sees a release matching its own admitted `operationEpoch` knows this
+    /// service no longer owns that operation. `nil` until the first admitted
+    /// operation releases; never published for a rejected admission.
+    /// Memory-only, never persisted.
+    @Published private(set) var lastReleasedOperation: OperationRelease?
     @Published private(set) var phase: OperationPhase = .idle {
         didSet {
             // Single centralized interception point for every
@@ -326,16 +357,30 @@ final class LectureNotesGenerationService: ObservableObject {
 
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generationID: generationID, epoch: myEpoch)
-            await self?.releaseOperation(epoch: myEpoch)
+            await self?.releaseOperation(sessionID: sessionID, epoch: myEpoch)
         }
         return .admitted
     }
 
-    private func releaseOperation(epoch: Int) {
+    /// Publication order: the release identity, generation, and terminal
+    /// outcome are captured first, ownership (`currentTask`,
+    /// `activeSessionID`, `activeGenerationID`) is cleared next, and
+    /// `lastReleasedOperation` is published last — so the release is never
+    /// externally visible while this service still owns the operation.
+    private func releaseOperation(sessionID: UUID, epoch: Int) {
         guard epoch == operationEpoch else { return }
+        var outcome: NotesGenerationOutcome?
+        if case .finished(let terminal) = phase { outcome = terminal }
+        let release = OperationRelease(
+            sessionID: sessionID,
+            operationEpoch: epoch,
+            generationID: activeGenerationID,
+            outcome: outcome
+        )
         currentTask = nil
         activeSessionID = nil
         activeGenerationID = nil
+        lastReleasedOperation = release
     }
 
     // MARK: - Execution

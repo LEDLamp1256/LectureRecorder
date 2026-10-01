@@ -43,6 +43,22 @@ final class CompletedSessionTranscriptionService: ObservableObject {
         case shuttingDown
     }
 
+    /// Identifies exactly one admitted operation that has fully released
+    /// ownership — see `lastReleasedOperation`. A synchronization signal
+    /// only, never a source of truth: an observer that needs the session's
+    /// transcription state re-reads it from durable artifacts afterwards.
+    struct OperationRelease: Equatable, Sendable {
+        let sessionID: UUID
+        /// The `generation` value this operation was admitted under. Unique
+        /// per admission for this instance's lifetime: read `generation`
+        /// synchronously right after `.admitted` to learn the token to match.
+        let generation: Int
+        /// The terminal status this operation published. `nil` only if the
+        /// run ended without publishing a terminal phase, which no current
+        /// path does.
+        let status: SessionTranscriptionStatus?
+    }
+
     /// The result of `shutdown(timeout:)`: whether the active operation (if
     /// any) actually released ownership within the bound, or the bound
     /// elapsed first. Either way `shutdown` has already closed admission
@@ -98,6 +114,13 @@ final class CompletedSessionTranscriptionService: ObservableObject {
         }
     }
     @Published private(set) var displayedSegments: [OrderedSegment] = []
+    /// The most recently released admitted operation, published exactly
+    /// once per admission, only after `currentTask`/`activeSessionID` have
+    /// already been cleared — so an observer that sees a release matching
+    /// its own admitted `generation` knows this service no longer owns that
+    /// operation. `nil` until the first admitted operation releases; never
+    /// published for a rejected admission. Memory-only, never persisted.
+    @Published private(set) var lastReleasedOperation: OperationRelease?
     /// Set alongside `activeSessionID` at admission, purely so the
     /// `phase` diagnostic observer above can report total run elapsed —
     /// never consulted by any operational logic.
@@ -382,7 +405,7 @@ final class CompletedSessionTranscriptionService: ObservableObject {
 
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generation: myGeneration, retryFailedJobs: retryFailedJobs)
-            await self?.releaseOperation(generation: myGeneration)
+            await self?.releaseOperation(sessionID: sessionID, generation: myGeneration)
         }
         return .admitted
     }
@@ -397,10 +420,20 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     /// available (a no-op, since `currentTask` is already nil) and falsely
     /// keep Continue/Retry disabled for a session that just finished
     /// incomplete/interrupted/recovery-pending.
-    private func releaseOperation(generation: Int) {
+    ///
+    /// Publication order: the release identity and terminal status are
+    /// captured first, ownership (`currentTask`, `activeSessionID`) is
+    /// cleared next, and `lastReleasedOperation` is published last — so the
+    /// release is never externally visible while this service still owns
+    /// the operation.
+    private func releaseOperation(sessionID: UUID, generation: Int) {
         guard generation == self.generation else { return }
+        var status: SessionTranscriptionStatus?
+        if case .finished(let terminal) = phase { status = terminal }
+        let release = OperationRelease(sessionID: sessionID, generation: generation, status: status)
         currentTask = nil
         activeSessionID = nil
+        lastReleasedOperation = release
     }
 
     // MARK: - Execution

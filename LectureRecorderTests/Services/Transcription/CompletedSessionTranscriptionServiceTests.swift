@@ -1287,3 +1287,244 @@ private final class FailIfCalledTranscriber: Transcribing, @unchecked Sendable {
         throw UnclassifiedFakeError()
     }
 }
+
+/// Collects every `lastReleasedOperation` emission after the initial value,
+/// plus the service's ownership state at the exact moment each one is
+/// emitted — so a test can prove ownership was already relinquished when
+/// an observer first sees the release.
+@MainActor
+private final class TranscriptionReleaseRecorder {
+    typealias Release = CompletedSessionTranscriptionService.OperationRelease
+
+    private(set) var releases: [Release] = []
+    private(set) var activeSessionIDAtEmission: [UUID?] = []
+    private(set) var nilEmissionCount = 0
+    /// Invoked synchronously inside the emission, after it is recorded.
+    var onRelease: ((Release) -> Void)?
+    private var cancellable: AnyCancellable?
+
+    init(_ service: CompletedSessionTranscriptionService) {
+        cancellable = service.$lastReleasedOperation.dropFirst().sink { [weak self, weak service] release in
+            guard let self else { return }
+            guard let release else {
+                self.nilEmissionCount += 1
+                return
+            }
+            self.activeSessionIDAtEmission.append(service?.activeSessionID)
+            self.releases.append(release)
+            self.onRelease?(release)
+        }
+    }
+}
+
+// MARK: - Operation release signal
+
+extension CompletedSessionTranscriptionServiceTests {
+    /// Waits, event-driven (no polling, no sleeps), for the release whose
+    /// token is exactly `generation`.
+    private func awaitRelease(
+        _ recorder: TranscriptionReleaseRecorder,
+        generation: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> TranscriptionReleaseRecorder.Release? {
+        if let existing = recorder.releases.first(where: { $0.generation == generation }) { return existing }
+        let released = expectation(description: "release of generation \(generation)")
+        recorder.onRelease = { release in
+            guard release.generation == generation else { return }
+            recorder.onRelease = nil
+            released.fulfill()
+        }
+        await fulfillment(of: [released], timeout: 5)
+        recorder.onRelease = nil
+        let release = recorder.releases.first { $0.generation == generation }
+        XCTAssertNotNil(release, "no release observed for generation \(generation)", file: file, line: line)
+        return release
+    }
+
+    func testLastReleasedOperationIsNilInitially() {
+        let service = makeService(transcriber: FakeTranscriber())
+        XCTAssertNil(service.lastReleasedOperation)
+    }
+
+    func testCompletedOperationPublishesExactlyOneMatchingRelease() async throws {
+        try writeManifest(chunkCount: 2)
+        let service = makeService(transcriber: FakeTranscriber())
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let token = service.generation
+        let release = await awaitRelease(recorder, generation: token)
+
+        XCTAssertEqual(release, .init(sessionID: sessionID, generation: token, status: .completed))
+        XCTAssertEqual(recorder.releases, [release].compactMap { $0 }, "exactly one release for one admitted operation")
+        XCTAssertEqual(recorder.nilEmissionCount, 0)
+        XCTAssertEqual(service.lastReleasedOperation, release)
+    }
+
+    func testOwnershipIsAlreadyReleasedWhenReleaseIsObserved() async throws {
+        try writeManifest(chunkCount: 1)
+        let service = makeService(transcriber: FakeTranscriber())
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        // Attempt the next admission synchronously from inside A's emission
+        // itself — the earliest moment any observer can react — then wait
+        // for the follow-up operation's own release.
+        var admissionAtEmission: CompletedSessionTranscriptionService.AdmissionResult?
+        let followUpReleased = expectation(description: "follow-up operation released")
+        recorder.onRelease = { _ in
+            if admissionAtEmission == nil {
+                admissionAtEmission = service.transcribe(sessionID: self.sessionID)
+            } else {
+                followUpReleased.fulfill()
+            }
+        }
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let tokenA = service.generation
+        await fulfillment(of: [followUpReleased], timeout: 5)
+
+        XCTAssertEqual(admissionAtEmission, .admitted, "the admission slot is free by the time the release is observable")
+        XCTAssertEqual(recorder.activeSessionIDAtEmission.first, .some(nil), "activeSessionID is cleared before the release is published")
+        XCTAssertEqual(recorder.releases.map(\.generation), [tokenA, tokenA + 1])
+        XCTAssertNil(service.activeSessionID)
+    }
+
+    func testFailedOperationStillPublishesRelease() async throws {
+        try writeManifest(chunkCount: 3)
+        let transcriber = FakeTranscriber()
+        transcriber.setFailure(
+            FakeTranscriberFailure(category: .engineThrew, diagnosticMessage: "boom", retryDisposition: .permanent),
+            forSequenceNumber: 1
+        )
+        let service = makeService(transcriber: transcriber)
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let token = service.generation
+        let release = await awaitRelease(recorder, generation: token)
+
+        XCTAssertEqual(release?.status, .incomplete(completed: 1, total: 3))
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testBlockedOperationStillPublishesRelease() async throws {
+        let service = makeService(transcriber: FailIfCalledTranscriber())
+        let recorder = TranscriptionReleaseRecorder(service)
+        let missingSessionID = UUID()
+
+        XCTAssertEqual(service.transcribe(sessionID: missingSessionID), .admitted)
+        let token = service.generation
+        let release = await awaitRelease(recorder, generation: token)
+
+        XCTAssertEqual(release?.sessionID, missingSessionID)
+        guard case .blocked = release?.status else {
+            return XCTFail("expected a blocked terminal status, got \(String(describing: release?.status))")
+        }
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testCancelledOperationPublishesExactlyOneRelease() async throws {
+        try writeManifest(chunkCount: 2)
+        let gated = SequenceGatedTranscriber()
+        await gated.armGate(beforeSequenceNumber: 0)
+        let service = makeService(transcriber: gated)
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let token = service.generation
+        await waitUntilGateEntered(gated, sequenceNumber: 0)
+        XCTAssertTrue(recorder.releases.isEmpty, "no release while the operation still owns the slot")
+
+        service.cancel(sessionID: sessionID)
+        // A repeated cancel request must not produce a second release.
+        service.cancel(sessionID: sessionID)
+        let release = await awaitRelease(recorder, generation: token)
+
+        XCTAssertEqual(release, .init(sessionID: sessionID, generation: token, status: .incomplete(completed: 0, total: 2)))
+        XCTAssertEqual(recorder.releases.count, 1)
+    }
+
+    func testShutdownCancellationPublishesExactlyOneRelease() async throws {
+        try writeManifest(chunkCount: 1)
+        let gated = SequenceGatedTranscriber()
+        await gated.armGate(beforeSequenceNumber: 0)
+        let service = makeService(transcriber: gated)
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let token = service.generation
+        await waitUntilGateEntered(gated, sequenceNumber: 0)
+
+        let outcome = await service.shutdown(timeout: 5)
+        XCTAssertEqual(outcome, .completed)
+        XCTAssertEqual(recorder.releases.map(\.generation), [token])
+        XCTAssertEqual(recorder.activeSessionIDAtEmission, [nil])
+    }
+
+    func testSequentialOperationsHaveDistinctTokensAndAStaleReleaseNeverMatchesTheNewerOperation() async throws {
+        try writeManifest(chunkCount: 1)
+        let gated = SequenceGatedTranscriber()
+        await gated.armGate(beforeSequenceNumber: 0)
+        let service = makeService(transcriber: gated)
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        // Operation A: cancelled in flight, leaving chunk 0 retryable.
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let tokenA = service.generation
+        await waitUntilGateEntered(gated, sequenceNumber: 0)
+        service.cancel(sessionID: sessionID)
+        let releaseA = await awaitRelease(recorder, generation: tokenA)
+
+        // Operation B: same session, retrying the same chunk (the gate is
+        // still armed, so B stays in flight until cancelled).
+        XCTAssertEqual(service.continueOrRetry(sessionID: sessionID), .admitted)
+        let tokenB = service.generation
+        XCTAssertNotEqual(tokenA, tokenB)
+
+        // While B runs, the latest visible release is still A's — same
+        // session, but an observer waiting on B's exact token can tell it
+        // is not B's.
+        XCTAssertEqual(service.lastReleasedOperation, releaseA)
+        XCTAssertEqual(service.lastReleasedOperation?.sessionID, sessionID)
+        XCTAssertNotEqual(service.lastReleasedOperation?.generation, tokenB)
+
+        service.cancel(sessionID: UUID()) // Wrong session: a no-op.
+        XCTAssertEqual(recorder.releases.count, 1, "cancelling a different session releases nothing")
+        service.cancel(sessionID: sessionID)
+        let releaseB = await awaitRelease(recorder, generation: tokenB)
+
+        XCTAssertEqual(recorder.releases.map(\.generation), [tokenA, tokenB], "exactly one release per admitted operation, in order")
+        XCTAssertNotEqual(releaseA, releaseB)
+    }
+
+    func testRejectedAdmissionsNeverPublishARelease() async throws {
+        try writeManifest(chunkCount: 1)
+        let gated = SequenceGatedTranscriber()
+        await gated.armGate(beforeSequenceNumber: 0)
+        let manager = makeSessionManager()
+        let service = makeService(transcriber: gated, sessionManager: manager)
+        let recorder = TranscriptionReleaseRecorder(service)
+
+        // `.recordingActive`.
+        await manager.startSession()
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .recordingActive)
+        await manager.stopSession()
+        XCTAssertEqual(service.generation, 0, "a rejected admission never consumes a token")
+
+        // `.busy`, while operation A holds the slot.
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let tokenA = service.generation
+        await waitUntilGateEntered(gated, sequenceNumber: 0)
+        XCTAssertEqual(service.transcribe(sessionID: UUID()), .busy)
+        XCTAssertEqual(service.generation, tokenA)
+
+        // `.shuttingDown`: shutdown also cancels and releases A.
+        await service.shutdown(timeout: 5)
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .shuttingDown)
+        XCTAssertEqual(service.continueOrRetry(sessionID: sessionID), .shuttingDown)
+
+        XCTAssertEqual(recorder.releases.map(\.generation), [tokenA], "only the admitted operation was ever released")
+        XCTAssertEqual(recorder.nilEmissionCount, 0)
+    }
+}
