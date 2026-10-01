@@ -24,6 +24,13 @@ import SwiftUI
 /// Source activation resolves here, and a ready target is handed to the
 /// Transcript pane. Owning it here — not in either pane — lets a pending
 /// target survive the narrow layout's Notes → Transcript remount.
+///
+/// Likewise owns this window's `SessionSummaryNotesRevealPresenter`: a
+/// Summary Supporting Notes activation resolves here, and the resulting
+/// pending target and exact Notes generation pin are handed to the Notes
+/// pane. The pin lives here — not in `SessionNotesView` — so it survives
+/// Summary → Notes remounts, and is dropped on session change. Summary
+/// never navigates to Transcript directly; Notes' Source actions do.
 struct CompletedSessionDetailView: View {
     private enum ContentSelection: Hashable {
         case transcript
@@ -55,6 +62,7 @@ struct CompletedSessionDetailView: View {
 
     @State private var contentSelection: ContentSelection = .transcript
     @StateObject private var revealPresenter: SessionTranscriptRevealPresenter
+    @StateObject private var summaryNotesRevealPresenter: SessionSummaryNotesRevealPresenter
 
     init(
         entry: CompletedSessionEntry,
@@ -81,6 +89,7 @@ struct CompletedSessionDetailView: View {
         self.summarySourceLoader = summarySourceLoader
         self.transcriptNavigationLoader = transcriptNavigationLoader
         _revealPresenter = StateObject(wrappedValue: SessionTranscriptRevealPresenter(sourceLoader: notesSourceLoader))
+        _summaryNotesRevealPresenter = StateObject(wrappedValue: SessionSummaryNotesRevealPresenter(sourceLoader: summarySourceLoader))
     }
 
     private var sessionID: UUID { entry.manifest.sessionID }
@@ -120,6 +129,7 @@ struct CompletedSessionDetailView: View {
         }
         .onChange(of: sessionID) {
             revealPresenter.invalidate()
+            summaryNotesRevealPresenter.invalidate()
         }
         .onChange(of: revealPresenter.pendingTarget) { _, target in
             // Only a successful, current resolution for this session moves
@@ -128,6 +138,20 @@ struct CompletedSessionDetailView: View {
             guard let target, target.sessionID == sessionID else { return }
             contentSelection = .transcript
         }
+        .onChange(of: summaryNotesRevealPresenter.pendingTarget) { _, target in
+            // Only a successful, current Summary reveal for this session
+            // moves the narrow layout to Notes; failures stay on Summary.
+            guard let target, target.sessionID == sessionID else { return }
+            contentSelection = .notes
+        }
+    }
+
+    /// The newest Supporting Notes failure for this session, as user-facing
+    /// text. Shown by both Summary and Notes.
+    private var summaryNotesRevealFailureMessage: String? {
+        guard summaryNotesRevealPresenter.sessionID == sessionID,
+              case .failed(let failure) = summaryNotesRevealPresenter.state else { return nil }
+        return SummaryNotesRevealFailureMessage.message(for: failure)
     }
 
     /// The newest reveal failure for this session, as user-facing text.
@@ -154,6 +178,8 @@ struct CompletedSessionDetailView: View {
             notesStore: notesStore,
             operationStateStore: notesOperationStateStore,
             sourceLoader: notesSourceLoader,
+            summaryRevealPresenter: summaryNotesRevealPresenter,
+            summaryRevealFailureMessage: summaryNotesRevealFailureMessage,
             revealFailureMessage: revealFailureMessage,
             onSourceActivated: { reference, transcriptFingerprint in
                 Task {
@@ -170,7 +196,13 @@ struct CompletedSessionDetailView: View {
             summaryStore: summaryStore,
             summaryOperationStateStore: summaryOperationStateStore,
             notesStore: notesStore,
-            summarySourceLoader: summarySourceLoader
+            summarySourceLoader: summarySourceLoader,
+            supportingNotesFailureMessage: summaryNotesRevealFailureMessage,
+            onSupportingNotesActivated: { document, passage in
+                Task {
+                    await summaryNotesRevealPresenter.requestReveal(document: document, passage: passage, for: entry)
+                }
+            }
         )
     }
 }

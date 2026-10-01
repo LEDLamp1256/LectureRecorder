@@ -22,6 +22,11 @@ struct SessionSummaryView: View {
     let entry: CompletedSessionEntry
     @ObservedObject var service: LectureSummaryGenerationService
     @StateObject private var presenter: SessionSummaryPresenter
+    /// Forwards a Supporting Notes activation to the parent, which owns the
+    /// Summary → Notes reveal; this view never loads source data for it.
+    private let onSupportingNotesActivated: ((LectureSummaryDocument, LectureSummaryPassage) -> Void)?
+    /// The parent's current Supporting Notes failure for this session, if any.
+    private let supportingNotesFailureMessage: String?
 
     init(
         entry: CompletedSessionEntry,
@@ -29,10 +34,14 @@ struct SessionSummaryView: View {
         summaryStore: any LectureSummaryStoring,
         summaryOperationStateStore: any LectureSummaryOperationStateStoring,
         notesStore: any LectureNotesStoring,
-        summarySourceLoader: any LectureSummarySourceLoading
+        summarySourceLoader: any LectureSummarySourceLoading,
+        supportingNotesFailureMessage: String? = nil,
+        onSupportingNotesActivated: ((LectureSummaryDocument, LectureSummaryPassage) -> Void)? = nil
     ) {
         self.entry = entry
         self.service = service
+        self.supportingNotesFailureMessage = supportingNotesFailureMessage
+        self.onSupportingNotesActivated = onSupportingNotesActivated
         _presenter = StateObject(wrappedValue: SessionSummaryPresenter(
             summaryStore: summaryStore,
             summaryOperationStateStore: summaryOperationStateStore,
@@ -239,8 +248,13 @@ struct SessionSummaryView: View {
     @ViewBuilder private var contentSection: some View {
         switch presenter.displayState {
         case .loaded(_, .completed(let document), _):
+            if let supportingNotesFailureMessage {
+                Label(supportingNotesFailureMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             ScrollView {
-                SummaryDocumentView(document: document)
+                SummaryDocumentView(document: document, onSupportingNotesActivated: onSupportingNotesActivated)
             }
         case .noGeneration:
             ContentUnavailableView(
