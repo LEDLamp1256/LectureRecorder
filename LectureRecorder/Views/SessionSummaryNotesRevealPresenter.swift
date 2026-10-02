@@ -174,6 +174,9 @@ nonisolated struct SummaryNotesSourceIdentity: Equatable, Sendable {
 ///   cancellation keep a still-valid same-source pin.
 /// - Consuming a reveal keeps the pin; `clearPin()` (Show Latest Notes) and
 ///   `invalidate()` (session change) drop it.
+/// - A newly displayed completed Summary from a different exact source
+///   (`reconcilePin`) drops the pin and supersedes an in-flight request for
+///   the old source before it can pin.
 ///
 /// Validation goes only through `LectureSummarySourceLoading`, by exact
 /// session, generation, fingerprints, and Note item IDs — never text.
@@ -195,6 +198,13 @@ final class SessionSummaryNotesRevealPresenter: ObservableObject {
     /// Bumped by every `requestReveal`, so the Notes pane can drop a previous
     /// reveal's highlight even when the pin itself does not change.
     @Published private(set) var revealRequestCount = 0
+    /// The source of the completed Summary most recently reported as
+    /// actually displayed (`reconcilePin`). Presentation-only.
+    private(set) var displayedSummarySource: SummaryNotesSourceIdentity?
+    /// The source of the Summary the current request was made from, so a
+    /// newly displayed Summary from another source can supersede it before
+    /// it ever pins.
+    private var requestSource: SummaryNotesSourceIdentity?
 
     init(sourceLoader: any LectureSummarySourceLoading) {
         self.sourceLoader = sourceLoader
@@ -253,6 +263,7 @@ final class SessionSummaryNotesRevealPresenter: ObservableObject {
         let myGeneration = generation
         let requestedSessionID = entry.manifest.sessionID
         let identity = SummaryNotesSourceIdentity(document: document)
+        requestSource = identity
         let isSameSource = identity == pinnedSource
             && identity.sessionID == requestedSessionID
             && sessionID == requestedSessionID
@@ -357,11 +368,43 @@ final class SessionSummaryNotesRevealPresenter: ObservableObject {
         application.requestGeneration == generation && state == .ready(application.target)
     }
 
+    /// Reconciles navigation state with the completed Summary the Summary
+    /// pane is actually displaying, and remembers that source. A pin, and a
+    /// request still resolving or ready, are only valid for a displayed
+    /// Summary of the same exact source identity — a different Summary
+    /// generation from the same source keeps both. Otherwise this drops the
+    /// pin and supersedes the request via `clearPin()`, so a late completion
+    /// fails its generation check and can never pin; no failure is shown.
+    /// With neither a pin nor an in-flight request it only records the
+    /// source.
+    func reconcilePin(withDisplayedSummarySource displayedSource: SummaryNotesSourceIdentity) {
+        displayedSummarySource = displayedSource
+        let pinConflicts = pinnedSource.map { $0 != displayedSource } ?? false
+        let requestConflicts: Bool
+        switch state {
+        case .resolving, .ready:
+            requestConflicts = requestSource.map { $0 != displayedSource } ?? false
+        case .idle, .failed:
+            requestConflicts = false
+        }
+        guard pinConflicts || requestConflicts else { return }
+        clearPin()
+    }
+
+    /// Hides a stale failure once a newer grounding navigation begins. Only
+    /// an existing `.failed` state is affected: a pending or resolving
+    /// request, the pin, and the request generation are left untouched.
+    func dismissFailure() {
+        guard case .failed = state else { return }
+        state = .idle
+    }
+
     /// Show Latest Notes: drops the pin and any pending reveal or failure,
     /// and makes in-flight work stale. Never touches Notes storage.
     func clearPin() {
         generation += 1
         pinnedSource = nil
+        requestSource = nil
         state = .idle
     }
 
@@ -371,6 +414,8 @@ final class SessionSummaryNotesRevealPresenter: ObservableObject {
         generation += 1
         sessionID = nil
         pinnedSource = nil
+        requestSource = nil
+        displayedSummarySource = nil
         state = .idle
     }
 }

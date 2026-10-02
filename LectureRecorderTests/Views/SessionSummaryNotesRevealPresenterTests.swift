@@ -784,6 +784,220 @@ final class SessionSummaryNotesRevealPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.pinnedNotesGenerationID, fixture.notesGenerationID)
     }
 
+    // MARK: - Displayed-Summary reconciliation
+
+    /// A different Summary generation from the same exact source keeps the
+    /// pin and the pending reveal.
+    func testDisplayedSummaryFromSameSourceKeepsPin() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let (presenter, _) = await readyPresenter(fixture, entry: entry)
+        let regeneratedFromSameSource = LectureSummaryDocument(
+            generationID: UUID(),
+            sessionID: fixture.summary.sessionID,
+            sourceNotesGenerationID: fixture.summary.sourceNotesGenerationID,
+            transcriptFingerprint: fixture.summary.transcriptFingerprint,
+            sourceNotesDocumentFingerprint: fixture.summary.sourceNotesDocumentFingerprint,
+            provenance: fixture.summary.provenance,
+            sections: []
+        )
+
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: regeneratedFromSameSource))
+
+        XCTAssertEqual(presenter.pinnedNotesGenerationID, fixture.notesGenerationID)
+        XCTAssertEqual(presenter.state, .ready(fixture.target))
+        XCTAssertEqual(presenter.displayedSummarySource, SummaryNotesSourceIdentity(document: fixture.summary))
+    }
+
+    func testDisplayedSummaryFromDifferentSourceClearsPinAndPendingReveal() async {
+        let entry = makeEntry()
+        let pinned = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let displayed = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let (presenter, _) = await readyPresenter(pinned, entry: entry)
+
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: displayed.summary))
+
+        XCTAssertNil(presenter.pinnedSource)
+        XCTAssertNil(presenter.pendingTarget)
+        XCTAssertEqual(presenter.state, .idle)
+        XCTAssertEqual(presenter.displayedSummarySource, SummaryNotesSourceIdentity(document: displayed.summary))
+    }
+
+    /// The race: A's request is still loading (no pin yet) when Summary B
+    /// from a different source becomes displayed. A is superseded at once,
+    /// shows no failure, and its late success can never publish or pin.
+    func testDifferentDisplayedSourceSupersedesInFlightRequestBeforeItPins() async {
+        let entry = makeEntry()
+        let a = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let b = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSummarySourceLoader()
+        await loader.hold(a.notesGenerationID)
+        let presenter = SessionSummaryNotesRevealPresenter(sourceLoader: loader)
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: a.summary))
+
+        let requestA = Task { await presenter.requestReveal(document: a.summary, passage: a.passage, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        XCTAssertEqual(presenter.state, .resolving)
+        XCTAssertNil(presenter.pinnedSource)
+
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: b.summary))
+        XCTAssertEqual(presenter.state, .idle, "superseded without a failure")
+        XCTAssertNil(presenter.pinnedSource)
+
+        await loader.resumeHeldCall(0, with: .success(a.snapshot()))
+        await requestA.value
+
+        XCTAssertEqual(presenter.state, .idle)
+        XCTAssertNil(presenter.pendingTarget)
+        XCTAssertNil(presenter.pinnedSource, "A's late completion never pins")
+        XCTAssertEqual(presenter.displayedSummarySource, SummaryNotesSourceIdentity(document: b.summary))
+    }
+
+    /// Another Summary generation from exactly A's source does not disturb
+    /// A's in-flight request.
+    func testSameDisplayedSourceLetsInFlightRequestCompleteAndPin() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSummarySourceLoader()
+        await loader.hold(fixture.notesGenerationID)
+        let presenter = SessionSummaryNotesRevealPresenter(sourceLoader: loader)
+        let regeneratedFromSameSource = LectureSummaryDocument(
+            generationID: UUID(),
+            sessionID: fixture.summary.sessionID,
+            sourceNotesGenerationID: fixture.summary.sourceNotesGenerationID,
+            transcriptFingerprint: fixture.summary.transcriptFingerprint,
+            sourceNotesDocumentFingerprint: fixture.summary.sourceNotesDocumentFingerprint,
+            provenance: fixture.summary.provenance,
+            sections: []
+        )
+
+        let request = Task { await presenter.requestReveal(document: fixture.summary, passage: fixture.passage, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: regeneratedFromSameSource))
+        XCTAssertEqual(presenter.state, .resolving)
+
+        await loader.resumeHeldCall(0, with: .success(fixture.snapshot()))
+        await request.value
+
+        XCTAssertEqual(presenter.state, .ready(fixture.target))
+        XCTAssertEqual(presenter.pinnedNotesGenerationID, fixture.notesGenerationID)
+    }
+
+    /// After B supersedes A, a request from B pins B; A's late completion
+    /// cannot alter B's target, pin, or the displayed source.
+    func testStaleSupersededCompletionCannotMutateNewerDisplayedSourceOrPin() async {
+        let entry = makeEntry()
+        let a = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let b = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSummarySourceLoader()
+        await loader.hold(a.notesGenerationID)
+        await loader.setResult(.success(b.snapshot()), for: b.notesGenerationID)
+        let presenter = SessionSummaryNotesRevealPresenter(sourceLoader: loader)
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: a.summary))
+
+        let requestA = Task { await presenter.requestReveal(document: a.summary, passage: a.passage, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: b.summary))
+        await presenter.requestReveal(document: b.summary, passage: b.passage, for: entry)
+        XCTAssertEqual(presenter.state, .ready(b.target))
+
+        await loader.resumeHeldCall(0, with: .success(a.snapshot()))
+        await requestA.value
+
+        XCTAssertEqual(presenter.state, .ready(b.target))
+        XCTAssertEqual(presenter.pinnedSource, SummaryNotesSourceIdentity(document: b.summary))
+        XCTAssertEqual(presenter.displayedSummarySource, SummaryNotesSourceIdentity(document: b.summary))
+    }
+
+    func testInvalidateClearsDisplayedSource() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let (presenter, _) = await readyPresenter(fixture, entry: entry)
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: fixture.summary))
+
+        presenter.invalidate()
+
+        XCTAssertNil(presenter.displayedSummarySource)
+        XCTAssertNil(presenter.pinnedSource)
+    }
+
+    func testClearPinAndDismissFailureKeepDisplayedSource() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let (presenter, _) = await readyPresenter(fixture, entry: entry)
+        let displayed = SummaryNotesSourceIdentity(document: fixture.summary)
+        presenter.reconcilePin(withDisplayedSummarySource: displayed)
+
+        presenter.dismissFailure()
+        XCTAssertEqual(presenter.displayedSummarySource, displayed)
+        presenter.clearPin()
+        XCTAssertEqual(presenter.displayedSummarySource, displayed)
+        XCTAssertNil(presenter.pinnedSource)
+    }
+
+    /// Same generation ID but a different Notes document fingerprint is a
+    /// different source.
+    func testDisplayedSummaryWithSameGenerationButDifferentFingerprintClearsPin() async {
+        let entry = makeEntry()
+        let generationID = UUID()
+        let pinned = SummaryFixture.make(sessionID: entry.manifest.sessionID, notesGenerationID: generationID)
+        let displayed = SummaryFixture.make(sessionID: entry.manifest.sessionID, notesGenerationID: generationID, notesDocumentDigest: "c")
+        let (presenter, _) = await readyPresenter(pinned, entry: entry)
+
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: displayed.summary))
+
+        XCTAssertNil(presenter.pinnedSource)
+    }
+
+    func testReconcileWithoutPinIsANoOp() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let presenter = await request(fixture, snapshot: fixture.snapshot(notesDocumentFingerprint: NotesDocumentFingerprint(algorithmVersion: 1, digestHex: String(repeating: "c", count: 64))), entry: entry)
+        XCTAssertEqual(presenter.state, .failed(.sourceChanged))
+        XCTAssertNil(presenter.pinnedSource)
+
+        presenter.reconcilePin(withDisplayedSummarySource: SummaryNotesSourceIdentity(document: SummaryFixture.make(sessionID: entry.manifest.sessionID).summary))
+
+        XCTAssertEqual(presenter.state, .failed(.sourceChanged))
+        XCTAssertEqual(presenter.sessionID, entry.manifest.sessionID)
+    }
+
+    // MARK: - Failure dismissal
+
+    func testDismissFailureClearsOnlyTheFailureAndKeepsPin() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID, supportIndices: [1], otherSupportIndices: [3])
+        let (presenter, loader) = await readyPresenter(fixture, entry: entry)
+        let withoutOtherSupport = fixture.noteItems.filter { $0.id != fixture.noteItems[3].id }
+        await loader.setResult(.success(fixture.snapshot(items: withoutOtherSupport)), for: fixture.notesGenerationID)
+        await presenter.requestReveal(document: fixture.summary, passage: fixture.otherPassage, for: entry)
+        XCTAssertEqual(presenter.state, .failed(.locationUnavailable))
+
+        presenter.dismissFailure()
+
+        XCTAssertEqual(presenter.state, .idle)
+        XCTAssertEqual(presenter.pinnedNotesGenerationID, fixture.notesGenerationID)
+    }
+
+    func testDismissFailureLeavesReadyAndResolvingRequestsAlone() async {
+        let entry = makeEntry()
+        let fixture = SummaryFixture.make(sessionID: entry.manifest.sessionID)
+        let (presenter, loader) = await readyPresenter(fixture, entry: entry)
+
+        presenter.dismissFailure()
+        XCTAssertEqual(presenter.state, .ready(fixture.target))
+
+        await loader.hold(fixture.notesGenerationID)
+        let task = Task { await presenter.requestReveal(document: fixture.summary, passage: fixture.otherPassage, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        presenter.dismissFailure()
+        XCTAssertEqual(presenter.state, .resolving)
+
+        await loader.resumeHeldCall(0, with: .success(fixture.snapshot()))
+        await task.value
+        XCTAssertEqual(presenter.state, .ready(fixture.otherTarget))
+    }
+
     // MARK: - Messages
 
     func testFailureMessagesAreDistinctAndPresentationSafe() {

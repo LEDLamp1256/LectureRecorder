@@ -14,11 +14,13 @@ import SwiftUI
 /// is never reinterpreted as an integrity problem merely because a
 /// *different* session currently owns the shared operation.
 ///
-/// Playback is independent of transcription: a window-local
-/// `SessionPlaybackPresenter` prepares this session's audio when the view
-/// appears (never auto-playing) and stops it when the view disappears. A
-/// completed transcript with loaded navigation shows each passage with a
-/// timestamp button that plays from that passage.
+/// Playback is independent of transcription and of this pane's lifetime:
+/// the `SessionPlaybackPresenter` is owned, prepared, and torn down by the
+/// parent `CompletedSessionDetailView`, so playback continues while this
+/// pane is unmounted. This view only shows its state and issues the same
+/// play/pause/reset/seek/timestamp commands through it. A completed
+/// transcript with loaded navigation shows each passage with a timestamp
+/// button that plays from that passage.
 ///
 /// A Notes Source reveal arrives through the parent-owned
 /// `SessionTranscriptRevealPresenter`. Once this session's transcript is
@@ -26,8 +28,10 @@ import SwiftUI
 /// transcript scrolls to the first row of the referenced chunks and
 /// highlights every row of those chunks — whole-chunk evidence, never one
 /// segment. Navigation rows are preferred; without navigation, the plain
-/// per-chunk rows are used, and only completed ones count. Revealing never
-/// touches playback: only timestamp buttons seek.
+/// per-chunk rows are used, and only completed ones count. A newer Source
+/// request clears the previous reveal's highlight and message as soon as it
+/// starts resolving. Revealing never touches playback: only timestamp
+/// buttons seek.
 struct SessionTranscriptView: View {
     /// Re-runs reveal application when a new target arrives or this
     /// session's displayed transcript changes kind (e.g. finishes loading).
@@ -43,7 +47,8 @@ struct SessionTranscriptView: View {
     let entry: CompletedSessionEntry
     @ObservedObject var service: CompletedSessionTranscriptionService
     @StateObject private var presenter: SessionTranscriptPresenter
-    @StateObject private var playback = SessionPlaybackPresenter()
+    /// Parent-owned; this view never prepares or tears it down.
+    @ObservedObject var playback: SessionPlaybackPresenter
     /// While the time slider is being dragged, the position it previews.
     /// UI-only: the presenter's position stays authoritative, and one seek
     /// is issued when the drag ends.
@@ -65,11 +70,13 @@ struct SessionTranscriptView: View {
         entry: CompletedSessionEntry,
         service: CompletedSessionTranscriptionService,
         navigationLoader: any CompletedTranscriptNavigationLoading,
-        revealPresenter: SessionTranscriptRevealPresenter
+        revealPresenter: SessionTranscriptRevealPresenter,
+        playback: SessionPlaybackPresenter
     ) {
         self.entry = entry
         self.service = service
         self.revealPresenter = revealPresenter
+        self.playback = playback
         _presenter = StateObject(wrappedValue: SessionTranscriptPresenter(loader: service, navigationLoader: navigationLoader))
     }
 
@@ -116,13 +123,10 @@ struct SessionTranscriptView: View {
             // Likewise for the plain rows' sequence numbers.
             clearReveal()
         }
-        .task(id: sessionID) {
-            scrubPreviewSeconds = nil
-            await playback.prepare(for: entry)
-        }
-        .onDisappear {
-            scrubPreviewSeconds = nil
-            playback.tearDown()
+        .onChange(of: revealPresenter.state) { _, newState in
+            // A newer Source request supersedes the previous reveal's
+            // evidence and message; it will apply its own or fail itself.
+            if newState == .resolving { clearReveal() }
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
             guard SessionOwnershipTransition.shouldRefreshDurableState(

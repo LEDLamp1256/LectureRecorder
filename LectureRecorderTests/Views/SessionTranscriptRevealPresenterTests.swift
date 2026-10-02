@@ -801,3 +801,105 @@ final class TranscriptRevealApplicationPlannerTests: XCTestCase {
         XCTAssertFalse(sourceMessage.contains("/private"), "never exposes storage detail")
     }
 }
+
+// MARK: - Cancellation and failure dismissal
+
+extension SessionTranscriptRevealPresenterTests {
+    func testCancelledInitialLoadEndsCleanlyWithoutFailure() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSourceLoader()
+        await loader.setResult(.failure(CancellationError()), for: entry.manifest.sessionID)
+        let presenter = SessionTranscriptRevealPresenter(sourceLoader: loader)
+
+        await presenter.requestReveal(reference: reference(snapshot.sessionID, 1...1), generatedFrom: snapshot.fingerprint, for: entry)
+
+        XCTAssertEqual(presenter.state, .idle, "cancellation is not a source failure")
+        XCTAssertNil(presenter.pendingTarget)
+    }
+
+    func testOperationalInitialLoadErrorStillFails() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSourceLoader()
+        await loader.setResult(.failure(NotesTranscriptSourceLoadError.sourceBuildFailed("unreadable")), for: entry.manifest.sessionID)
+        let presenter = SessionTranscriptRevealPresenter(sourceLoader: loader)
+
+        await presenter.requestReveal(reference: reference(snapshot.sessionID, 1...1), generatedFrom: snapshot.fingerprint, for: entry)
+
+        guard case .failed(.sourceUnavailable) = presenter.state else {
+            return XCTFail("expected sourceUnavailable, got \(presenter.state)")
+        }
+    }
+
+    /// A late cancellation from a superseded request must not end the newer
+    /// request's ready target.
+    func testCancelledSupersededRequestCannotAlterNewerRequest() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSourceLoader()
+        await loader.hold(snapshot.sessionID)
+        let presenter = SessionTranscriptRevealPresenter(sourceLoader: loader)
+
+        let requestA = Task { await presenter.requestReveal(reference: reference(snapshot.sessionID, 0...0), generatedFrom: snapshot.fingerprint, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        let requestB = Task { await presenter.requestReveal(reference: reference(snapshot.sessionID, 1...2), generatedFrom: snapshot.fingerprint, for: entry) }
+        await waitForHeldCalls(2, in: loader)
+        await loader.resumeHeldCall(1, with: .success(snapshot))
+        await requestB.value
+        await loader.resumeHeldCall(0, with: .failure(CancellationError()))
+        await requestA.value
+
+        XCTAssertEqual(presenter.state, .ready(target(snapshot, 1...2)))
+    }
+
+    func testCancelledRevalidationKeepsReadyTargetForRetry() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let (presenter, loader) = await makeReadyPresenter(entry: entry, snapshot: snapshot)
+        await loader.setResult(.failure(CancellationError()), for: entry.manifest.sessionID)
+
+        let cancelled = await presenter.revalidateReadyTarget(for: entry)
+
+        XCTAssertNil(cancelled)
+        XCTAssertEqual(presenter.state, .ready(target(snapshot, 1...1)))
+
+        await loader.setResult(.success(snapshot), for: entry.manifest.sessionID)
+        let retried = await presenter.revalidateReadyTarget(for: entry)
+        XCTAssertEqual(retried?.target, target(snapshot, 1...1), "a later attempt can still apply it")
+    }
+
+    func testDismissFailureClearsOnlyAFailure() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let loader = ControllableSourceLoader()
+        await loader.setResult(.failure(NotesTranscriptSourceLoadError.sourceBuildFailed("unreadable")), for: entry.manifest.sessionID)
+        let presenter = SessionTranscriptRevealPresenter(sourceLoader: loader)
+        await presenter.requestReveal(reference: reference(snapshot.sessionID, 1...1), generatedFrom: snapshot.fingerprint, for: entry)
+        guard case .failed = presenter.state else { return XCTFail("expected a failure") }
+
+        presenter.dismissFailure()
+
+        XCTAssertEqual(presenter.state, .idle)
+        XCTAssertEqual(presenter.sessionID, entry.manifest.sessionID)
+    }
+
+    func testDismissFailureLeavesReadyAndResolvingRequestsAlone() async {
+        let entry = makeEntry()
+        let snapshot = makeSnapshot(sessionID: entry.manifest.sessionID)
+        let (presenter, loader) = await makeReadyPresenter(entry: entry, snapshot: snapshot)
+
+        presenter.dismissFailure()
+        XCTAssertEqual(presenter.state, .ready(target(snapshot, 1...1)))
+
+        await loader.hold(snapshot.sessionID)
+        let request = Task { await presenter.requestReveal(reference: reference(snapshot.sessionID, 1...2), generatedFrom: snapshot.fingerprint, for: entry) }
+        await waitForHeldCalls(1, in: loader)
+        presenter.dismissFailure()
+        XCTAssertEqual(presenter.state, .resolving)
+
+        await loader.resumeHeldCall(0, with: .success(snapshot))
+        await request.value
+        XCTAssertEqual(presenter.state, .ready(target(snapshot, 1...2)), "the pending request still completes")
+    }
+}

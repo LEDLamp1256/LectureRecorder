@@ -163,6 +163,12 @@ final class SessionTranscriptRevealPresenter: ObservableObject {
             snapshot = try await sourceLoader.loadCurrentSnapshot(sessionID: requestedSessionID)
         } catch {
             guard myGeneration == generation else { return }
+            // A cancelled load says nothing about the source: end the
+            // request cleanly rather than publish a false failure.
+            guard !Self.isCancellation(error) else {
+                state = .idle
+                return
+            }
             state = .failed(.sourceUnavailable(reason: error.localizedDescription))
             return
         }
@@ -207,7 +213,9 @@ final class SessionTranscriptRevealPresenter: ObservableObject {
         do {
             snapshot = try await sourceLoader.loadCurrentSnapshot(sessionID: target.sessionID)
         } catch {
-            guard isStillCurrent() else { return nil }
+            // A cancelled application attempt (e.g. the Transcript pane went
+            // away) leaves the still-current target pending for a retry.
+            guard isStillCurrent(), !Self.isCancellation(error) else { return nil }
             state = .failed(.sourceUnavailable(reason: error.localizedDescription))
             return nil
         }
@@ -238,6 +246,18 @@ final class SessionTranscriptRevealPresenter: ObservableObject {
     func reject(_ application: TranscriptRevealApplication, with failure: TranscriptRevealFailure) {
         guard isCurrent(application) else { return }
         state = .failed(failure)
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        error is CancellationError || Task.isCancelled
+    }
+
+    /// Hides a stale failure once a newer grounding navigation begins. Only
+    /// an existing `.failed` state is affected: a pending or resolving
+    /// request and the request generation are left untouched.
+    func dismissFailure() {
+        guard case .failed = state else { return }
+        state = .idle
     }
 
     private func isCurrent(_ application: TranscriptRevealApplication) -> Bool {
