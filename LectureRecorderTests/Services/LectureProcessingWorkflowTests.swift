@@ -67,9 +67,7 @@ private final class SwitchableSourceLoader: NotesTranscriptSourceLoading, @unche
 
     func loadCurrentSnapshot(sessionID: UUID) async throws -> NotesTranscriptSourceSnapshot {
         var snapshot = try await wrapped.loadCurrentSnapshot(sessionID: sessionID)
-        lock.lock()
-        let isChanged = changed
-        lock.unlock()
+        let isChanged = lock.withLock { changed }
         guard isChanged else { return snapshot }
         snapshot.units[0].text += " (revised)"
         snapshot.fingerprint = TranscriptSourceFingerprint.compute(sessionID: snapshot.sessionID, units: snapshot.units)
