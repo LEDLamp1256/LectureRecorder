@@ -27,6 +27,11 @@ struct SessionSummaryView: View {
     private let onSupportingNotesActivated: ((LectureSummaryDocument, LectureSummaryPassage) -> Void)?
     /// The parent's current Supporting Notes failure for this session, if any.
     private let supportingNotesFailureMessage: String?
+    /// Reports the source identity of the completed Summary this view is
+    /// actually displaying, whenever it changes, so the parent can keep its
+    /// Notes pin consistent with it. Never called while nothing completed is
+    /// displayed (loading, running, or not yet loaded after a remount).
+    private let onDisplayedSummarySourceChanged: ((SummaryNotesSourceIdentity) -> Void)?
 
     init(
         entry: CompletedSessionEntry,
@@ -36,11 +41,13 @@ struct SessionSummaryView: View {
         notesStore: any LectureNotesStoring,
         summarySourceLoader: any LectureSummarySourceLoading,
         supportingNotesFailureMessage: String? = nil,
+        onDisplayedSummarySourceChanged: ((SummaryNotesSourceIdentity) -> Void)? = nil,
         onSupportingNotesActivated: ((LectureSummaryDocument, LectureSummaryPassage) -> Void)? = nil
     ) {
         self.entry = entry
         self.service = service
         self.supportingNotesFailureMessage = supportingNotesFailureMessage
+        self.onDisplayedSummarySourceChanged = onDisplayedSummarySourceChanged
         self.onSupportingNotesActivated = onSupportingNotesActivated
         _presenter = StateObject(wrappedValue: SessionSummaryPresenter(
             summaryStore: summaryStore,
@@ -59,6 +66,14 @@ struct SessionSummaryView: View {
     @State private var actionMessage: String?
 
     private var sessionID: UUID { entry.manifest.sessionID }
+
+    /// The source identity of the completed Summary currently displayed for
+    /// this session; `nil` while anything else is shown.
+    private var displayedSummarySource: SummaryNotesSourceIdentity? {
+        guard presenter.displayedSessionID == sessionID,
+              case .loaded(_, .completed(let document), _) = presenter.displayState else { return nil }
+        return SummaryNotesSourceIdentity(document: document)
+    }
 
     private var ownership: SessionOwnershipDisplay {
         SessionActionAvailabilityCalculator.ownershipDisplay(activeSessionID: service.activeSessionID, sessionID: sessionID)
@@ -104,6 +119,10 @@ struct SessionSummaryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: sessionID) {
             await presenter.refresh(for: entry)
+        }
+        .onChange(of: displayedSummarySource, initial: true) { _, displayedSource in
+            guard let displayedSource else { return }
+            onDisplayedSummarySourceChanged?(displayedSource)
         }
         .onChange(of: service.activeSessionID) { oldValue, newValue in
             guard SessionOwnershipTransition.shouldRefreshDurableState(

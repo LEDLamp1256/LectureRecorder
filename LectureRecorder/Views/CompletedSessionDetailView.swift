@@ -30,7 +30,18 @@ import SwiftUI
 /// pending target and exact Notes generation pin are handed to the Notes
 /// pane. The pin lives here — not in `SessionNotesView` — so it survives
 /// Summary → Notes remounts, and is dropped on session change. Summary
-/// never navigates to Transcript directly; Notes' Source actions do.
+/// never navigates to Transcript directly; Notes' Source actions do. A
+/// newly displayed completed Summary from a different source drops the pin
+/// (`reconcilePin`), and starting either kind of navigation dismisses the
+/// other kind's stale failure.
+///
+/// Owns this session's single `SessionPlaybackPresenter` too: playback
+/// belongs to the session workspace, not the Transcript pane, so it keeps
+/// playing (or stays paused) across narrow-layout pane switches, Source and
+/// Supporting Notes navigation, and wide ↔ narrow breakpoint changes. It is
+/// prepared (never auto-playing) when this view appears and torn down when
+/// it disappears — which includes every session change, since
+/// `CompletedSessionsView` gives this view the session's identity.
 struct CompletedSessionDetailView: View {
     private enum ContentSelection: Hashable {
         case transcript
@@ -63,6 +74,7 @@ struct CompletedSessionDetailView: View {
     @State private var contentSelection: ContentSelection = .transcript
     @StateObject private var revealPresenter: SessionTranscriptRevealPresenter
     @StateObject private var summaryNotesRevealPresenter: SessionSummaryNotesRevealPresenter
+    @StateObject private var playback = SessionPlaybackPresenter()
 
     init(
         entry: CompletedSessionEntry,
@@ -127,6 +139,14 @@ struct CompletedSessionDetailView: View {
                 }
             }
         }
+        // Attached outside the layout switch, so pane remounts and
+        // breakpoint changes never prepare or tear down playback.
+        .task(id: sessionID) {
+            await playback.prepare(for: entry)
+        }
+        .onDisappear {
+            playback.tearDown()
+        }
         .onChange(of: sessionID) {
             revealPresenter.invalidate()
             summaryNotesRevealPresenter.invalidate()
@@ -166,7 +186,8 @@ struct CompletedSessionDetailView: View {
             entry: entry,
             service: transcriptionService,
             navigationLoader: transcriptNavigationLoader,
-            revealPresenter: revealPresenter
+            revealPresenter: revealPresenter,
+            playback: playback
         )
     }
 
@@ -182,6 +203,8 @@ struct CompletedSessionDetailView: View {
             summaryRevealFailureMessage: summaryNotesRevealFailureMessage,
             revealFailureMessage: revealFailureMessage,
             onSourceActivated: { reference, transcriptFingerprint in
+                // A newer navigation supersedes stale Summary feedback.
+                summaryNotesRevealPresenter.dismissFailure()
                 Task {
                     await revealPresenter.requestReveal(reference: reference, generatedFrom: transcriptFingerprint, for: entry)
                 }
@@ -198,7 +221,12 @@ struct CompletedSessionDetailView: View {
             notesStore: notesStore,
             summarySourceLoader: summarySourceLoader,
             supportingNotesFailureMessage: summaryNotesRevealFailureMessage,
+            onDisplayedSummarySourceChanged: { displayedSource in
+                summaryNotesRevealPresenter.reconcilePin(withDisplayedSummarySource: displayedSource)
+            },
             onSupportingNotesActivated: { document, passage in
+                // A newer navigation supersedes stale Source feedback.
+                revealPresenter.dismissFailure()
                 Task {
                     await summaryNotesRevealPresenter.requestReveal(document: document, passage: passage, for: entry)
                 }
