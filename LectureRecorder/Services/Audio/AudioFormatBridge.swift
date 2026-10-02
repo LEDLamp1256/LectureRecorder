@@ -19,7 +19,9 @@ import AVFoundation
 /// prove what format was actually written to a `.caf` chunk file on
 /// disk — that depends on how `AudioChunkWriter` constructs its
 /// `AVAudioFile`, and must be verified against a real generated file.
-func makeAudioFormatDescriptor(from format: AVAudioFormat) -> AudioFormatDescriptor {
+/// `nonisolated`: a pure mapping with no state, used by `SessionManager`
+/// and by the lecture importer's worker.
+nonisolated func makeAudioFormatDescriptor(from format: AVAudioFormat) -> AudioFormatDescriptor {
     AudioFormatDescriptor(
         sampleRate: format.sampleRate,
         channelCount: format.channelCount,

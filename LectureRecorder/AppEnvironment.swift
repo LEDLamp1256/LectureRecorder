@@ -51,6 +51,10 @@ final class AppEnvironment: ObservableObject {
     /// second one elsewhere — keeps exactly one production source-loading
     /// configuration in play.
     let summarySourceLoader: LectureSummarySourceLoader
+    /// Imports a local media file's audio as an ordinary completed session.
+    /// Its result enters the same catalog/transcription/Notes/Summary path
+    /// as a live recording; it never starts transcription itself.
+    let lectureMediaImporter: any LectureMediaImporting = LectureMediaImportService()
 
     init() {
         let store = SessionStore()

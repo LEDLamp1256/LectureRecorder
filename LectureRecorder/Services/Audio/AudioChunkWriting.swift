@@ -13,7 +13,12 @@ import AVFoundation
 /// are never visible through this seam. Exists so tests can inject a
 /// fully controlled writer double without depending on real filesystem
 /// durability timing.
-protocol AudioChunkWriting: Sendable {
+///
+/// `nonisolated`: its callers are the realtime capture callback and the
+/// lecture importer's worker, never just the main actor. Conformers must be
+/// safe to call from any thread — `AudioChunkWriter` serializes all of its
+/// state on its own private queue.
+nonisolated protocol AudioChunkWriting: Sendable {
     /// Finalized-chunk events for this writer's single recording cycle.
     /// Terminates via `.finish()` on clean completion, or
     /// `.finish(throwing:)` on any unrecoverable writer failure.
