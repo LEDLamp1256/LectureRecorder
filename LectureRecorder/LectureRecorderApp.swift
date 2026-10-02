@@ -29,6 +29,7 @@ struct LectureRecorderApp: App {
                 summaryOperationStateStore: appDelegate.environment.summaryOperationStateStore,
                 summarySourceLoader: appDelegate.environment.summarySourceLoader,
                 transcriptNavigationLoader: appDelegate.environment.transcriptNavigationLoader,
+                lectureMediaImporter: appDelegate.environment.lectureMediaImporter,
                 sessionManager: appDelegate.environment.sessionManager
             )
         }
