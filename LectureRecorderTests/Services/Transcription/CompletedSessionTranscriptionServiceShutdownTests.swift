@@ -25,9 +25,9 @@ private final class UncooperativeFakeTranscriber: Transcribing, @unchecked Senda
     }
 
     func transcribe(audioURL: URL, source: TranscriptionSourceSnapshot) async throws -> TranscriptionEngineOutput {
-        lock.lock()
-        hasBeenCalledFlag = true
-        lock.unlock()
+        lock.withLock {
+            hasBeenCalledFlag = true
+        }
         return await withCheckedContinuation { (_: CheckedContinuation<TranscriptionEngineOutput, Never>) in
             // Deliberately never resumed.
         }

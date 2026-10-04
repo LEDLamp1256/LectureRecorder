@@ -56,11 +56,13 @@ final class FakeTranscriber: Transcribing, @unchecked Sendable {
     }
 
     func transcribe(audioURL: URL, source: TranscriptionSourceSnapshot) async throws -> TranscriptionEngineOutput {
-        lock.lock()
-        calls.append((source.chunkSequenceNumber, audioURL))
-        let failure = scriptedFailures[source.chunkSequenceNumber]
-        let output = scriptedOutputs[source.chunkSequenceNumber] ?? defaultOutput
-        lock.unlock()
+        let (failure, output) = lock.withLock {
+            calls.append((source.chunkSequenceNumber, audioURL))
+            return (
+                scriptedFailures[source.chunkSequenceNumber],
+                scriptedOutputs[source.chunkSequenceNumber] ?? defaultOutput
+            )
+        }
 
         if let failure {
             throw failure
