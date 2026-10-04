@@ -1,5 +1,34 @@
 import SwiftUI
 
+/// Wide-layout geometry for `CompletedSessionDetailView`.
+///
+/// Each pane's minimum covers that pane's widest fixed-width row plus its
+/// 20pt padding on both sides. A pane narrower than its content does not
+/// clip at the trailing edge: SwiftUI centers the oversized content, pushing
+/// its leading edge out of the pane — for Transcript, under the sidebar.
+/// - Transcript: the playback bar — Play, Reset, the slider's 160pt minimum,
+///   and an elapsed / total label as long as `9:59:59 / 9:59:59` (~502pt).
+/// - Notes and Summary: their Generate / Continue / Cancel rows (~328pt and
+///   ~349pt).
+///
+/// The side-by-side breakpoint is derived from these minimums, so three
+/// panes are mounted only when the available width — already excluding the
+/// sidebar — gives every pane at least its minimum.
+nonisolated enum CompletedSessionWorkspaceLayout {
+    static let transcriptMinimumWidth: CGFloat = 520
+    static let notesMinimumWidth: CGFloat = 330
+    static let summaryMinimumWidth: CGFloat = 350
+    /// Room for the two split-view dividers.
+    static let dividerAllowance: CGFloat = 10
+
+    static let sideBySideMinimumWidth: CGFloat =
+        transcriptMinimumWidth + notesMinimumWidth + summaryMinimumWidth + dividerAllowance
+
+    static func usesSideBySide(availableWidth: CGFloat) -> Bool {
+        availableWidth >= sideBySideMinimumWidth
+    }
+}
+
 /// The completed-session workspace container: hosts the existing Transcript
 /// experience and the Notes and Summary experiences for one selected
 /// `CompletedSessionEntry`. Owns only the Transcript/Notes/Summary layout
@@ -16,9 +45,8 @@ import SwiftUI
 /// alongside Transcript in a resizable `HSplitView` with three panes; below
 /// that width, exactly one destination uses the full content area via a
 /// simple segmented switch instead of being forced into a cramped sidebar.
-/// The exact breakpoint and per-pane minimum widths are placeholder
-/// constants, chosen only so three panes are never mounted below a readable
-/// width — precise tuning is deferred to a later, dedicated visual pass.
+/// The breakpoint and per-pane minimum widths live in
+/// `CompletedSessionWorkspaceLayout`.
 ///
 /// Also owns this window's `SessionTranscriptRevealPresenter`: a Notes
 /// Source activation resolves here, and a ready target is handed to the
@@ -49,15 +77,7 @@ struct CompletedSessionDetailView: View {
         case summary
     }
 
-    /// Three panes at the minimum widths below sum to 1,000pt; this leaves
-    /// the same ~200pt side-by-side margin the prior two-pane breakpoint
-    /// (900pt for a 680pt sum) reserved, rather than keeping the old
-    /// breakpoint and letting three panes get compressed below their
-    /// readable minimums.
-    private static let sideBySideMinimumWidth: CGFloat = 1200
-    private static let transcriptMinimumWidth: CGFloat = 360
-    private static let notesMinimumWidth: CGFloat = 320
-    private static let summaryMinimumWidth: CGFloat = 320
+    private typealias Layout = CompletedSessionWorkspaceLayout
 
     let entry: CompletedSessionEntry
     @ObservedObject var transcriptionService: CompletedSessionTranscriptionService
@@ -108,14 +128,14 @@ struct CompletedSessionDetailView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            if proxy.size.width >= Self.sideBySideMinimumWidth {
+            if Layout.usesSideBySide(availableWidth: proxy.size.width) {
                 HSplitView {
                     transcriptView
-                        .frame(minWidth: Self.transcriptMinimumWidth)
+                        .frame(minWidth: Layout.transcriptMinimumWidth)
                     notesView
-                        .frame(minWidth: Self.notesMinimumWidth)
+                        .frame(minWidth: Layout.notesMinimumWidth)
                     summaryView
-                        .frame(minWidth: Self.summaryMinimumWidth)
+                        .frame(minWidth: Layout.summaryMinimumWidth)
                 }
             } else {
                 VStack(spacing: 0) {
