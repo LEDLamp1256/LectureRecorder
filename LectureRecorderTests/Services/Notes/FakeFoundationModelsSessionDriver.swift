@@ -138,11 +138,10 @@ final class FakeFoundationModelsSessionDriver: FoundationModelsSessionDriving, @
         prompt: String,
         generating: Content.Type
     ) async -> Int? {
-        lock.lock()
-        tokenCountCalls += 1
-        let override = tokenCountOverride
-        let handler = tokenCountHandler
-        lock.unlock()
+        let (override, handler) = lock.withLock {
+            tokenCountCalls += 1
+            return (tokenCountOverride, tokenCountHandler)
+        }
         if let override { return override }
         return handler?(instructions, prompt)
     }
@@ -152,16 +151,15 @@ final class FakeFoundationModelsSessionDriver: FoundationModelsSessionDriving, @
         prompt: String,
         schema: GenerationSchema
     ) async -> Int? {
-        lock.lock()
-        tokenCountCalls += 1
-        schemaPreflightLog.append(FakeFoundationModelsSchemaRequest(
-            instructions: instructions,
-            prompt: prompt,
-            schemaDescription: schema.debugDescription
-        ))
-        let override = tokenCountOverride
-        let handler = tokenCountHandler
-        lock.unlock()
+        let (override, handler) = lock.withLock {
+            tokenCountCalls += 1
+            schemaPreflightLog.append(FakeFoundationModelsSchemaRequest(
+                instructions: instructions,
+                prompt: prompt,
+                schemaDescription: schema.debugDescription
+            ))
+            return (tokenCountOverride, tokenCountHandler)
+        }
         if let override { return override }
         return handler?(instructions, prompt)
     }
@@ -171,28 +169,27 @@ final class FakeFoundationModelsSessionDriver: FoundationModelsSessionDriving, @
         prompt: String,
         generating: Content.Type
     ) async throws -> Content {
-        lock.lock()
-        promptLog.append((instructions, prompt))
-        responseTypeLog.append(String(reflecting: Content.self))
-        let callNumber = promptLog.count
-        let shouldGate = gateBeforeCallNumber == callNumber
-        lock.unlock()
+        let shouldGate = lock.withLock {
+            promptLog.append((instructions, prompt))
+            responseTypeLog.append(String(reflecting: Content.self))
+            let callNumber = promptLog.count
+            return gateBeforeCallNumber == callNumber
+        }
 
         if shouldGate {
-            lock.lock(); enteredGateFlag = true; lock.unlock()
+            lock.withLock { enteredGateFlag = true }
             while !Task.isCancelled {
                 await Task.yield()
             }
             try Task.checkCancellation()
         }
 
-        lock.lock()
-        guard !responseQueue.isEmpty else {
-            lock.unlock()
+        let dequeued: Result<Any, Error>? = lock.withLock {
+            responseQueue.isEmpty ? nil : responseQueue.removeFirst()
+        }
+        guard let next = dequeued else {
             throw FakeFoundationModelsDriverError.noScriptedResponse
         }
-        let next = responseQueue.removeFirst()
-        lock.unlock()
 
         switch next {
         case .success(let value):
@@ -210,33 +207,32 @@ final class FakeFoundationModelsSessionDriver: FoundationModelsSessionDriving, @
         prompt: String,
         schema: GenerationSchema
     ) async throws -> GeneratedContent {
-        lock.lock()
-        promptLog.append((instructions, prompt))
-        responseTypeLog.append(String(reflecting: GeneratedContent.self))
-        schemaResponseLog.append(FakeFoundationModelsSchemaRequest(
-            instructions: instructions,
-            prompt: prompt,
-            schemaDescription: schema.debugDescription
-        ))
-        let callNumber = promptLog.count
-        let shouldGate = gateBeforeCallNumber == callNumber
-        lock.unlock()
+        let shouldGate = lock.withLock {
+            promptLog.append((instructions, prompt))
+            responseTypeLog.append(String(reflecting: GeneratedContent.self))
+            schemaResponseLog.append(FakeFoundationModelsSchemaRequest(
+                instructions: instructions,
+                prompt: prompt,
+                schemaDescription: schema.debugDescription
+            ))
+            let callNumber = promptLog.count
+            return gateBeforeCallNumber == callNumber
+        }
 
         if shouldGate {
-            lock.lock(); enteredGateFlag = true; lock.unlock()
+            lock.withLock { enteredGateFlag = true }
             while !Task.isCancelled {
                 await Task.yield()
             }
             try Task.checkCancellation()
         }
 
-        lock.lock()
-        guard !responseQueue.isEmpty else {
-            lock.unlock()
+        let dequeued: Result<Any, Error>? = lock.withLock {
+            responseQueue.isEmpty ? nil : responseQueue.removeFirst()
+        }
+        guard let next = dequeued else {
             throw FakeFoundationModelsDriverError.noScriptedResponse
         }
-        let next = responseQueue.removeFirst()
-        lock.unlock()
 
         switch next {
         case .success(let value):

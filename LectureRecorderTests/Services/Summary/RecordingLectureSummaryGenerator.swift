@@ -42,10 +42,10 @@ final class RecordingLectureSummaryGenerator: LectureSummaryGenerating, NewLectu
     }
 
     func makePlan(for source: LectureSummarySourceSnapshot) async throws -> LectureSummaryPlan {
-        lock.lock()
-        _makePlanCallCount += 1
-        let failure = makePlanFailure
-        lock.unlock()
+        let failure = lock.withLock {
+            _makePlanCallCount += 1
+            return makePlanFailure
+        }
         if let failure { throw failure }
         return try LectureSummaryPlanner.plan(
             source: source,
@@ -58,10 +58,10 @@ final class RecordingLectureSummaryGenerator: LectureSummaryGenerating, NewLectu
         generation: LectureSummaryGenerationRecord,
         source: LectureSummarySourceSnapshot
     ) async throws -> LectureSummaryAnalysis {
-        lock.lock()
-        _generateAnalysisCallCount += 1
-        let failure = generateAnalysisFailure
-        lock.unlock()
+        let failure = lock.withLock {
+            _generateAnalysisCallCount += 1
+            return generateAnalysisFailure
+        }
         if let failure { throw failure }
         return LectureSummaryAnalysis(
             generationID: generation.generationID,
@@ -81,10 +81,10 @@ final class RecordingLectureSummaryGenerator: LectureSummaryGenerating, NewLectu
         generation: LectureSummaryGenerationRecord,
         source: LectureSummarySourceSnapshot
     ) async throws -> LectureSummaryDocument {
-        lock.lock()
-        _generateDocumentCallCount += 1
-        let failure = generateDocumentFailure
-        lock.unlock()
+        let failure = lock.withLock {
+            _generateDocumentCallCount += 1
+            return generateDocumentFailure
+        }
         if let failure { throw failure }
         return LectureSummaryDocument(
             generationID: generation.generationID,

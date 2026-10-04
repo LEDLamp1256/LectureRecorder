@@ -21,10 +21,10 @@ private final class SwitchableSourceSnapshotLoader: NotesTranscriptSourceLoading
     }
 
     func loadCurrentSnapshot(sessionID: UUID) async throws -> NotesTranscriptSourceSnapshot {
-        lock.lock()
-        callCount += 1
-        let count = callCount
-        lock.unlock()
+        let count = lock.withLock {
+            callCount += 1
+            return callCount
+        }
         return count <= switchAfterCallCount ? before : after
     }
 }

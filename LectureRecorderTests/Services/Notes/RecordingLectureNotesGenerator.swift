@@ -36,10 +36,10 @@ final class RecordingLectureNotesGenerator: LectureNotesGenerating, NewLectureNo
         window: NotesInputWindow,
         generation: LectureNotesGenerationRecord
     ) async throws -> LectureNotesWindowAnalysis {
-        lock.lock()
-        _analyzeCallCount += 1
-        let failure = analyzeFailure
-        lock.unlock()
+        let failure = lock.withLock {
+            _analyzeCallCount += 1
+            return analyzeFailure
+        }
         if let failure { throw failure }
         return LectureNotesWindowAnalysis(
             generationID: generation.generationID,
@@ -64,10 +64,10 @@ final class RecordingLectureNotesGenerator: LectureNotesGenerating, NewLectureNo
         analyses: [LectureNotesWindowAnalysis],
         generation: LectureNotesGenerationRecord
     ) async throws -> LectureNotesDocument {
-        lock.lock()
-        _synthesizeCallCount += 1
-        let failure = synthesizeFailure
-        lock.unlock()
+        let failure = lock.withLock {
+            _synthesizeCallCount += 1
+            return synthesizeFailure
+        }
         if let failure { throw failure }
         return LectureNotesDocument(
             generationID: generation.generationID,

@@ -81,15 +81,14 @@ final class FakeMLXSessionDriver: MLXSessionDriving, @unchecked Sendable {
     }
 
     func preparedInputTokenCount(instructions: String, prompt: String) async throws -> Int {
-        lock.lock()
-        _tokenCountCallCount += 1
-        let result: Result<Int, Error>
-        if !tokenCountQueue.isEmpty {
-            result = tokenCountQueue.removeFirst()
-        } else {
-            result = defaultTokenCount
+        let result: Result<Int, Error> = lock.withLock {
+            _tokenCountCallCount += 1
+            if !tokenCountQueue.isEmpty {
+                return tokenCountQueue.removeFirst()
+            } else {
+                return defaultTokenCount
+            }
         }
-        lock.unlock()
         switch result {
         case .success(let count): return count
         case .failure(let error): throw error
@@ -100,12 +99,13 @@ final class FakeMLXSessionDriver: MLXSessionDriving, @unchecked Sendable {
         instructions: String, prompt: String, jsonSchema: String, maxOutputTokens: Int,
         sampling: MLXGuidedSampling?
     ) async throws -> MLXGuidedGenerationOutcome {
-        lock.lock()
-        let index = _respondCallCount
-        _respondCallCount += 1
-        respondArgumentLog.append((instructions, prompt, jsonSchema, maxOutputTokens))
-        respondSamplingLog.append(sampling)
-        lock.unlock()
+        let index = lock.withLock {
+            let index = _respondCallCount
+            _respondCallCount += 1
+            respondArgumentLog.append((instructions, prompt, jsonSchema, maxOutputTokens))
+            respondSamplingLog.append(sampling)
+            return index
+        }
 
         guard index < respondQueue.count else {
             throw FakeMLXSessionDriverError.noScriptedResponse
