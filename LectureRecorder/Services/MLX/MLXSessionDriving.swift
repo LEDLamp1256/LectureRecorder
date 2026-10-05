@@ -164,6 +164,16 @@ nonisolated struct MLXGuidedSampling: Sendable, Equatable, Codable {
     }
 }
 
+/// Host-side form of the vocabulary-derived closing/whitespace logit
+/// biases. Plain `Sendable` values, so it can be cached by
+/// `RealMLXSessionDriver` and passed into `ModelContainer.perform`; the
+/// corresponding `MLXArray`s are built only inside that closure.
+nonisolated private struct TokenizerBiasHostValues: Sendable {
+    let closing: [Float]
+    let whitespace: [Float]
+    let whitespaceTokenIDs: Set<Int>
+}
+
 /// Production driver. Owns local model verification/loading, tokenizer
 /// access, exact token counting, chat-template request preparation,
 /// grammar-constrained generation, and best-effort timing/memory
@@ -190,8 +200,10 @@ actor RealMLXSessionDriver: MLXSessionDriving {
     /// vocabulary (never from a particular schema or generation) — safe to
     /// cache and reuse, mirroring the pinned upstream
     /// `MLXFoundationModels.ModelContextCache.makeTokenizerBias`'s own
-    /// per-model caching of this exact data.
-    private var tokenizerBias: (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>)?
+    /// per-model caching of this exact data. Cached as host values only:
+    /// `MLXArray` is not `Sendable`, so the arrays themselves are rebuilt
+    /// inside each `container.perform` that consumes them and never leave it.
+    private var tokenizerBias: TokenizerBiasHostValues?
 
     init(
         descriptor: MLXModelDescriptor = .qwen3_8b_4bit,
@@ -298,8 +310,8 @@ actor RealMLXSessionDriver: MLXSessionDriving {
                     vocabSize: vocabSize,
                     completionReserve: completionReserve,
                     hardReserve: hardReserve,
-                    closingBias: bias.closing,
-                    whitespaceBias: bias.whitespace,
+                    closingBias: MLXArray(bias.closing),
+                    whitespaceBias: MLXArray(bias.whitespace),
                     whitespaceTokenIDs: bias.whitespaceTokenIDs,
                     // Built inside this call: every request starts from its
                     // own seed and never depends on earlier requests.
@@ -373,15 +385,18 @@ actor RealMLXSessionDriver: MLXSessionDriving {
     /// build once and reuse, exactly like `cachedGrammarTokenizer` above.
     private func cachedTokenizerBias(
         container: ModelContainer
-    ) async throws -> (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) {
+    ) async throws -> TokenizerBiasHostValues {
         if let tokenizerBias { return tokenizerBias }
-        let built = try await container.perform {
-            context -> (closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) in
+        let built = await container.perform { context -> TokenizerBiasHostValues in
             let closing = ClosingTokenBias.compute(
                 tokenizer: context.tokenizer, eosTokenId: context.tokenizer.eosTokenId
             )
             let (whitespace, whitespaceTokenIDs) = WhitespaceTokenBias.compute(tokenizer: context.tokenizer)
-            return (closing, whitespace, whitespaceTokenIDs)
+            return TokenizerBiasHostValues(
+                closing: closing.asArray(Float.self),
+                whitespace: whitespace.asArray(Float.self),
+                whitespaceTokenIDs: whitespaceTokenIDs
+            )
         }
         self.tokenizerBias = built
         return built
