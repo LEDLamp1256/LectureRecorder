@@ -1,3 +1,4 @@
+import os
 import XCTest
 @testable import LectureRecorder
 
@@ -1706,14 +1707,15 @@ final class MLXLectureNotesGeneratorTests: XCTestCase {
     func testDiagnosticRecorderDoesNotAffectResult() async throws {
         let driver = FakeMLXSessionDriver()
         driver.enqueueRespond(.success(.stub(jsonText: itemsJSON([candidate("content", references: [(0, 0)])]))))
-        var recordedEvents: [MLXNotesDiagnosticEvent] = []
+        let recorder = OSAllocatedUnfairLock<[MLXNotesDiagnosticEvent]>(initialState: [])
         let generator = MLXLectureNotesGenerator(
             sessionDriver: driver,
-            diagnosticRecorder: { recordedEvents.append($0) }
+            diagnosticRecorder: { event in recorder.withLock { $0.append(event) } }
         )
         let generation = generationRecord()
 
         let analysis = try await generator.analyzeWindow(units: [unit(0, "a")], window: window(first: 0, last: 0), generation: generation)
+        let recordedEvents = recorder.withLock { $0 }
         XCTAssertEqual(analysis.items.first?.body, "content")
         XCTAssertFalse(recordedEvents.isEmpty, "diagnostics should have observed the preflight, purely additively")
     }
