@@ -242,7 +242,7 @@ nonisolated enum NotesSourceReferenceError: LocalizedError, Sendable, Equatable 
     }
 }
 
-extension NotesSourceReference {
+nonisolated extension NotesSourceReference {
     /// Validates this reference against `snapshot`: the session must
     /// match, the range must not be inverted, and *every* sequence number
     /// in `firstSequenceNumber...lastSequenceNumber` must actually exist

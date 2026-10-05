@@ -27,7 +27,7 @@ nonisolated enum AcceptanceDiagnosticValue: Sendable, Equatable {
     }
 }
 
-extension AcceptanceDiagnosticValue: Encodable {
+nonisolated extension AcceptanceDiagnosticValue: Encodable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
@@ -125,7 +125,7 @@ nonisolated enum AcceptanceDiagnosticEvent {
 /// One append-only line of the acceptance-diagnostics trace. Every field is
 /// diagnostic-only metadata — never raw lecture content — see
 /// `AcceptanceDiagnosticLogger`.
-private struct AcceptanceDiagnosticRecord: Encodable {
+nonisolated private struct AcceptanceDiagnosticRecord: Encodable, Sendable {
     var schemaVersion: Int
     var timestamp: String
     var pid: Int32

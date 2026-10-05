@@ -13,7 +13,7 @@ nonisolated struct SummaryNotesRevealTarget: Equatable, Sendable {
     let supportingNoteItemIDs: [UUID]
 }
 
-extension SummaryNotesRevealTarget {
+nonisolated extension SummaryNotesRevealTarget {
     /// `nil` when `passage` is not one of `document`'s passages, so a target
     /// can never pair one Summary's source identity with another's support.
     init?(document: LectureSummaryDocument, passage: LectureSummaryPassage) {

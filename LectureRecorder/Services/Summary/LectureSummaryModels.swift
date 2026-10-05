@@ -108,7 +108,7 @@ nonisolated enum LectureSummaryPlanValidationError: LocalizedError, Sendable, Eq
     }
 }
 
-extension LectureSummaryPlan {
+nonisolated extension LectureSummaryPlan {
     /// Validates only structure available in the persisted plan itself. Exact
     /// byte counts and exact source coverage remain source-aware checks in
     /// `LectureSummaryIntegrityValidator` through deterministic recomputation.
