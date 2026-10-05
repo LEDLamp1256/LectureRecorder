@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import os
 import XCTest
 @testable import LectureRecorder
 
@@ -907,13 +908,15 @@ final class SessionManagerTests: XCTestCase {
 
         await sessionManager.startSession()
 
-        var observedFinishBeforeStopReturned = false
+        let finishObservedOnEnteringStopping = OSAllocatedUnfairLock(initialState: false)
         captureService.setDidEnterStoppingHookForTesting {
-            observedFinishBeforeStopReturned = writer.finishRecordingCallCount > 0
+            let finishAlreadyCalled = writer.finishRecordingCallCount > 0
+            finishObservedOnEnteringStopping.withLock { $0 = finishAlreadyCalled }
         }
 
         await sessionManager.stopSession()
 
+        let observedFinishBeforeStopReturned = finishObservedOnEnteringStopping.withLock { $0 }
         XCTAssertFalse(
             observedFinishBeforeStopReturned,
             "finishRecording() must not be called until captureService.stop()'s drain has completed"

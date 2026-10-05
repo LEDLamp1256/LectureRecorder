@@ -1,4 +1,5 @@
 import FoundationModels
+import os
 import XCTest
 @testable import LectureRecorder
 
@@ -548,19 +549,20 @@ final class FoundationModelsLectureSummaryGeneratorTests: XCTestCase {
     }
 
     func testPreflightRecorderReceivesRealTokenCountAndContextBudgetOnBatchAnalysis() async throws {
-        var recorded: [FoundationModelsSummaryPreflightEvent] = []
+        let recorder = OSAllocatedUnfairLock<[FoundationModelsSummaryPreflightEvent]>(initialState: [])
         let driver = FakeFoundationModelsSessionDriver()
         driver.setTokenCountOverride(1)
-        let backend = generator(driver, maxItems: 2, preflightRecorder: { recorded.append($0) })
+        let backend = generator(driver, maxItems: 2, preflightRecorder: { event in recorder.withLock { $0.append(event) } })
         let source = try SummaryTestSupport.source()
         let (plan, record) = try await planAndGeneration(backend, source: source)
-        recorded.removeAll() // isolate the call under test from makePlan's own preflights
+        recorder.withLock { $0.removeAll() } // isolate the call under test from makePlan's own preflights
         driver.enqueue(AppleSummaryPassagesDTO(passages: [
             passageDTO("Grounded", support: [1])
         ]))
 
         _ = try await backend.generateAnalysis(for: plan.batches[0], generation: record, source: source)
 
+        let recorded = recorder.withLock { $0 }
         XCTAssertEqual(recorded.count, 1)
         let event = try XCTUnwrap(recorded.first)
         XCTAssertEqual(event.stage, .batchAnalysis)
