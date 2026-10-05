@@ -208,11 +208,11 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
     ) async -> CompletedSessionTranscriptionService.OperationPhase {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            let phase = await service.phase
+            let phase = service.phase
             if case .finished = phase { return phase }
             await Task.yield()
         }
-        return await service.phase
+        return service.phase
     }
 
     /// Polls until `gated` reports it has genuinely entered its gate for
@@ -237,8 +237,8 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
     func testAdmissionSucceedsWhenRecordingIsIdle() async {
         let service = makeService(transcriber: FakeTranscriber())
-        try? writeManifest(chunkCount: 1)
-        let result = await service.transcribe(sessionID: sessionID)
+        _ = try? writeManifest(chunkCount: 1)
+        let result = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(result, .admitted)
         _ = await waitUntilFinished(service)
     }
@@ -250,7 +250,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let stateAfterStart = manager.state
         XCTAssertEqual(stateAfterStart, .recording)
 
-        let result = await service.transcribe(sessionID: sessionID)
+        let result = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(result, .recordingActive)
 
         await manager.stopSession()
@@ -263,7 +263,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let manager = makeSessionManager()
         let service = makeService(transcriber: gated, sessionManager: manager)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
 
@@ -274,7 +274,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stateAfterStart, .recording)
         await manager.stopSession()
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         _ = await waitUntilFinished(service)
     }
 
@@ -284,14 +284,14 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         await gated.armGate(beforeSequenceNumber: 0)
         let service = makeService(transcriber: gated)
 
-        let first = await service.transcribe(sessionID: sessionID)
-        let second = await service.transcribe(sessionID: sessionID)
-        let third = await service.transcribe(sessionID: UUID())
+        let first = service.transcribe(sessionID: sessionID)
+        let second = service.transcribe(sessionID: sessionID)
+        let third = service.transcribe(sessionID: UUID())
         XCTAssertEqual(first, .admitted)
         XCTAssertEqual(second, .busy)
         XCTAssertEqual(third, .busy)
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         _ = await waitUntilFinished(service)
     }
 
@@ -305,7 +305,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         transcriber.setOutput(FakeTranscriber.defaultFakeOutput.withText("seg2"), forSequenceNumber: 2)
         let service = makeService(transcriber: transcriber)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.completed))
@@ -315,7 +315,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
             XCTAssertEqual(call.audioURL.lastPathComponent, TranscriptionArtifactPaths.canonicalChunkFileName(for: call.sequenceNumber))
         }
 
-        let segments = await service.displayedSegments
+        let segments = service.displayedSegments
         XCTAssertEqual(segments.count, 3)
         for (index, expectedText) in ["seg0", "seg1", "seg2"].enumerated() {
             if case .completed(let text) = segments[index].state {
@@ -335,7 +335,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         )
         let service = makeService(transcriber: transcriber)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.incomplete(completed: 1, total: 3)))
@@ -350,11 +350,11 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         await gated.armGate(beforeSequenceNumber: 0)
         let service = makeService(transcriber: gated)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         let finalPhase = await waitUntilFinished(service)
 
         // Chunk 0's cancellation is recorded as a durable, retryable
@@ -416,7 +416,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         }
 
         let service = makeService(transcriber: FailIfCalledTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.completed))
@@ -431,7 +431,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let manager = makeSessionManager()
         let service = makeService(transcriber: gated, sessionManager: manager)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
 
@@ -446,7 +446,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let finalRecordingState = manager.state
         XCTAssertEqual(finalRecordingState, .completed)
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         _ = await waitUntilFinished(service)
     }
 
@@ -476,7 +476,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.continueOrRetry(sessionID: sessionID)
+        let admission = service.continueOrRetry(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.completed))
@@ -503,7 +503,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.continueOrRetry(sessionID: sessionID)
+        let admission = service.continueOrRetry(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.incomplete(completed: 0, total: 1)))
@@ -533,7 +533,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -601,7 +601,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         await failingStore.setFailNextCreateJobIfAbsent(true)
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: failingStore)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -639,7 +639,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         await failingStore.setFailLoadAllJobArtifacts(onCallNumber: 4)
         let service = makeService(transcriber: FailIfCalledTranscriber(), store: failingStore)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, never a false .completed, got \(finalPhase)") }
@@ -660,7 +660,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let before = try readSourceBytes(manifest)
 
         let service = makeService(transcriber: FakeTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.completed))
@@ -680,7 +680,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
             forSequenceNumber: 1
         )
         let service = makeService(transcriber: transcriber)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.incomplete(completed: 1, total: 2)))
@@ -697,10 +697,10 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let gated = SequenceGatedTranscriber()
         await gated.armGate(beforeSequenceNumber: 0)
         let service = makeService(transcriber: gated)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         _ = await waitUntilFinished(service)
 
         let after = try readSourceBytes(manifest)
@@ -715,7 +715,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let hangingStore = HangingStoreWrapper(wrapped: TranscriptionStore())
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: hangingStore)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
 
         let deadline = Date().addingTimeInterval(5)
@@ -728,7 +728,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         // Cancellation is requested strictly before the preflight's own
         // first store read has even returned — deterministically before
         // any chunk could possibly have been claimed or transcribed.
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         await hangingStore.release()
         _ = await waitUntilFinished(service)
 
@@ -741,7 +741,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let gated = SequenceGatedTranscriber()
         await gated.armGate(beforeSequenceNumber: 0)
         let service = makeService(transcriber: gated)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
 
@@ -758,7 +758,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         // before chunk 1's iteration, without needing to poll first (a
         // poll here would only add latency on our side of the race).
         await gated.releaseSuccessfully()
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
 
         let store = TranscriptionStore()
         let finalPhase = await waitUntilFinished(service)
@@ -775,14 +775,14 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let gated = SequenceGatedTranscriber()
         await gated.armGate(beforeSequenceNumber: 0)
         let service = makeService(transcriber: gated)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         // Immediately after requesting cancellation — before cleanup has
         // actually finished — a new admission attempt must still see Busy.
-        let raceAdmission = await service.transcribe(sessionID: sessionID)
+        let raceAdmission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(raceAdmission, .busy)
 
         _ = await waitUntilFinished(service)
@@ -802,7 +802,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         }
         XCTAssertEqual(manager.state, .requestingPermission)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .recordingActive)
 
         await hangingPermission.release(.granted)
@@ -827,7 +827,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: externalRoot) }
 
         let service = makeService(transcriber: FailIfCalledTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked for a symlinked Sessions root, got \(finalPhase)") }
@@ -848,7 +848,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: externalSessionDir) }
 
         let service = makeService(transcriber: FailIfCalledTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked for a symlinked session directory, got \(finalPhase)") }
@@ -904,7 +904,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -926,7 +926,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -946,7 +946,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: store)
-        let admission = await service.continueOrRetry(sessionID: sessionID)
+        let admission = service.continueOrRetry(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -964,7 +964,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         await failingStore.setFailLoadAllJobArtifacts(onCallNumber: 3)
         let transcriber = FakeTranscriber()
         let service = makeService(transcriber: transcriber, store: failingStore)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         if case .finished(.blocked) = finalPhase {} else { XCTFail("expected .blocked, got \(finalPhase)") }
@@ -1003,7 +1003,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         let transcriber = FailIfCalledTranscriber()
         let service = makeService(transcriber: transcriber, store: failingStore)
 
-        let admission1 = await service.transcribe(sessionID: sessionID)
+        let admission1 = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission1, .admitted)
         let phase1 = await waitUntilFinished(service)
         XCTAssertEqual(phase1, .finished(.recoveryPending), "durability-unconfirmed must never report Completed")
@@ -1012,7 +1012,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
 
         // Durability confirmation now succeeds.
         await failingStore.setForcedConfirmResultsDirectoryDurable(true)
-        let admission2 = await service.continueOrRetry(sessionID: sessionID)
+        let admission2 = service.continueOrRetry(sessionID: sessionID)
         XCTAssertEqual(admission2, .admitted)
         let phase2 = await waitUntilFinished(service)
         XCTAssertEqual(phase2, .finished(.completed))
@@ -1123,10 +1123,10 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         service.$phase.sink { observerA.append($0) }.store(in: &cancellables)
         service.$phase.sink { observerB.append($0) }.store(in: &cancellables)
 
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         await waitUntilGateEntered(gated, sequenceNumber: 0)
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         await gated.releaseSuccessfully()
         _ = await waitUntilFinished(service)
 
@@ -1147,24 +1147,24 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
     func testActiveSessionIDIsClearedAfterCleanupActuallyFinishes() async throws {
         try writeManifest(chunkCount: 1)
         let service = makeService(transcriber: FakeTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         _ = await waitUntilFinished(service)
 
-        let activeAfterFinish = await service.activeSessionID
+        let activeAfterFinish = service.activeSessionID
         XCTAssertNil(activeAfterFinish, "activeSessionID must not still claim ownership after the operation has released it")
     }
 
     func testCancelIsANoOpAfterOwnershipHasAlreadyBeenReleased() async throws {
         try writeManifest(chunkCount: 1)
         let service = makeService(transcriber: FakeTranscriber())
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finishedPhase = await waitUntilFinished(service)
 
-        await service.cancel(sessionID: sessionID)
+        service.cancel(sessionID: sessionID)
         // Cancel after release must not disturb the already-terminal phase.
-        let phaseAfterLateCancel = await service.phase
+        let phaseAfterLateCancel = service.phase
         XCTAssertEqual(phaseAfterLateCancel, finishedPhase)
     }
 
@@ -1176,7 +1176,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
             forSequenceNumber: 1
         )
         let service = makeService(transcriber: transcriber)
-        let admission = await service.transcribe(sessionID: sessionID)
+        let admission = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admission, .admitted)
         let finalPhase = await waitUntilFinished(service)
         XCTAssertEqual(finalPhase, .finished(.incomplete(completed: 1, total: 3)))
@@ -1184,7 +1184,7 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         // Ownership released, so the pure availability calculator now
         // reports this session eligible for Continue/Retry — exactly the
         // workflow Correction 1 restores.
-        let activeSessionID = await service.activeSessionID
+        let activeSessionID = service.activeSessionID
         let ownership = SessionActionAvailabilityCalculator.ownershipDisplay(activeSessionID: activeSessionID, sessionID: sessionID)
         XCTAssertEqual(ownership, .none)
         let availability = SessionActionAvailabilityCalculator.availability(peekedStatus: .incomplete(completed: 1, total: 3), ownership: ownership)
@@ -1195,24 +1195,24 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
     // MARK: - Correction 3: no cross-session transcript leakage
 
     func testStartingANewOperationSynchronouslyClearsThePreviousSessionsDisplayedSegments() async throws {
-        let manifestA = try writeManifest(chunkCount: 1)
+        _ = try writeManifest(chunkCount: 1)
         let transcriberA = FakeTranscriber()
         transcriberA.setOutput(FakeTranscriber.defaultFakeOutput.withText("a-text"), forSequenceNumber: 0)
         let service = makeService(transcriber: transcriberA)
 
-        let admissionA = await service.transcribe(sessionID: sessionID)
+        let admissionA = service.transcribe(sessionID: sessionID)
         XCTAssertEqual(admissionA, .admitted)
         _ = await waitUntilFinished(service)
-        let segmentsAfterA = await service.displayedSegments
+        let segmentsAfterA = service.displayedSegments
         XCTAssertFalse(segmentsAfterA.isEmpty, "setup: session A must have produced a displayed transcript")
 
         // Start a different session B (a nonexistent one is sufficient —
         // admission itself, synchronously, must already have cleared A's
         // leftover segments before B's own run() even begins).
         let sessionBID = UUID()
-        let admissionB = await service.transcribe(sessionID: sessionBID)
+        let admissionB = service.transcribe(sessionID: sessionBID)
         XCTAssertEqual(admissionB, .admitted)
-        let segmentsImmediatelyAfterBAdmitted = await service.displayedSegments
+        let segmentsImmediatelyAfterBAdmitted = service.displayedSegments
         XCTAssertTrue(segmentsImmediatelyAfterBAdmitted.isEmpty, "A's transcript must never remain visible once B is the active session")
 
         _ = await waitUntilFinished(service)
