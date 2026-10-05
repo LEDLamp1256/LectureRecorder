@@ -65,7 +65,7 @@ final class ManagedProcessTerminationHandlerTests: XCTestCase {
             XCTAssertFalse(managedProcess.isRunning, "fixture should have already exited before observation is installed")
 
             // XCTestExpectation's `fulfill()` is thread-safe and idempotent
-            // to call from any queue, and `XCTWaiter.wait(for:timeout:)` is
+            // to call from any queue, and `XCTWaiter.fulfillment(of:timeout:)` is
             // XCTest's own single, race-free wait/timeout mechanism that
             // reports its outcome as a value — unlike a hand-rolled
             // `CheckedContinuation`, there is no unsynchronized shared flag
@@ -78,7 +78,7 @@ final class ManagedProcessTerminationHandlerTests: XCTestCase {
             managedProcess.observeTermination { _ in
                 terminationObserved.fulfill()
             }
-            let waitResult = XCTWaiter().wait(for: [terminationObserved], timeout: 3.0)
+            let waitResult = await XCTWaiter().fulfillment(of: [terminationObserved], timeout: 3.0)
 
             if waitResult != .completed {
                 missed += 1
