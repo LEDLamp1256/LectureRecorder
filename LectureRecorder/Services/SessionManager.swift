@@ -611,7 +611,7 @@ final class SessionManager: ObservableObject {
         finalManifest.endDate = Date()
         finalManifest.observedCaptureCopyFailureCount = outcome.observedCopyFailureCount
 
-        if let primaryFailure {
+        if primaryFailure != nil {
             finalManifest.status = .failed
             finalManifest.endReason = .error
             finalManifest.endedCleanly = false

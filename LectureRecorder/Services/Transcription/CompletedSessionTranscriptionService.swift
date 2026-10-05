@@ -405,7 +405,7 @@ final class CompletedSessionTranscriptionService: ObservableObject {
 
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generation: myGeneration, retryFailedJobs: retryFailedJobs)
-            await self?.releaseOperation(sessionID: sessionID, generation: myGeneration)
+            self?.releaseOperation(sessionID: sessionID, generation: myGeneration)
         }
         return .admitted
     }
