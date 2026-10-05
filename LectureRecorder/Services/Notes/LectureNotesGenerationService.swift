@@ -357,7 +357,7 @@ final class LectureNotesGenerationService: ObservableObject {
 
         currentTask = Task { [weak self] in
             await self?.run(sessionID: sessionID, generationID: generationID, epoch: myEpoch)
-            await self?.releaseOperation(sessionID: sessionID, epoch: myEpoch)
+            self?.releaseOperation(sessionID: sessionID, epoch: myEpoch)
         }
         return .admitted
     }
