@@ -17,7 +17,7 @@
 /// draining. No callback can be newly admitted once the gate is closed.
 /// This count is not proof that the hardware or downstream pipeline
 /// lost no audio; it reflects only what this accounting observed.
-struct CaptureStopOutcome: Sendable {
+nonisolated struct CaptureStopOutcome: Sendable {
     let failure: Error?
     let observedCopyFailureCount: Int
 }
