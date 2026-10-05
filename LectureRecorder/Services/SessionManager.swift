@@ -312,7 +312,7 @@ final class SessionManager: ObservableObject {
                     writer.acceptBuffer(buffer)
                 },
                 onFailure: { [weak self] error in
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
                         self?.handleCaptureFailure(runtimeID: runtimeID, error: error)
                     }
                 }
