@@ -31,7 +31,7 @@ final class LectureNotesGenerationService: ObservableObject {
     /// itself a source of truth — every case here is derived from, and
     /// consistent with, what `NotesGenerationRecoveryClassifier` would
     /// independently compute from durable artifacts alone.
-    enum NotesGenerationOutcome: Equatable {
+    nonisolated enum NotesGenerationOutcome: Equatable, Sendable {
         case completed(document: LectureNotesDocument)
         case cancelled
         case staleSource

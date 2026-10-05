@@ -216,7 +216,7 @@ nonisolated enum NotesWindowPlanValidationError: LocalizedError, Sendable, Equat
     }
 }
 
-extension NotesWindowPlan {
+nonisolated extension NotesWindowPlan {
     /// Validates this plan's own internal structural consistency — no
     /// filesystem or source-snapshot access required. Checks (in order):
     /// supported schema version; unique window indices; indices form
