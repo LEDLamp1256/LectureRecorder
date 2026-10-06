@@ -51,6 +51,11 @@ private actor FailingSessionStore: SessionStoring {
         writeManifestGate = nil
     }
 
+    /// Whether a gated `writeManifest` call is currently suspended.
+    func isWriteManifestGateHeld() -> Bool {
+        writeManifestGate != nil
+    }
+
     func setFailCreateDirectoriesFlag(_ value: Bool) {
         failCreateDirectories = value
     }
@@ -103,6 +108,34 @@ private actor FailingSessionStore: SessionStoring {
 
     func sessionsRootDirectory() async throws -> URL {
         try await wrapped.sessionsRootDirectory()
+    }
+}
+
+/// A permission service whose `requestPermission()` stays suspended until
+/// the test releases it, so application termination can be raced against
+/// a Start suspended at the permission boundary.
+private final class GatedPermissionService: MicrophonePermissionServing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<PermissionStatus, Never>?
+
+    func currentStatus() -> PermissionStatus { .granted }
+
+    func requestPermission() async -> PermissionStatus {
+        await withCheckedContinuation { continuation in
+            lock.withLock { self.continuation = continuation }
+        }
+    }
+
+    var isSuspended: Bool {
+        lock.withLock { continuation != nil }
+    }
+
+    func release(with status: PermissionStatus) {
+        let pending = lock.withLock { () -> CheckedContinuation<PermissionStatus, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume(returning: status)
     }
 }
 
@@ -1197,5 +1230,396 @@ final class SessionManagerTests: XCTestCase {
             .appendingPathComponent("chunks")
             .appendingPathComponent(completed.chunks[0].fileName)
         XCTAssertTrue(FileManager.default.fileExists(atPath: chunkFileURL.path))
+    }
+
+    // MARK: - Application termination (T7-B)
+
+    /// Polls `condition` on the main actor until it holds, failing the test
+    /// after `timeout`. Used only to observe a deliberately held suspension.
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition() {
+            if Date() > deadline {
+                XCTFail("Timed out waiting for condition", file: file, line: line)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    private func sessionDirectory(_ sessionID: UUID) -> URL {
+        tempDirectory.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+    }
+
+    private func sessionDirectories() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
+            .filter { !$0.hasPrefix(".") }
+    }
+
+    /// Records whether capture was ever started (the mock's start commit
+    /// hook fires synchronously inside every successful `start()`).
+    private final class CaptureStartProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var started = false
+        var didStart: Bool { lock.withLock { started } }
+        func markStarted() { lock.withLock { started = true } }
+    }
+
+    private func armCaptureStartProbe() -> CaptureStartProbe {
+        let probe = CaptureStartProbe()
+        captureService.setStartCommitHookForTesting { _, _ in probe.markStarted() }
+        return probe
+    }
+
+    func testApplicationTerminationDuringRecordingFinalizesThroughSharedShutdownWithAppTerminatedReason() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+
+        XCTAssertEqual(outcome, .released)
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .completed)
+        XCTAssertEqual(persisted.endReason, .appTerminated)
+        XCTAssertTrue(persisted.endedCleanly)
+        XCTAssertNotNil(persisted.endDate)
+        XCTAssertNil(persisted.failureDescription)
+        XCTAssertEqual(sessionManager.lastFinalizedSessionID, sessionID)
+    }
+
+    func testApplicationTerminationPersistsFinalManifestBeforeReleasing() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.armWriteManifestGate()
+
+        final class OutcomeBox: @unchecked Sendable {
+            var outcome: SessionManager.ApplicationTerminationOutcome?
+        }
+        let box = OutcomeBox()
+        let termination = Task { @MainActor in
+            box.outcome = await self.sessionManager.shutdownForApplicationTermination(timeout: 5)
+        }
+
+        await waitUntil { await self.failingStore.isWriteManifestGateHeld() }
+        XCTAssertNil(box.outcome, "termination must not release before the final manifest is written")
+        XCTAssertEqual(try readPersistedManifest(sessionID: sessionID).status, .recording)
+
+        await failingStore.releaseWriteManifestGate()
+        await termination.value
+
+        XCTAssertEqual(box.outcome, .released)
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .completed)
+        XCTAssertEqual(persisted.endReason, .appTerminated)
+    }
+
+    func testApplicationTerminationJoinsInFlightUserStopAndKeepsUserStoppedReason() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.armWriteManifestGate()
+
+        let userStop = Task { @MainActor in await self.sessionManager.stopSession() }
+        await waitUntil { await self.failingStore.isWriteManifestGateHeld() }
+        XCTAssertEqual(sessionManager.state, .stopping)
+
+        let termination = Task { @MainActor in
+            await self.sessionManager.shutdownForApplicationTermination(timeout: 5)
+        }
+        await Task.yield()
+        await failingStore.releaseWriteManifestGate()
+        await userStop.value
+        let outcome = await termination.value
+
+        XCTAssertEqual(outcome, .released)
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .completed)
+        XCTAssertEqual(persisted.endReason, .userStopped, "the first trigger (user Stop) decides the end reason")
+    }
+
+    func testRepeatedApplicationTerminationRequestsAreIdempotent() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        sessionManager.beginApplicationTermination()
+        sessionManager.beginApplicationTermination()
+        async let first = sessionManager.shutdownForApplicationTermination(timeout: 5)
+        async let second = sessionManager.shutdownForApplicationTermination(timeout: 5)
+        let outcomes = await [first, second]
+
+        XCTAssertEqual(outcomes, [.released, .released])
+        XCTAssertEqual(captureService.stopCallCountForTesting, 1)
+        XCTAssertEqual(try readPersistedManifest(sessionID: sessionID).endReason, .appTerminated)
+        XCTAssertEqual(sessionManager.state, .completed)
+    }
+
+    func testApplicationTerminationWhileIdleIsNoOp() async throws {
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+
+        XCTAssertEqual(outcome, .released)
+        XCTAssertEqual(sessionManager.state, .idle)
+        XCTAssertEqual(captureService.stopCallCountForTesting, 0)
+        XCTAssertNil(sessionManager.lastFinalizedSessionID)
+        XCTAssertTrue(try sessionDirectories().isEmpty)
+    }
+
+    func testStartIsRefusedAfterApplicationTerminationBegins() async throws {
+        let probe = armCaptureStartProbe()
+        sessionManager.beginApplicationTermination()
+
+        XCTAssertFalse(sessionManager.canStart)
+        await sessionManager.startSession()
+
+        XCTAssertEqual(sessionManager.state, .idle)
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertFalse(probe.didStart)
+        XCTAssertTrue(try sessionDirectories().isEmpty)
+    }
+
+    func testTerminationWhilePermissionRequestIsSuspendedNeverStartsCapture() async throws {
+        let gatedPermission = GatedPermissionService()
+        sessionManager = SessionManager(
+            store: failingStore,
+            permissionService: gatedPermission,
+            captureService: captureService,
+            chunkWriterFactory: chunkWriterFactory
+        )
+        let probe = armCaptureStartProbe()
+
+        let start = Task { @MainActor in await self.sessionManager.startSession() }
+        await waitUntil { gatedPermission.isSuspended }
+        XCTAssertEqual(sessionManager.state, .requestingPermission)
+
+        let termination = Task { @MainActor in
+            await self.sessionManager.shutdownForApplicationTermination(timeout: 5)
+        }
+        await Task.yield()
+        gatedPermission.release(with: .granted)
+        await start.value
+        let outcome = await termination.value
+
+        XCTAssertEqual(outcome, .released)
+        guard case .failed = sessionManager.state else {
+            return XCTFail("Expected the aborted Start to settle in .failed, got \(sessionManager.state)")
+        }
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertFalse(probe.didStart, "capture must never start after termination began")
+        XCTAssertTrue(chunkWriterFactory.recordedCalls.isEmpty)
+        XCTAssertTrue(try sessionDirectories().isEmpty, "nothing is created on disk")
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        XCTAssertFalse(sessionManager.canStart, "no automatic retry or restart")
+    }
+
+    func testTerminationWhilePreparationIsSuspendedNeverStartsCapture() async throws {
+        let probe = armCaptureStartProbe()
+        await failingStore.armWriteManifestGate()
+
+        let start = Task { @MainActor in await self.sessionManager.startSession() }
+        await waitUntil { await self.failingStore.isWriteManifestGateHeld() }
+        XCTAssertEqual(sessionManager.state, .preparing)
+        let sessionID = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(sessionDirectories().first)))
+
+        let termination = Task { @MainActor in
+            await self.sessionManager.shutdownForApplicationTermination(timeout: 5)
+        }
+        await Task.yield()
+        await failingStore.releaseWriteManifestGate()
+        await start.value
+        let outcome = await termination.value
+
+        XCTAssertEqual(outcome, .released)
+        guard case .failed = sessionManager.state else {
+            return XCTFail("Expected the aborted Start to settle in .failed, got \(sessionManager.state)")
+        }
+        XCTAssertFalse(probe.didStart, "capture must never start after termination began")
+        XCTAssertTrue(chunkWriterFactory.recordedCalls.isEmpty)
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        // The aborted attempt is recorded truthfully: never a recording,
+        // no audio, and so never listed.
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .failed)
+        XCTAssertTrue(persisted.chunks.isEmpty)
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        guard case .acquired(let externalLock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("The aborted session's directory lock must be released")
+        }
+        externalLock.release()
+        XCTAssertFalse(sessionManager.canStart, "no automatic retry or restart")
+    }
+
+    func testApplicationTerminationNeverRestartsRecording() async throws {
+        await sessionManager.startSession()
+        _ = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+        let stopsAfterTermination = captureService.stopCallCountForTesting
+        let directoriesAfterTermination = try sessionDirectories()
+
+        await sessionManager.startSession()
+
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertEqual(captureService.stopCallCountForTesting, stopsAfterTermination)
+        XCTAssertEqual(try sessionDirectories(), directoriesAfterTermination)
+    }
+
+    func testApplicationTerminationFinalWriteFailureLeavesRecoverableRecordingManifest() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+
+        XCTAssertEqual(outcome, .released)
+        XCTAssertNotNil(sessionManager.unresolvedIssue)
+        XCTAssertEqual(
+            try readPersistedManifest(sessionID: sessionID).status,
+            .recording,
+            "an unconfirmed final write leaves the on-disk manifest for next-launch recovery"
+        )
+        XCTAssertTrue(
+            sessionManager.holdsSessionDirectoryLockForTesting,
+            "the still-owned unresolved finalization keeps its directory lock"
+        )
+    }
+
+    func testSessionDirectoryLockHeldDuringRecordingAndReleasedAfterShutdown() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        XCTAssertTrue(sessionManager.holdsSessionDirectoryLockForTesting)
+        guard case .busy = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("A live recording's directory must be locked against other owners")
+        }
+
+        await sessionManager.stopSession()
+
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        guard case .acquired(let lock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("The directory lock must be released once the recording lifecycle is released")
+        }
+        lock.release()
+    }
+
+    func testSessionDirectoryLockReleasedOnlyAfterUnresolvedFinalizationIsResolved() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.setWriteManifestFailureQueue([true])
+        await sessionManager.stopSession()
+
+        guard case .busy = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("An unresolved finalization still owned here must keep the lock")
+        }
+
+        await sessionManager.retryResolution()
+
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        XCTAssertEqual(sessionManager.lastFinalizedSessionID, sessionID)
+        guard case .acquired(let lock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("Resolving the finalization must release the lock")
+        }
+        lock.release()
+    }
+
+    func testSessionDirectoryLockReleasedWhenUnresolvedSessionIsDiscarded() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.setWriteManifestFailureQueue([true])
+        await sessionManager.stopSession()
+        XCTAssertTrue(sessionManager.holdsSessionDirectoryLockForTesting)
+
+        await sessionManager.discardUnresolvedSession()
+
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        guard case .acquired(let lock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("Discarding must hand the session to next-launch recovery by releasing the lock")
+        }
+        lock.release()
+    }
+
+    func testFailedFinalizationPublishesTerminalRefreshSignal() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        await waitUntil { self.sessionManager.state.isFailed }
+
+        XCTAssertNil(sessionManager.lastCompletedSession)
+        XCTAssertEqual(sessionManager.lastFinalizedSessionID, sessionID)
+        XCTAssertEqual(try readPersistedManifest(sessionID: sessionID).status, .failed)
+    }
+
+    func testRecordingTerminationWaitIsBounded() async throws {
+        await sessionManager.startSession()
+        await failingStore.armWriteManifestGate()
+
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 0.2, pollInterval: 0.01)
+
+        XCTAssertEqual(outcome, .timedOut)
+        // Clean up the deliberately stalled finalization.
+        await waitUntil { await self.failingStore.isWriteManifestGateHeld() }
+        await failingStore.releaseWriteManifestGate()
+        await waitUntil { self.sessionManager.state == .completed }
+    }
+
+    func testOperationalFailureAfterTerminationBeganKeepsFailurePrecedence() async throws {
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        // Termination initiates the shared shutdown first; a capture failure
+        // then arrives before capture has drained.
+        sessionManager.beginApplicationTermination()
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+
+        XCTAssertEqual(outcome, .released)
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .failed)
+        XCTAssertEqual(persisted.endReason, .error)
+        XCTAssertFalse(persisted.endedCleanly)
+        XCTAssertNotNil(persisted.failureDescription)
+    }
+
+    func testResolvedStartFailureReleasesSessionDirectoryLock() async throws {
+        await failingStore.setFailCreateLoggerFlag(true)
+
+        await sessionManager.startSession()
+
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        let sessionID = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(sessionDirectories().first)))
+        guard case .acquired(let lock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("A resolved start failure must release the directory lock")
+        }
+        lock.release()
+    }
+
+    func testUnresolvedStartFailureKeepsLockUntilRetrySucceeds() async throws {
+        await failingStore.setFailCreateLoggerFlag(true)
+        await failingStore.setWriteManifestFailureQueue([false, true])
+
+        await sessionManager.startSession()
+
+        XCTAssertNotNil(sessionManager.unresolvedIssue)
+        XCTAssertTrue(sessionManager.holdsSessionDirectoryLockForTesting)
+        let sessionID = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(sessionDirectories().first)))
+        guard case .busy = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("An unresolved start failure still owned here must keep the lock")
+        }
+
+        await sessionManager.retryResolution()
+
+        XCTAssertNil(sessionManager.unresolvedIssue)
+        XCTAssertFalse(sessionManager.holdsSessionDirectoryLockForTesting)
+        guard case .acquired(let lock) = SessionDirectoryLock.tryAcquire(directory: sessionDirectory(sessionID)) else {
+            return XCTFail("Resolving the start failure must release the lock")
+        }
+        lock.release()
     }
 }

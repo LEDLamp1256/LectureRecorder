@@ -93,6 +93,39 @@ final class CompletedSessionsListPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.result?.sessions.map(\.manifest.sessionID), [finalized.sessionID])
     }
 
+    /// T7-B: the terminal-finalization signal (`SessionManager.
+    /// lastFinalizedSessionID`, published for a `.failed` finalization too —
+    /// see `SessionManagerTests.testFailedFinalizationPublishesTerminalRefreshSignal`)
+    /// refreshes the list so a failed recording with audio appears without
+    /// a manual Refresh.
+    func testRefreshAfterFailedFinalizationLoadsTheFailedSession() throws {
+        let presenter = makePresenter()
+        presenter.reload()
+        XCTAssertEqual(presenter.result?.sessions.count, 0)
+
+        let sessionID = UUID()
+        let sessionPaths = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempDirectory, sessionID: sessionID)
+        var manifest = SessionManifest.newSession(id: sessionID, audioFormat: makeAudioFormat(), targetChunkDurationSeconds: 30)
+        manifest.status = .failed
+        manifest.endReason = .error
+        manifest.endDate = Date()
+        manifest.failureDescription = "Capture failure: injected"
+        manifest.chunks = [ChunkMetadata(
+            sequenceNumber: 0,
+            fileName: TranscriptionArtifactPaths.canonicalChunkFileName(for: 0),
+            startOffsetSeconds: 0,
+            durationSeconds: 30,
+            frameCount: 1_323_000,
+            state: .completed
+        )]
+        try AtomicFileWriter.writeJSON(manifest, to: sessionPaths.manifestURL)
+
+        presenter.refreshAfterFinalization(oldLastCompletedSessionID: nil, newLastCompletedSessionID: sessionID)
+
+        XCTAssertEqual(presenter.result?.sessions.map(\.manifest.sessionID), [sessionID])
+        XCTAssertEqual(presenter.result?.sessions.first?.manifest.status, .failed)
+    }
+
     // MARK: - No premature refresh
 
     func testNoRefreshOccursWhileStillFinalizing() async throws {

@@ -92,4 +92,28 @@ final class AppEnvironmentTests: XCTestCase {
         let secondAdmission = environment.completedSessionTranscriptionService.transcribe(sessionID: sessionID)
         XCTAssertEqual(secondAdmission, .admitted)
     }
+
+    /// T7-B: application termination closes recording Start admission and
+    /// shuts down every downstream service through one combined, bounded
+    /// call. (Termination *during* a live recording is proven with fakes in
+    /// `SessionManagerTests`; starting real capture here is avoided.)
+    func testTerminationShutsDownRecordingAndAllDownstreamServices() async {
+        let environment = AppEnvironment()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await environment.shutdownForTermination(recordingTimeout: 1)
+        let elapsed = clock.now - start
+
+        XCTAssertTrue(environment.sessionManager.isApplicationTerminating)
+        XCTAssertFalse(environment.sessionManager.canStart)
+        XCTAssertTrue(environment.completedSessionTranscriptionService.isShuttingDown)
+        XCTAssertTrue(environment.lectureNotesGenerationService.isShuttingDown)
+        XCTAssertTrue(environment.lectureSummaryGenerationService.isShuttingDown)
+        XCTAssertLessThan(elapsed, .seconds(1), "an idle environment releases immediately")
+        XCTAssertEqual(
+            environment.completedSessionTranscriptionService.transcribe(sessionID: UUID()),
+            .shuttingDown
+        )
+    }
 }

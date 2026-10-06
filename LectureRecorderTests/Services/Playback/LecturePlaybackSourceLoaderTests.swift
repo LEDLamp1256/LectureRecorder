@@ -56,14 +56,35 @@ final class LecturePlaybackSourceLoaderTests: XCTestCase {
 
     func testIneligibleSessionIsRejectedByReusedEligibilityCheck() throws {
         var (manifest, paths) = try PlaybackTestAudio.makeSession(root: root, frameCounts: [100])
-        manifest.status = .interrupted
-        assertLoadFails(manifest, paths, .sessionIneligible(.artifactPathValidation(.sessionNotCompleted(.interrupted))))
+        // T7-B: a live / not-yet-recovered recording is never playable.
+        manifest.status = .recording
+        assertLoadFails(manifest, paths, .sessionIneligible(.artifactPathValidation(.sessionNotCompleted(.recording))))
 
         manifest.status = .completed
         XCTAssertThrowsError(
             try LecturePlaybackSourceLoader.load(expectedSessionID: UUID(), manifest: manifest, sessionPaths: paths)
         ) { error in
             XCTAssertEqual(error as? LecturePlaybackSourceError, .sessionIneligible(.sessionIdentityMismatch))
+        }
+    }
+
+    /// T7-B: an interrupted or failed recording's durable audio is playable
+    /// through the same validated source loader, with identity checks
+    /// still enforced.
+    func testInterruptedAndFailedSessionsLoadPlayback() throws {
+        for status in [SessionStatus.interrupted, .failed] {
+            var (manifest, paths) = try PlaybackTestAudio.makeSession(root: root, frameCounts: [4_410, 100])
+            manifest.status = status
+            manifest.endedCleanly = false
+
+            let source = try load(manifest, paths)
+
+            XCTAssertEqual(source.chunkURLs, (0..<2).map { chunkURL(paths, $0) }, "\(status)")
+            XCTAssertThrowsError(
+                try LecturePlaybackSourceLoader.load(expectedSessionID: UUID(), manifest: manifest, sessionPaths: paths)
+            ) { error in
+                XCTAssertEqual(error as? LecturePlaybackSourceError, .sessionIneligible(.sessionIdentityMismatch))
+            }
         }
     }
 

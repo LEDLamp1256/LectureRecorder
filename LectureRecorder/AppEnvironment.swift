@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 
 /// Composition root for the app's dependency graph. Keeps object
 /// construction in one place so future phases have a single, obvious spot
@@ -56,7 +57,21 @@ final class AppEnvironment: ObservableObject {
     /// as a live recording; it never starts transcription itself.
     let lectureMediaImporter: any LectureMediaImporting = LectureMediaImportService()
 
-    init() {
+    /// What launch-time abandoned-recording recovery did, or `nil` when this
+    /// environment was composed without it (see `init`).
+    let launchRecoveryReport: AbandonedRecordingRecoveryReport?
+
+    /// - Parameter abandonedRecordingRecovery: when supplied, runs once,
+    ///   synchronously, before `SessionManager` is constructed — so no
+    ///   recording owned by this process can exist yet, and the session
+    ///   library's first read already sees recovered sessions. Defaults to
+    ///   `nil`: only the application's real launch path supplies it, so
+    ///   merely composing an environment (for example in tests, whose host
+    ///   shares the real application container) never mutates real
+    ///   sessions.
+    init(abandonedRecordingRecovery: AbandonedRecordingRecovery? = nil) {
+        self.launchRecoveryReport = abandonedRecordingRecovery?.recoverAbandonedRecordings()
+
         let store = SessionStore()
         let permissionService = MicrophonePermissionService()
         let captureService = AudioCaptureService()
@@ -304,5 +319,34 @@ final class AppEnvironment: ObservableObject {
             newGenerationAvailabilityChecker: summaryGeneratorRouter,
             generationProvenance: MLXSummaryConfiguration.generationProvenance
         )
+    }
+
+    // MARK: - Application termination
+
+    /// The synchronous half of application termination, with no `await`:
+    /// closes recording Start admission (beginning the shared recording
+    /// shutdown if a recording is live) and closes admission/requests
+    /// cancellation on every downstream service. Idempotent.
+    func beginTermination() {
+        sessionManager.beginApplicationTermination()
+        completedSessionTranscriptionService.beginShutdown()
+        lectureNotesGenerationService.beginShutdown()
+        lectureSummaryGenerationService.beginShutdown()
+    }
+
+    /// Begins termination (see `beginTermination`), then waits concurrently
+    /// for the recording lifecycle to release (up to `recordingTimeout`)
+    /// and for each downstream service's own bounded shutdown. Never
+    /// cleans anything up destructively: if the recording bound elapses,
+    /// durable on-disk state is left for next-launch recovery.
+    func shutdownForTermination(
+        recordingTimeout: TimeInterval = SessionManager.defaultApplicationTerminationTimeout
+    ) async {
+        beginTermination()
+        async let recording = sessionManager.shutdownForApplicationTermination(timeout: recordingTimeout)
+        async let transcription = completedSessionTranscriptionService.shutdown()
+        async let notes = lectureNotesGenerationService.shutdown()
+        async let summary = lectureSummaryGenerationService.shutdown()
+        _ = await (recording, transcription, notes, summary)
     }
 }

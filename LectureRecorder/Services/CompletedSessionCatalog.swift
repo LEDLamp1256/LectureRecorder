@@ -1,7 +1,8 @@
 import Foundation
 
-/// One structurally-valid, `.completed`-status session discovered by
-/// `CompletedSessionCatalog`.
+/// One structurally-valid, listable session discovered by
+/// `CompletedSessionCatalog`: `.completed`, or a terminal `.interrupted` /
+/// `.failed` recording with durable audio (see `isListable`).
 nonisolated struct CompletedSessionEntry: Sendable, Equatable {
     let manifest: SessionManifest
     let sessionPaths: SessionPaths
@@ -60,6 +61,22 @@ nonisolated struct CompletedSessionCatalog: Sendable {
         self.sessionsRootResolver = sessionsRootResolver
     }
 
+    /// Whether a decoded manifest belongs in the session library:
+    /// `.completed` (unchanged behavior, including zero-chunk), or a
+    /// terminal `.interrupted`/`.failed` recording that durably captured at
+    /// least one chunk of audio. Never `.recording`. The session's actual
+    /// status is preserved and shown — it is never presented as completed.
+    static func isListable(_ manifest: SessionManifest) -> Bool {
+        switch manifest.status {
+        case .completed:
+            return true
+        case .interrupted, .failed:
+            return !manifest.chunks.isEmpty
+        case .recording:
+            return false
+        }
+    }
+
     func listCompletedSessions() throws -> CompletedSessionCatalogResult {
         let root = try sessionsRootResolver()
 
@@ -108,10 +125,11 @@ nonisolated struct CompletedSessionCatalog: Sendable {
                 continue
             }
 
-            guard manifest.status == .completed else {
-                // A legitimately non-completed session (still recording,
-                // failed, interrupted) — not part of this catalog and not
-                // an error.
+            guard Self.isListable(manifest) else {
+                // A legitimately unlisted session (still recording or
+                // awaiting recovery, or a failed/interrupted attempt that
+                // captured no audio) — not part of this catalog and not an
+                // error.
                 continue
             }
 
@@ -130,12 +148,11 @@ nonisolated struct CompletedSessionCatalog: Sendable {
         }
 
         // Newest-first by authoritative manifest metadata — never by
-        // filesystem enumeration or mtime. `endDate` is the completion
-        // timestamp `SessionManager` persists at the moment a session
-        // durably becomes `.completed`; every session in `result.sessions`
-        // already has `status == .completed`, so `endDate` is expected to
-        // be set, but `creationDate` is a safe, still-authoritative
-        // fallback if an older manifest ever lacked it. Equal timestamps
+        // filesystem enumeration or mtime. `endDate` is the timestamp
+        // `SessionManager` persists when a session durably finalizes;
+        // `creationDate` is the authoritative fallback when it is absent —
+        // always so for a recovered `.interrupted` session, whose true end
+        // time is unknown. Equal timestamps
         // break the tie on `sessionID` so ordering is deterministic and
         // stable across repeated calls, not dependent on scan order.
         result.sessions.sort { lhs, rhs in

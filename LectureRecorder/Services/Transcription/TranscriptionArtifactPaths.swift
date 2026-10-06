@@ -14,10 +14,12 @@ nonisolated struct TranscriptionArtifactPaths: Sendable, Equatable {
     /// Every validation failure `validated(manifest:sessionPaths:)` can
     /// throw, checked in the exact order listed here.
     nonisolated enum ValidationError: LocalizedError, Sendable, Equatable {
-        /// The manifest's `status` is not `.completed`. Named
-        /// `sessionNotCompleted`, not `sessionNotTerminal`, because
-        /// `.failed`/`.interrupted` are also terminal recording states but
-        /// are deliberately rejected by T1.
+        /// The manifest's `status` is not an immutable terminal recording
+        /// state. Since T7-B, `.completed`, `.interrupted` and `.failed`
+        /// sessions are all eligible (their audio is durable and their
+        /// manifests never change again); only `.recording` — a live or
+        /// not-yet-recovered session — is rejected. The case keeps its
+        /// original name so existing callers and diagnostics are unchanged.
         case sessionNotCompleted(SessionStatus)
         /// `sessionPaths.sessionDirectory`'s last path component does not
         /// match `manifest.sessionID` — proves the supplied paths do not
@@ -43,7 +45,7 @@ nonisolated struct TranscriptionArtifactPaths: Sendable, Equatable {
         var errorDescription: String? {
             switch self {
             case .sessionNotCompleted(let status):
-                return "Session is not completed (status: \(status.rawValue)); T1 only processes completed sessions."
+                return "Session is not a finished recording (status: \(status.rawValue)); only completed, interrupted or failed sessions are processed."
             case .pathSessionMismatch:
                 return "The supplied session paths do not belong to the supplied manifest's session ID."
             case .unexpectedPathTopology:
@@ -66,7 +68,8 @@ nonisolated struct TranscriptionArtifactPaths: Sendable, Equatable {
 
     /// Validates `manifest` against `sessionPaths` in the following exact
     /// order, before any directory or file is created:
-    /// 1. `manifest.status == .completed`.
+    /// 1. `manifest.status` is terminal (`.completed`, `.interrupted` or
+    ///    `.failed`) — never `.recording`.
     /// 2. `sessionPaths.sessionDirectory` belongs to `manifest.sessionID`.
     /// 3. `sessionPaths`' internal topology (chunks/session.json layout)
     ///    matches expectations.
@@ -79,7 +82,7 @@ nonisolated struct TranscriptionArtifactPaths: Sendable, Equatable {
         manifest: SessionManifest,
         sessionPaths: SessionPaths
     ) throws -> TranscriptionArtifactPaths {
-        guard manifest.status == .completed else {
+        guard isTerminalRecordingStatus(manifest.status) else {
             throw ValidationError.sessionNotCompleted(manifest.status)
         }
 
@@ -138,6 +141,18 @@ nonisolated struct TranscriptionArtifactPaths: Sendable, Equatable {
             jobsDirectory: jobsDirectory,
             resultsDirectory: resultsDirectory
         )
+    }
+
+    /// The immutable terminal statuses whose durable audio may be played,
+    /// transcribed and listed. `.recording` is excluded: such a session is
+    /// either live or awaiting abandoned-recording recovery.
+    static func isTerminalRecordingStatus(_ status: SessionStatus) -> Bool {
+        switch status {
+        case .completed, .interrupted, .failed:
+            return true
+        case .recording:
+            return false
+        }
     }
 
     /// The canonical `chunk_%06d.caf` filename for `sequenceNumber` —

@@ -60,15 +60,29 @@ final class TranscriptionArtifactPathsTests: XCTestCase {
         XCTAssertNoThrow(try TranscriptionArtifactPaths.validated(manifest: manifest, sessionPaths: paths))
     }
 
-    func testValidatedRejectsNonCompletedManifest() throws {
+    /// T7-B: only a live / not-yet-recovered `.recording` manifest is
+    /// rejected by the shared status gate.
+    func testValidatedRejectsRecordingManifest() throws {
         let sessionID = UUID()
         let paths = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempDirectory, sessionID: sessionID)
         var manifest = makeCompletedManifest(sessionID: sessionID, chunkCount: 1)
-        manifest.status = .failed
+        manifest.status = .recording
         XCTAssertThrowsError(try TranscriptionArtifactPaths.validated(manifest: manifest, sessionPaths: paths)) { error in
-            guard case TranscriptionArtifactPaths.ValidationError.sessionNotCompleted = error else {
-                return XCTFail("Expected sessionNotCompleted, got \(error)")
+            guard case TranscriptionArtifactPaths.ValidationError.sessionNotCompleted(.recording) = error else {
+                return XCTFail("Expected sessionNotCompleted(.recording), got \(error)")
             }
+        }
+    }
+
+    /// T7-B: immutable terminal `.interrupted` and `.failed` recordings are
+    /// eligible alongside `.completed`.
+    func testValidatedAcceptsInterruptedAndFailedTerminalManifests() throws {
+        for status in [SessionStatus.completed, .interrupted, .failed] {
+            let sessionID = UUID()
+            let paths = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempDirectory, sessionID: sessionID)
+            var manifest = makeCompletedManifest(sessionID: sessionID, chunkCount: 2)
+            manifest.status = status
+            XCTAssertNoThrow(try TranscriptionArtifactPaths.validated(manifest: manifest, sessionPaths: paths), "\(status)")
         }
     }
 
