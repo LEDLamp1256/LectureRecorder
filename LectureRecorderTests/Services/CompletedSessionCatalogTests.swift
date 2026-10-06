@@ -89,6 +89,69 @@ final class CompletedSessionCatalogTests: XCTestCase {
         XCTAssertTrue(result.errors.isEmpty)
     }
 
+    /// T7-B: a terminal interrupted recording with durable audio is listed,
+    /// keeping its real status.
+    func testInterruptedSessionWithChunksIsListed() throws {
+        let sessionID = UUID()
+        try writeCompletedSession(sessionID: sessionID, status: .interrupted, chunkCount: 2)
+        let result = try makeCatalog().listCompletedSessions()
+        XCTAssertEqual(result.sessions.map(\.manifest.sessionID), [sessionID])
+        XCTAssertEqual(result.sessions.first?.manifest.status, .interrupted)
+        XCTAssertTrue(result.errors.isEmpty)
+    }
+
+    /// T7-B: a failed recording with durable audio is listed, keeping its
+    /// real status.
+    func testFailedSessionWithChunksIsListed() throws {
+        let sessionID = UUID()
+        try writeCompletedSession(sessionID: sessionID, status: .failed, chunkCount: 1)
+        let result = try makeCatalog().listCompletedSessions()
+        XCTAssertEqual(result.sessions.map(\.manifest.sessionID), [sessionID])
+        XCTAssertEqual(result.sessions.first?.manifest.status, .failed)
+    }
+
+    /// T7-B: failed/interrupted attempts that captured no audio stay out of
+    /// the library (unlike zero-chunk completed sessions, unchanged).
+    func testZeroChunkFailedOrInterruptedSessionIsNotListed() throws {
+        try writeCompletedSession(status: .failed, chunkCount: 0)
+        try writeCompletedSession(status: .interrupted, chunkCount: 0)
+        let result = try makeCatalog().listCompletedSessions()
+        XCTAssertTrue(result.sessions.isEmpty)
+        XCTAssertTrue(result.errors.isEmpty)
+    }
+
+    /// T7-B: the catalog stays read-only — listing a terminal session never
+    /// rewrites its manifest.
+    func testListingTerminalSessionsNeverMutatesTheirManifests() throws {
+        let paths = try writeCompletedSession(status: .interrupted, chunkCount: 2)
+        let before = try Data(contentsOf: paths.manifestURL)
+        _ = try makeCatalog().listCompletedSessions()
+        XCTAssertEqual(try Data(contentsOf: paths.manifestURL), before)
+    }
+
+    func testRecordingStatusDisplayNeverPresentsTerminalFailuresAsCompleted() {
+        var manifest = SessionManifest.newSession(id: UUID(), audioFormat: makeAudioFormat(), targetChunkDurationSeconds: 30)
+
+        manifest.status = .completed
+        manifest.endReason = .userStopped
+        XCTAssertNil(SessionRecordingStatusDisplay.listCaption(for: manifest))
+        XCTAssertNil(SessionRecordingStatusDisplay.detailStatus(for: manifest))
+
+        manifest.endReason = .appTerminated
+        XCTAssertEqual(SessionRecordingStatusDisplay.listCaption(for: manifest), "Ended when the app quit")
+
+        manifest.status = .interrupted
+        manifest.endReason = .unknown
+        XCTAssertEqual(SessionRecordingStatusDisplay.listCaption(for: manifest), "Interrupted recording")
+        XCTAssertNotNil(SessionRecordingStatusDisplay.detailStatus(for: manifest))
+
+        manifest.status = .failed
+        manifest.endReason = .error
+        manifest.failureDescription = "Capture failure: device changed"
+        XCTAssertEqual(SessionRecordingStatusDisplay.listCaption(for: manifest), "Recording failed")
+        XCTAssertEqual(SessionRecordingStatusDisplay.detailStatus(for: manifest), "Recording failed: Capture failure: device changed")
+    }
+
     func testZeroChunkCompletedSessionIsListedAsValid() throws {
         try writeCompletedSession(chunkCount: 0)
         let catalog = try makeCatalog()

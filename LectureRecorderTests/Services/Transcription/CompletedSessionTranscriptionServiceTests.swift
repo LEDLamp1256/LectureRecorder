@@ -326,6 +326,39 @@ final class CompletedSessionTranscriptionServiceTests: XCTestCase {
         }
     }
 
+    /// T7-B: a recovered `.interrupted` session's durable audio is
+    /// transcribable through the ordinary path, and its status is kept.
+    func testRecoveredInterruptedSessionCanBeTranscribed() async throws {
+        try await assertTerminalSessionCanBeTranscribed(status: .interrupted)
+    }
+
+    /// T7-B: a `.failed` recording's already-captured audio is
+    /// transcribable through the ordinary path, and its status is kept.
+    func testFailedSessionWithChunksCanBeTranscribed() async throws {
+        try await assertTerminalSessionCanBeTranscribed(status: .failed)
+    }
+
+    private func assertTerminalSessionCanBeTranscribed(status: SessionStatus) async throws {
+        var manifest = try writeManifest(chunkCount: 2)
+        manifest.status = status
+        manifest.endedCleanly = false
+        manifest.endReason = status == .failed ? .error : .unknown
+        try AtomicFileWriter.writeJSON(manifest, to: sessionPaths.manifestURL)
+        let transcriber = FakeTranscriber()
+        let service = makeService(transcriber: transcriber)
+
+        XCTAssertEqual(service.transcribe(sessionID: sessionID), .admitted)
+        let finalPhase = await waitUntilFinished(service)
+
+        XCTAssertEqual(finalPhase, .finished(.completed))
+        XCTAssertEqual(transcriber.recordedCalls.map(\.sequenceNumber), [0, 1])
+        XCTAssertEqual(
+            try AtomicFileWriter.readJSON(SessionManifest.self, from: sessionPaths.manifestURL).status,
+            status,
+            "transcription never relabels the recording's terminal status"
+        )
+    }
+
     func testFirstFailedChunkStopsSchedulingLaterChunksAndPreservesSuccessfulPrefix() async throws {
         try writeManifest(chunkCount: 3)
         let transcriber = FakeTranscriber()

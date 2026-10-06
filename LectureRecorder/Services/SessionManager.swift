@@ -58,10 +58,35 @@ private enum OperationalFailureCause {
 /// `OperationalFailureCause` and never prevents a `.completed` outcome by
 /// itself — only a genuinely retained operational failure does that, even
 /// if that failure surfaces only after a user-initiated Stop already
-/// began the same shutdown.
+/// began the same shutdown. `.applicationTerminating` is likewise never an
+/// operational failure: it only changes the persisted `endReason` of an
+/// otherwise clean finalization, and only when it is the trigger that
+/// actually began the shutdown (first trigger wins).
 private enum ShutdownTrigger {
     case userStopped
+    case applicationTerminating
     case operational(OperationalFailureCause)
+}
+
+/// Why `startSession()` unwound without establishing a recording, for
+/// reasons that are not capture/store failures of their own.
+private enum SessionStartAbort: LocalizedError {
+    /// Application termination began while Start was suspended.
+    case applicationTerminating
+    /// The new session directory's ownership lock could not be acquired.
+    case sessionDirectoryLockUnavailable(errno: Int32?)
+
+    var errorDescription: String? {
+        switch self {
+        case .applicationTerminating:
+            return "Recording did not start because the application is quitting."
+        case .sessionDirectoryLockUnavailable(let code):
+            if let code {
+                return "Unable to take ownership of the new session directory (errno \(code))."
+            }
+            return "Unable to take ownership of the new session directory: it is already locked."
+        }
+    }
 }
 
 /// One recording cycle's complete retained runtime state. Confined to
@@ -85,6 +110,9 @@ private final class RecordingRuntime {
     var expectedNextSequence = 0
     var interiorPersistenceHasFailed = false
     var operationalFailures: [OperationalFailureCause] = []
+    /// Set once, when the shared shutdown task is created, if application
+    /// termination was the trigger that began it.
+    var shutdownInitiatedByApplicationTermination = false
 
     init(id: UUID, writer: any AudioChunkWriting, paths: SessionPaths) {
         self.id = id
@@ -144,6 +172,32 @@ final class SessionManager: ObservableObject {
     @Published private(set) var unresolvedIssue: UnresolvedSessionIssue?
     @Published private(set) var lastKnownPermissionStatus: PermissionStatus = .undetermined
     @Published private(set) var revealFolderErrorMessage: String?
+    /// The session ID of the most recent recording whose terminal manifest
+    /// (`.completed` or `.failed`) was durably persisted by this instance.
+    /// A memory-only refresh signal for session lists; never persisted and
+    /// never a source of truth for the session's status.
+    @Published private(set) var lastFinalizedSessionID: UUID?
+
+    /// The default bound `shutdownForApplicationTermination` waits for the
+    /// recording lifecycle to release. Independent of — and deliberately
+    /// larger than — the downstream services' 5-second shutdown bound,
+    /// because recording finalization is the one path that preserves source
+    /// audio. If it elapses, whatever is durable on disk is left for
+    /// next-launch abandoned-recording recovery.
+    nonisolated static let defaultApplicationTerminationTimeout: TimeInterval = 15
+
+    /// Set synchronously by `beginApplicationTermination()` and never
+    /// cleared: once application termination begins, this instance never
+    /// establishes another recording.
+    private(set) var isApplicationTerminating = false
+    /// True for the whole duration of a `startSession()` call that passed
+    /// admission, so termination can wait for an in-flight Start to unwind.
+    private var isStartInFlight = false
+    /// Proves live ownership of the current session's directory to other
+    /// processes (see `SessionDirectoryLock`). Held from directory creation
+    /// until this instance releases that session's lifecycle — including
+    /// while an unresolved finalization issue for it is still owned here.
+    private var currentSessionLock: SessionDirectoryLock?
 
     private let store: any SessionStoring
     private let permissionService: MicrophonePermissionServing
@@ -174,7 +228,7 @@ final class SessionManager: ObservableObject {
     }
 
     var canStart: Bool {
-        unresolvedIssue == nil && (state == .idle || state == .completed)
+        !isApplicationTerminating && unresolvedIssue == nil && (state == .idle || state == .completed)
     }
 
     var canStop: Bool {
@@ -223,9 +277,20 @@ final class SessionManager: ObservableObject {
             return
         }
 
+        isStartInFlight = true
+        defer { isStartInFlight = false }
+
         transition(to: .requestingPermission)
         let status = await permissionService.requestPermission()
         lastKnownPermissionStatus = status
+
+        // Termination may have begun while the permission request was
+        // suspended. Nothing exists yet — no capture, directory or manifest.
+        guard !isApplicationTerminating else {
+            Log.session.notice("startSession() abandoned after permission: application is terminating")
+            transition(to: .failed(SessionStartAbort.applicationTerminating.localizedDescription))
+            return
+        }
 
         guard status == .granted else {
             Log.permission.error("Microphone permission not granted: \(String(describing: status), privacy: .public)")
@@ -255,9 +320,23 @@ final class SessionManager: ObservableObject {
         var writerConstructed = false
 
         do {
-            // Step 4: session directories.
+            // Step 4: session directories, then live ownership of them —
+            // before the initial `.recording` manifest exists, so no other
+            // process's abandoned-recording recovery can ever observe this
+            // session as ownerless. `createdPaths` is only recorded once
+            // ownership is held: without it, the failure path must not write
+            // anything into the directory.
             let paths = try await store.createSessionDirectories(sessionID: sessionID)
+            switch SessionDirectoryLock.tryAcquire(directory: paths.sessionDirectory) {
+            case .acquired(let lock):
+                currentSessionLock = lock
+            case .busy:
+                throw SessionStartAbort.sessionDirectoryLockUnavailable(errno: nil)
+            case .failed(let code):
+                throw SessionStartAbort.sessionDirectoryLockUnavailable(errno: code)
+            }
             createdPaths = paths
+            try throwIfApplicationTerminating()
 
             // Step 5 + 6: bridge the negotiated format, build and persist
             // the initial manifest using it.
@@ -271,9 +350,14 @@ final class SessionManager: ObservableObject {
 
             try await store.writeManifest(manifest, paths: paths)
             initialManifestPersisted = true
+            try throwIfApplicationTerminating()
 
             let logger = try await store.createSessionLogger(paths: paths)
             await logger.log("Session \(sessionID.uuidString) created.")
+            // Last suspension point before the runtime is installed and
+            // capture starts: nothing below suspends, so a recording can
+            // never become live after application termination began.
+            try throwIfApplicationTerminating()
 
             // Step 7: construct the writer through the injected factory.
             let writer = try chunkWriterFactory.makeWriter(
@@ -369,7 +453,10 @@ final class SessionManager: ObservableObject {
             // reconcile, and startSession()'s ordering means a manifest
             // could not have been constructed without paths existing
             // first, so preparedManifest/initialManifestPersisted would
-            // also be nil/false here.
+            // also be nil/false here. (Also reached when the new
+            // directory's ownership lock could not be taken: nothing may
+            // then be written into it.)
+            releaseSessionLock()
             transition(to: .failed(description))
             return
         }
@@ -390,8 +477,11 @@ final class SessionManager: ObservableObject {
             activeSession = nil
             currentSessionPaths = nil
             currentSessionLogger = nil
+            releaseSessionLock()
             transition(to: .failed(description))
         } catch let persistError {
+            // The session's lifecycle stays owned here (unresolved issue),
+            // so its directory lock is deliberately kept.
             Log.session.error(
                 "Failed to persist failure state for session \(sessionID.uuidString, privacy: .public): \(persistError.localizedDescription, privacy: .public)"
             )
@@ -568,6 +658,12 @@ final class SessionManager: ObservableObject {
             transition(to: .stopping)
         }
 
+        // First trigger wins: only the trigger that creates the shared
+        // shutdown task decides a clean finalization's `endReason`.
+        if case .applicationTerminating = trigger {
+            runtime.shutdownInitiatedByApplicationTermination = true
+        }
+
         // Strong self-capture, deliberately: the shutdown task must
         // finish tearing down capture and writer resources even if
         // SessionManager itself became otherwise unreferenced. The
@@ -603,6 +699,7 @@ final class SessionManager: ObservableObject {
         guard var finalManifest = activeSession else {
             Log.session.fault("performSharedShutdown reached with no activeSession; this indicates a bug.")
             currentRuntime = nil
+            releaseSessionLock()
             transition(to: .failed("Internal error: session state lost during shutdown."))
             return
         }
@@ -618,7 +715,7 @@ final class SessionManager: ObservableObject {
             finalManifest.failureDescription = formatFailureDescription(runtime.operationalFailures)
         } else {
             finalManifest.status = .completed
-            finalManifest.endReason = .userStopped
+            finalManifest.endReason = runtime.shutdownInitiatedByApplicationTermination ? .appTerminated : .userStopped
             finalManifest.endedCleanly = true
             finalManifest.failureDescription = nil
         }
@@ -639,9 +736,12 @@ final class SessionManager: ObservableObject {
         // observes the same real completion" contract.
         do {
             try await store.writeManifest(finalManifest, paths: paths)
+            let cleanEndMessage = finalManifest.endReason == .appTerminated
+                ? "Session \(finalManifest.sessionID.uuidString) finalized because the application is quitting."
+                : "Session \(finalManifest.sessionID.uuidString) stopped by user."
             await currentSessionLogger?.log(
                 primaryFailure == nil
-                    ? "Session \(finalManifest.sessionID.uuidString) stopped by user."
+                    ? cleanEndMessage
                     : "Session \(finalManifest.sessionID.uuidString) ended with a failure: \(finalManifest.failureDescription ?? "unknown")",
                 level: primaryFailure == nil ? "INFO" : "ERROR"
             )
@@ -655,6 +755,8 @@ final class SessionManager: ObservableObject {
             if finalManifest.status == .completed {
                 lastCompletedSession = finalManifest
             }
+            lastFinalizedSessionID = finalManifest.sessionID
+            releaseSessionLock()
 
             currentRuntime = nil
             transition(to: finalManifest.status == .completed ? .completed : .failed(finalManifest.failureDescription ?? "Recording failed."))
@@ -678,6 +780,10 @@ final class SessionManager: ObservableObject {
                 canRetry: true
             )
 
+            // The unresolved finalization is still owned by this process,
+            // so the session directory lock is deliberately kept. If the
+            // process exits in this state, the on-disk `.recording`
+            // manifest is left for next-launch abandoned-recording recovery.
             currentRuntime = nil
             transition(to: .failed(finalManifest.failureDescription ?? error.localizedDescription))
         }
@@ -754,12 +860,14 @@ final class SessionManager: ObservableObject {
                     await currentSessionLogger?.close()
                     Log.session.info("Failed session's final manifest persisted on retry: \(pending.sessionID.uuidString, privacy: .public)")
                 }
+                lastFinalizedSessionID = pending.sessionID
                 activeSession = nil
                 currentSessionPaths = nil
                 currentSessionLogger = nil
                 pendingManifestForRetry = nil
                 retryKind = nil
                 unresolvedIssue = nil
+                releaseSessionLock()
 
             case .prepareFailure:
                 await currentSessionLogger?.close()
@@ -769,6 +877,7 @@ final class SessionManager: ObservableObject {
                 pendingManifestForRetry = nil
                 retryKind = nil
                 unresolvedIssue = nil
+                releaseSessionLock()
                 Log.session.info(
                     "Failure record persisted on retry for session \(pending.sessionID.uuidString, privacy: .public); call resetAfterFailure() to continue."
                 )
@@ -817,6 +926,9 @@ final class SessionManager: ObservableObject {
         pendingManifestForRetry = nil
         retryKind = nil
         unresolvedIssue = nil
+        // This process no longer owns the session's lifecycle; its on-disk
+        // state becomes eligible for abandoned-recording recovery.
+        releaseSessionLock()
     }
 
     /// Explicitly clears a resolved failure and returns to `.idle`. Only
@@ -833,7 +945,80 @@ final class SessionManager: ObservableObject {
         activeSession = nil
         currentSessionPaths = nil
         currentSessionLogger = nil
+        releaseSessionLock()
         transition(to: .idle)
+    }
+
+    // MARK: - Application termination
+
+    /// Outcome of `shutdownForApplicationTermination`.
+    enum ApplicationTerminationOutcome: Equatable, Sendable {
+        /// No recording runtime and no in-flight Start remain.
+        case released
+        /// The bound elapsed first. Nothing is cleaned up destructively;
+        /// whatever is durable on disk is left for next-launch recovery.
+        case timedOut
+    }
+
+    /// The synchronous half of application termination: permanently closes
+    /// Start admission and, if a recording is live, begins the one shared
+    /// shutdown with the `.applicationTerminating` trigger. If a shutdown is
+    /// already in flight (for example a user Stop), it is left untouched and
+    /// its own trigger decides the `endReason`. Idempotent; never restarts
+    /// anything.
+    func beginApplicationTermination() {
+        guard !isApplicationTerminating else { return }
+        isApplicationTerminating = true
+        Log.session.info("Application termination began; Start admission closed")
+        if state == .recording, let runtime = currentRuntime {
+            requestShutdown(runtimeID: runtime.id, trigger: .applicationTerminating)
+        }
+    }
+
+    /// Begins application termination (see `beginApplicationTermination`)
+    /// and waits, up to `timeout`, until this instance no longer owns a
+    /// recording runtime and no Start is in flight. A Start suspended at
+    /// termination unwinds on its own without establishing a recording.
+    ///
+    /// Polls rather than awaiting the shutdown task directly, so the bound
+    /// holds even if finalization I/O stalls — mirroring the downstream
+    /// services' `shutdown(timeout:)` idiom.
+    @discardableResult
+    func shutdownForApplicationTermination(
+        timeout: TimeInterval = SessionManager.defaultApplicationTerminationTimeout,
+        pollInterval: TimeInterval = 0.02
+    ) async -> ApplicationTerminationOutcome {
+        beginApplicationTermination()
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(Int64(max(timeout, 0) * 1_000)))
+        let pollNanoseconds = UInt64(max(pollInterval, 0.001) * 1_000_000_000)
+
+        while currentRuntime != nil || isStartInFlight {
+            if clock.now >= deadline {
+                Log.session.error("Recording did not release within the application-termination bound")
+                return .timedOut
+            }
+            try? await Task.sleep(nanoseconds: pollNanoseconds)
+        }
+        return .released
+    }
+
+    /// Test-only: whether this instance currently holds a session
+    /// directory ownership lock.
+    var holdsSessionDirectoryLockForTesting: Bool {
+        currentSessionLock?.isHeld ?? false
+    }
+
+    private func throwIfApplicationTerminating() throws {
+        if isApplicationTerminating {
+            throw SessionStartAbort.applicationTerminating
+        }
+    }
+
+    private func releaseSessionLock() {
+        currentSessionLock?.release()
+        currentSessionLock = nil
     }
 
     private func transition(to newState: RecordingState) {

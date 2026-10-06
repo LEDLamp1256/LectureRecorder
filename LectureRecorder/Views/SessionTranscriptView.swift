@@ -145,6 +145,11 @@ struct SessionTranscriptView: View {
             Text("Recorded \(entry.manifest.creationDate.formatted(date: .abbreviated, time: .shortened)) · \(entry.manifest.chunks.count) chunks")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+            if let recordingStatus = SessionRecordingStatusDisplay.detailStatus(for: entry.manifest) {
+                Label(recordingStatus, systemImage: "exclamationmark.triangle")
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
+            }
         }
     }
 

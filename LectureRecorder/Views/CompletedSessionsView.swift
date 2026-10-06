@@ -72,6 +72,11 @@ struct CompletedSessionsView: View {
                     Text("\(entry.manifest.chunks.count) chunks · \(entry.manifest.creationDate.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let caption = SessionRecordingStatusDisplay.listCaption(for: entry.manifest) {
+                        Text(caption)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                 }
                 .tag(entry.manifest.sessionID)
             }
@@ -126,7 +131,10 @@ struct CompletedSessionsView: View {
         .task {
             presenter.reload()
         }
-        .onChange(of: sessionManager.lastCompletedSession?.sessionID) { oldValue, newValue in
+        // Any terminal recording finalization (completed or failed) refreshes
+        // the list, so a recording that failed in this app appears without
+        // a manual Refresh.
+        .onChange(of: sessionManager.lastFinalizedSessionID) { oldValue, newValue in
             presenter.refreshAfterFinalization(oldLastCompletedSessionID: oldValue, newLastCompletedSessionID: newValue)
         }
         .alert(
@@ -195,6 +203,45 @@ struct CompletedSessionsView: View {
                 presenter.reload()
             }
             importErrorMessage = error.localizedDescription
+        }
+    }
+}
+
+/// User-facing text for a listed session's terminal recording status.
+/// Never presents `.interrupted` or `.failed` as completed; a clean user
+/// Stop shows nothing extra.
+nonisolated enum SessionRecordingStatusDisplay {
+    /// A short caption for the session list row, or `nil` for an ordinary
+    /// completed session.
+    static func listCaption(for manifest: SessionManifest) -> String? {
+        switch manifest.status {
+        case .interrupted:
+            return "Interrupted recording"
+        case .failed:
+            return "Recording failed"
+        case .completed:
+            return manifest.endReason == .appTerminated ? "Ended when the app quit" : nil
+        case .recording:
+            return nil
+        }
+    }
+
+    /// The status line for the session detail metadata, or `nil` for an
+    /// ordinary completed session. A failed session includes its existing
+    /// `failureDescription`.
+    static func detailStatus(for manifest: SessionManifest) -> String? {
+        switch manifest.status {
+        case .interrupted:
+            return "Interrupted recording — recovered after the app stopped unexpectedly. Audio saved before the interruption is available."
+        case .failed:
+            if let description = manifest.failureDescription, !description.isEmpty {
+                return "Recording failed: \(description)"
+            }
+            return "Recording failed."
+        case .completed:
+            return manifest.endReason == .appTerminated ? "Recording ended when the app quit." : nil
+        case .recording:
+            return nil
         }
     }
 }
