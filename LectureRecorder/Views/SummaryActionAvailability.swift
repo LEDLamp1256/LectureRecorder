@@ -95,13 +95,16 @@ nonisolated enum SummaryActionAvailabilityCalculator {
                 // `LectureSummaryGenerationService.run()` would itself
                 // deterministically refuse a Continue for this generation
                 // before ever reaching classification. Never offered here
-                // either.
-                return SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+                // either. A fresh Generate against the currently usable
+                // Notes generation is: it mints a new Summary generation ID
+                // and never touches this one's files.
+                return freshGenerateOnly(currentUsableNotesGenerationID: currentUsableNotesGenerationID)
             }
             return SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: false)
         case .resumable(_, let interruption):
             guard case .normal = advisoryStateIntegrity else {
-                return SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+                // Same as `.readyForSynthesis` above.
+                return freshGenerateOnly(currentUsableNotesGenerationID: currentUsableNotesGenerationID)
             }
             let isRetry: Bool
             if case .recoverableFailure = interruption { isRetry = true } else { isRetry = false }
@@ -148,10 +151,28 @@ nonisolated enum SummaryActionAvailabilityCalculator {
             )
         }
     }
+
+    /// Generate against the currently usable Notes generation only — never
+    /// Continue/Retry — and only when one exists.
+    private static func freshGenerateOnly(currentUsableNotesGenerationID: UUID?) -> SummaryActionAvailability {
+        SummaryActionAvailability(
+            canGenerate: currentUsableNotesGenerationID != nil,
+            generateNotesGenerationID: currentUsableNotesGenerationID,
+            canContinueOrRetry: false,
+            canCancel: false,
+            continueOrRetryIsRetry: false
+        )
+    }
 }
 
 nonisolated enum SummaryRecoveryMessage {
     static let incompatibleProvenance = "This generation was created by an earlier, incompatible Summary version and can't be resumed. Choose Generate Summary to start a new generation."
+    /// Shown when a resumable generation's advisory recovery state can't be
+    /// trusted, in place of the raw reason (which can carry file-system
+    /// error text). The second form applies when no usable Notes exist to
+    /// generate from.
+    static let advisoryStateProblem = "Saved progress can't be resumed safely. Choose Generate Summary to start over."
+    static let advisoryStateProblemWithoutNotes = "Saved progress can't be resumed safely. Generate completed Notes first to start a new Summary."
 }
 
 /// Pure mapping from a `LectureSummaryGenerationService.AdmissionResult` to

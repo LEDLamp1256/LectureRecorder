@@ -92,14 +92,34 @@ final class SummaryActionAvailabilityTests: XCTestCase {
         XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: false))
     }
 
-    func testReadyForSynthesisWithAdvisoryProblemOffersNoActions() throws {
+    func testReadyForSynthesisWithAdvisoryProblemOffersOnlyFreshGenerate() throws {
         let generation = try makeGeneration()
         let availability = SummaryActionAvailabilityCalculator.availability(
             displayState: .loaded(record: generation, classification: .readyForSynthesis(analyses: []), advisoryStateIntegrity: .problem(reason: "mismatch")),
             currentUsableNotesGenerationID: currentNotesID,
             ownership: .none
         )
-        XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: true, generateNotesGenerationID: currentNotesID, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+    }
+
+    func testAdvisoryProblemWithoutUsableNotesOffersNoActions() throws {
+        let generation = try makeGeneration()
+        for classification: SummaryGenerationRecoveryClassification in [
+            .readyForSynthesis(analyses: []),
+            .resumable(nextBatchIndex: 1, interruption: .cancelled)
+        ] {
+            let availability = SummaryActionAvailabilityCalculator.availability(
+                displayState: .loaded(record: generation, classification: classification, advisoryStateIntegrity: .problem(reason: "mismatch")),
+                currentUsableNotesGenerationID: nil,
+                ownership: .none
+            )
+            XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        }
+    }
+
+    func testAdvisoryProblemWordingIsFixed() {
+        XCTAssertEqual(SummaryRecoveryMessage.advisoryStateProblem, "Saved progress can't be resumed safely. Choose Generate Summary to start over.")
+        XCTAssertFalse(SummaryRecoveryMessage.advisoryStateProblemWithoutNotes.contains("Choose Generate Summary"))
     }
 
     func testResumableNonFailureOffersContinueLabel() throws {
@@ -122,14 +142,14 @@ final class SummaryActionAvailabilityTests: XCTestCase {
         XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: true))
     }
 
-    func testResumableWithAdvisoryProblemOffersNoActions() throws {
+    func testResumableWithAdvisoryProblemOffersOnlyFreshGenerate() throws {
         let generation = try makeGeneration()
         let availability = SummaryActionAvailabilityCalculator.availability(
             displayState: .loaded(record: generation, classification: .resumable(nextBatchIndex: 1, interruption: .recoverableFailure(description: "boom")), advisoryStateIntegrity: .problem(reason: "mismatch")),
             currentUsableNotesGenerationID: currentNotesID,
             ownership: .none
         )
-        XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: false, generateNotesGenerationID: nil, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        XCTAssertEqual(availability, SummaryActionAvailability(canGenerate: true, generateNotesGenerationID: currentNotesID, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
     }
 
     // MARK: - Stale source: never Continue/Retry, fresh Generate only when a current Notes generation exists

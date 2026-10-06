@@ -13,6 +13,21 @@ struct UnresolvedSessionIssue: Equatable, Sendable {
     let canRetry: Bool
 }
 
+/// A recording that stopped because an operational failure — not a user
+/// Stop or app termination — initiated its shutdown. Memory-only: never
+/// persisted, and the session's manifest is finalized exactly as before.
+/// `id` is unique per occurrence so observers can act once per event.
+struct UnexpectedRecordingStop: Equatable, Sendable {
+    let id: UUID
+    let sessionID: UUID
+    /// Fixed, user-facing wording for the initiating failure — never the
+    /// underlying error text.
+    let reason: String
+    /// Whether the session's final manifest was durably written. When
+    /// `false`, an `unresolvedIssue` for the session is also present.
+    let finalizationConfirmed: Bool
+}
+
 /// Distinguishes what a pending retry is trying to accomplish, so
 /// `retryResolution()` knows how to finish the job on success.
 private enum RetryKind {
@@ -45,6 +60,20 @@ private enum OperationalFailureCause {
             return "Chunk sequence violation: expected chunk #\(expected), got #\(got)"
         case .interiorManifestPersistenceFailure(let error):
             return "Failed to persist finalized chunk metadata: \(error.localizedDescription)"
+        }
+    }
+
+    /// Sanitized wording for an unexpected-stop notice.
+    var userFacingReason: String {
+        switch self {
+        case .captureFailure, .captureStopOutcomeFailure:
+            return "The audio input changed or stopped working."
+        case .writerStreamFailure:
+            return "Audio couldn't be written to disk."
+        case .chunkSequenceViolation:
+            return "The audio writer reported an unexpected error."
+        case .interiorManifestPersistenceFailure:
+            return "Recording progress couldn't be saved to disk."
         }
     }
 
@@ -113,6 +142,10 @@ private final class RecordingRuntime {
     /// Set once, when the shared shutdown task is created, if application
     /// termination was the trigger that began it.
     var shutdownInitiatedByApplicationTermination = false
+    /// Set once, when the shared shutdown task is created, if an
+    /// operational failure was the trigger that began it. A failure that
+    /// only joins an already-begun shutdown never sets this.
+    var shutdownInitiatingOperationalFailure: OperationalFailureCause?
 
     init(id: UUID, writer: any AudioChunkWriting, paths: SessionPaths) {
         self.id = id
@@ -177,6 +210,10 @@ final class SessionManager: ObservableObject {
     /// A memory-only refresh signal for session lists; never persisted and
     /// never a source of truth for the session's status.
     @Published private(set) var lastFinalizedSessionID: UUID?
+    /// The most recent recording an operational failure stopped, until the
+    /// user acknowledges it or starts a new recording. Memory-only domain
+    /// state; presentation and attention side effects belong to observers.
+    @Published private(set) var unexpectedRecordingStop: UnexpectedRecordingStop?
 
     /// The default bound `shutdownForApplicationTermination` waits for the
     /// recording lifecycle to release. Independent of — and deliberately
@@ -247,6 +284,13 @@ final class SessionManager: ObservableObject {
         unresolvedIssue != nil
     }
 
+    /// Clears the unexpected-stop notice if it is still the one identified
+    /// by `id`; a newer notice is left in place.
+    func acknowledgeUnexpectedRecordingStop(id: UUID) {
+        guard unexpectedRecordingStop?.id == id else { return }
+        unexpectedRecordingStop = nil
+    }
+
     func refreshPermissionStatus() async {
         lastKnownPermissionStatus = permissionService.currentStatus()
     }
@@ -279,6 +323,8 @@ final class SessionManager: ObservableObject {
 
         isStartInFlight = true
         defer { isStartInFlight = false }
+        // An explicit new Start supersedes any earlier notice.
+        unexpectedRecordingStop = nil
 
         transition(to: .requestingPermission)
         let status = await permissionService.requestPermission()
@@ -663,6 +709,9 @@ final class SessionManager: ObservableObject {
         if case .applicationTerminating = trigger {
             runtime.shutdownInitiatedByApplicationTermination = true
         }
+        if case .operational(let cause) = trigger {
+            runtime.shutdownInitiatingOperationalFailure = cause
+        }
 
         // Strong self-capture, deliberately: the shutdown task must
         // finish tearing down capture and writer resources even if
@@ -760,6 +809,7 @@ final class SessionManager: ObservableObject {
 
             currentRuntime = nil
             transition(to: finalManifest.status == .completed ? .completed : .failed(finalManifest.failureDescription ?? "Recording failed."))
+            publishUnexpectedStopIfInitiatedByFailure(runtime: runtime, sessionID: finalManifest.sessionID, finalizationConfirmed: true)
             Log.session.info(
                 "Session ended: \(finalManifest.sessionID.uuidString, privacy: .public) status=\(finalManifest.status.rawValue, privacy: .public)"
             )
@@ -786,7 +836,22 @@ final class SessionManager: ObservableObject {
             // manifest is left for next-launch abandoned-recording recovery.
             currentRuntime = nil
             transition(to: .failed(finalManifest.failureDescription ?? error.localizedDescription))
+            publishUnexpectedStopIfInitiatedByFailure(runtime: runtime, sessionID: finalManifest.sessionID, finalizationConfirmed: false)
         }
+    }
+
+    /// Publishes one `UnexpectedRecordingStop` for a runtime whose shared
+    /// shutdown an operational failure began — never for a shutdown a user
+    /// Stop or app termination began, whatever failures joined it later.
+    /// Called exactly once per runtime, after finalization settled.
+    private func publishUnexpectedStopIfInitiatedByFailure(runtime: RecordingRuntime, sessionID: UUID, finalizationConfirmed: Bool) {
+        guard let cause = runtime.shutdownInitiatingOperationalFailure else { return }
+        unexpectedRecordingStop = UnexpectedRecordingStop(
+            id: UUID(),
+            sessionID: sessionID,
+            reason: cause.userFacingReason,
+            finalizationConfirmed: finalizationConfirmed
+        )
     }
 
     // MARK: - Stop

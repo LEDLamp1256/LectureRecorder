@@ -35,6 +35,9 @@ final class SessionTranscriptPresenter: ObservableObject {
     @Published private(set) var segments: [OrderedSegment] = []
     /// Non-`nil` only for a completed transcript whose navigation loaded.
     @Published private(set) var navigation: TranscriptPlaybackNavigation?
+    /// Non-`nil` only for an incomplete/interrupted/recovery-pending status
+    /// whose failed-part overview loaded.
+    @Published private(set) var failureOverview: TranscriptionFailureOverview?
 
     init(
         loader: any CompletedSessionStatusLoading,
@@ -58,6 +61,18 @@ final class SessionTranscriptPresenter: ObservableObject {
 
         var loadedSegments: [OrderedSegment] = []
         var loadedNavigation: TranscriptPlaybackNavigation?
+        var loadedFailureOverview: TranscriptionFailureOverview?
+        switch loadedStatus {
+        case .incomplete, .interrupted, .recoveryPending:
+            loadedFailureOverview = await loader.peekFailureOverview(
+                sessionID: sessionID,
+                manifest: entry.manifest,
+                sessionPaths: entry.sessionPaths
+            )
+            guard myGeneration == generation else { return }
+        default:
+            break
+        }
         if case .completed = loadedStatus {
             let fetchedSegments = await loader.peekOrderedSegments(
                 sessionID: sessionID,
@@ -82,5 +97,6 @@ final class SessionTranscriptPresenter: ObservableObject {
         status = loadedStatus
         segments = loadedSegments
         navigation = loadedNavigation
+        failureOverview = loadedFailureOverview
     }
 }

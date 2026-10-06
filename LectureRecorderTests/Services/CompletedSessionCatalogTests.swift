@@ -309,4 +309,76 @@ final class CompletedSessionCatalogTests: XCTestCase {
             "ordering must be stable across repeated calls, not merely correct once"
         )
     }
+
+    // MARK: - T7-C1: "sessions can't be shown" indicator
+
+    func testCatalogProblemsCountOnlyRealSessionRecordsWithFixedReasons() throws {
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        // Stray non-session entries: never counted.
+        try FileManager.default.createDirectory(at: tempRoot.appendingPathComponent("not-a-uuid", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tempRoot.appendingPathComponent("Exports", isDirectory: true), withIntermediateDirectories: true)
+
+        let goodID = UUID()
+        try writeCompletedSession(sessionID: goodID)
+
+        let corruptID = UUID()
+        let corruptPaths = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempRoot, sessionID: corruptID)
+        try Data("{\"raw decoder diagnostic\": ".utf8).write(to: corruptPaths.manifestURL)
+
+        let missingID = UUID()
+        _ = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempRoot, sessionID: missingID)
+
+        let ineligibleID = UUID()
+        try writeCompletedSession(sessionID: ineligibleID, chunkState: .recording)
+
+        let catalog = try makeCatalog()
+        let result = try catalog.listCompletedSessions()
+        XCTAssertEqual(result.sessions.map(\.manifest.sessionID), [goodID], "problem sessions must stay excluded")
+
+        let problems = CompletedSessionCatalogProblem.problems(from: result.errors)
+        XCTAssertEqual(problems.count, 3)
+        XCTAssertEqual(Set(problems.map(\.sessionID)), [corruptID, missingID, ineligibleID])
+        let byID = Dictionary(uniqueKeysWithValues: problems.map { ($0.sessionID, $0.reason) })
+        XCTAssertEqual(byID[corruptID], "unreadable record")
+        XCTAssertEqual(byID[missingID], "missing record")
+        XCTAssertEqual(byID[ineligibleID], "fails safety checks")
+        for problem in problems {
+            XCTAssertEqual(problem.shortSessionID, String(problem.sessionID.uuidString.prefix(8)))
+            XCTAssertFalse(problem.reason.contains("decoder"))
+        }
+        XCTAssertEqual(CompletedSessionCatalogProblem.summary(count: problems.count), "3 sessions can't be shown")
+        XCTAssertEqual(CompletedSessionCatalogProblem.summary(count: 1), "1 session can't be shown")
+    }
+
+    func testCatalogProblemReasonMappingForEveryErrorKind() {
+        let id = UUID()
+        XCTAssertNil(CompletedSessionCatalogProblem.problem(for: .invalidSessionDirectoryName("x")))
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .unsafeSessionDirectory(id))?.reason, "fails safety checks")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .manifestUnavailable(id))?.reason, "missing record")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .corruptManifest(id, "Unexpected character at line 1"))?.reason, "unreadable record")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .ineligible(id, .unsupportedManifestSchema(99)))?.reason, "unsupported format")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .ineligible(id, .sessionIdentityMismatch))?.reason, "fails safety checks")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .ineligible(id, .chunksDirectoryUnsafe))?.reason, "fails safety checks")
+        XCTAssertEqual(CompletedSessionCatalogProblem.problem(for: .ineligible(id, .nonCompletedChunk(sequenceNumber: 0)))?.reason, "fails safety checks")
+    }
+
+    func testListingWithProblemSessionsRemainsReadOnly() throws {
+        let corruptID = UUID()
+        let corruptPaths = try DefaultFileSystemLocator.buildPaths(rootDirectory: tempRoot, sessionID: corruptID)
+        let corruptBytes = Data("corrupt".utf8)
+        try corruptBytes.write(to: corruptPaths.manifestURL)
+        let ineligibleID = UUID()
+        let ineligiblePaths = try writeCompletedSession(sessionID: ineligibleID, chunkState: .recording)
+        let ineligibleBytes = try Data(contentsOf: ineligiblePaths.manifestURL)
+        let rootListingBefore = try FileManager.default.contentsOfDirectory(atPath: tempRoot.path).sorted()
+
+        let catalog = try makeCatalog()
+        _ = try catalog.listCompletedSessions()
+        _ = try catalog.listCompletedSessions()
+
+        XCTAssertEqual(try Data(contentsOf: corruptPaths.manifestURL), corruptBytes)
+        XCTAssertEqual(try Data(contentsOf: ineligiblePaths.manifestURL), ineligibleBytes)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: tempRoot.path).sorted(), rootListingBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ineligiblePaths.sessionDirectory.appendingPathComponent("transcription").path))
+    }
 }

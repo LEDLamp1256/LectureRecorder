@@ -69,13 +69,17 @@ nonisolated enum NotesActionAvailabilityCalculator {
                 // deterministically refuse a Continue for this generation
                 // before ever reaching classification — see
                 // `operationStateIdentity`/`loadOperationState`'s catch
-                // block. Never offered here either.
-                return NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+                // block. Never offered here either. A fresh Generate is:
+                // `.loaded` is only reached once the current transcript
+                // source loaded, and Generate mints a new generation ID
+                // and never touches this one's files.
+                return NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
             }
             return NotesActionAvailability(canGenerate: false, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: false)
         case .resumable(_, let interruption):
             guard case .normal = advisoryStateIntegrity else {
-                return NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+                // Same as `.readyForSynthesis` above.
+                return NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
             }
             let isRetry: Bool
             if case .recoverableFailure = interruption { isRetry = true } else { isRetry = false }
@@ -101,6 +105,11 @@ nonisolated enum NotesActionAvailabilityCalculator {
 /// User-facing recovery wording shared by the Notes view and its tests.
 nonisolated enum NotesRecoveryMessage {
     static let incompatibleProvenance = "This generation was created by an earlier, incompatible Notes version and can't be resumed. Choose Generate Notes to start a new generation."
+    /// Shown when a resumable generation's advisory recovery state can't be
+    /// trusted. Replaces the raw reason, which can carry file-system error text.
+    static let advisoryStateProblem = "Saved progress can't be resumed safely. Choose Generate Notes to start over."
+    static let transcriptRequiredTitle = "Transcript Required"
+    static let transcriptRequiredDescription = "Finish transcribing this lecture before generating Notes."
 }
 
 /// Pure mapping from a `LectureNotesGenerationService.AdmissionResult` to

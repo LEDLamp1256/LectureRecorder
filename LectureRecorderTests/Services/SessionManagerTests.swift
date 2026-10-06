@@ -1623,3 +1623,254 @@ final class SessionManagerTests: XCTestCase {
         lock.release()
     }
 }
+
+// MARK: - T7-C3: unexpected recording-stop signal
+
+extension SessionManagerTests {
+    /// Every non-nil `unexpectedRecordingStop` value published, in order.
+    @MainActor
+    private final class UnexpectedStopRecorder {
+        private(set) var events: [UnexpectedRecordingStop] = []
+        private var subscription: AnyCancellable?
+
+        init(_ manager: SessionManager) {
+            subscription = manager.$unexpectedRecordingStop.sink { [weak self] event in
+                if let event { self?.events.append(event) }
+            }
+        }
+    }
+
+    private func waitForTerminalState(file: StaticString = #filePath, line: UInt = #line) async {
+        await waitUntil(file: file, line: line) {
+            switch self.sessionManager.state {
+            case .failed, .completed: return true
+            default: return false
+            }
+        }
+    }
+
+    func testOperationalFailureThatInitiatesShutdownPublishesOneUnexpectedStop() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        writer.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+
+        XCTAssertEqual(recorder.events.count, 1)
+        let event = try XCTUnwrap(recorder.events.first)
+        XCTAssertEqual(event.sessionID, sessionID)
+        XCTAssertEqual(event.reason, "Audio couldn't be written to disk.")
+        XCTAssertFalse(event.reason.contains("Injected"), "the alert reason never carries raw error text")
+        XCTAssertTrue(event.finalizationConfirmed)
+        XCTAssertEqual(sessionManager.unexpectedRecordingStop, event)
+
+        // Existing finalization semantics are unchanged.
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .failed)
+        XCTAssertEqual(persisted.endReason, .error)
+        XCTAssertFalse(persisted.endedCleanly)
+        XCTAssertEqual(persisted.failureDescription, "Audio writer failure: Injected test failure")
+        guard case .failed = sessionManager.state else { return XCTFail("expected .failed, got \(sessionManager.state)") }
+        XCTAssertEqual(sessionManager.lastFinalizedSessionID, sessionID)
+    }
+
+    func testUnexpectedStopNeverRestartsRecording() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let probeCount = OSAllocatedUnfairLock(initialState: 0)
+        captureService.setStartCommitHookForTesting { _, _ in probeCount.withLock { $0 += 1 } }
+        await sessionManager.startSession()
+
+        writer.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+        for _ in 0..<50 { await Task.yield() }
+
+        XCTAssertEqual(probeCount.withLock { $0 }, 1, "capture is never started again on its own")
+        XCTAssertNil(sessionManager.activeSession)
+        XCTAssertFalse(sessionManager.canStop)
+        XCTAssertEqual(try sessionDirectories().count, 1, "no new session directory appears")
+        guard case .failed = sessionManager.state else { return XCTFail("expected .failed, got \(sessionManager.state)") }
+    }
+
+    func testUserStopPublishesNoUnexpectedStop() async throws {
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        await sessionManager.stopSession()
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertTrue(recorder.events.isEmpty)
+        XCTAssertNil(sessionManager.unexpectedRecordingStop)
+    }
+
+    func testApplicationTerminationPublishesNoUnexpectedStop() async throws {
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+        XCTAssertEqual(outcome, .released)
+        XCTAssertEqual(sessionManager.state, .completed)
+        XCTAssertTrue(recorder.events.isEmpty)
+    }
+
+    func testOperationalFailureArrivingAfterUserStopPublishesNoUnexpectedStop() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        // User Stop creates the shared shutdown first; it then waits for the
+        // writer stream, which ends with a failure that joins it.
+        let stop = Task { @MainActor in await self.sessionManager.stopSession() }
+        await waitUntil { self.sessionManager.state == .stopping }
+        writer.failStream(TestInjectedError.injected)
+        await stop.value
+
+        XCTAssertTrue(recorder.events.isEmpty)
+        // The joining failure still decides the persisted outcome, as before.
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .failed)
+        XCTAssertEqual(persisted.endReason, .error)
+    }
+
+    func testOperationalFailureArrivingAfterApplicationTerminationPublishesNoUnexpectedStop() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+
+        sessionManager.beginApplicationTermination()
+        XCTAssertEqual(sessionManager.state, .stopping)
+        writer.failStream(TestInjectedError.injected)
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        let outcome = await sessionManager.shutdownForApplicationTermination(timeout: 5)
+
+        XCTAssertEqual(outcome, .released)
+        XCTAssertTrue(recorder.events.isEmpty)
+        let persisted = try readPersistedManifest(sessionID: sessionID)
+        XCTAssertEqual(persisted.status, .failed)
+    }
+
+    func testDuplicateFailureCallbacksInOneShutdownPublishOnlyOneEvent() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+
+        writer.failStream(TestInjectedError.injected)
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        captureService.simulateAsyncFailure(TestInjectedError.injected)
+        await waitForTerminalState()
+        for _ in 0..<50 { await Task.yield() }
+
+        XCTAssertEqual(recorder.events.count, 1)
+        XCTAssertEqual(Set(recorder.events.map(\.id)).count, 1)
+    }
+
+    func testUnresolvedFinalizationAfterFailureStillNotifiesWithoutClaimingTheSaveSucceeded() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        await failingStore.setWriteManifestFailureQueue([true])
+
+        writer.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+
+        XCTAssertNotNil(sessionManager.unresolvedIssue, "existing unresolved-finalization behavior is unchanged")
+        XCTAssertEqual(recorder.events.count, 1)
+        XCTAssertEqual(recorder.events.first?.sessionID, sessionID)
+        XCTAssertEqual(recorder.events.first?.finalizationConfirmed, false)
+    }
+
+    func testUnexpectedStopIsMemoryOnlyAndNeverPersisted() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        await sessionManager.startSession()
+        let sessionID = try XCTUnwrap(sessionManager.activeSession?.sessionID)
+        writer.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+        XCTAssertNotNil(sessionManager.unexpectedRecordingStop)
+
+        let manifestURL = sessionDirectory(sessionID).appendingPathComponent("session.json")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
+        XCTAssertTrue(json.keys.filter { $0.lowercased().contains("unexpected") }.isEmpty)
+        let files = try FileManager.default.subpathsOfDirectory(atPath: sessionDirectory(sessionID).path)
+        XCTAssertTrue(files.filter { $0.lowercased().contains("unexpected") }.isEmpty)
+
+        // A fresh instance over the same storage starts with no event.
+        let relaunched = SessionManager(
+            store: failingStore,
+            permissionService: permissionService,
+            captureService: MockAudioCaptureService(formatToPrepare: makeTestAudioFormat()),
+            chunkWriterFactory: FakeAudioChunkWriterFactory()
+        )
+        XCTAssertNil(relaunched.unexpectedRecordingStop)
+    }
+
+    func testAcknowledgeClearsOnlyTheMatchingEventAndAnExplicitStartClearsIt() async throws {
+        let firstWriter = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(firstWriter)
+        await sessionManager.startSession()
+        firstWriter.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+        let event = try XCTUnwrap(sessionManager.unexpectedRecordingStop)
+
+        sessionManager.acknowledgeUnexpectedRecordingStop(id: UUID())
+        XCTAssertEqual(sessionManager.unexpectedRecordingStop, event, "a stale/unknown ID never clears the current event")
+        sessionManager.acknowledgeUnexpectedRecordingStop(id: event.id)
+        XCTAssertNil(sessionManager.unexpectedRecordingStop)
+
+        // An unacknowledged event is cleared by the next explicit Start.
+        sessionManager.resetAfterFailure()
+        let secondWriter = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(secondWriter)
+        await sessionManager.startSession()
+        secondWriter.failStream(TestInjectedError.injected)
+        await waitForTerminalState()
+        XCTAssertNotNil(sessionManager.unexpectedRecordingStop)
+        sessionManager.resetAfterFailure()
+        chunkWriterFactory.setWriterToReturn(FakeAudioChunkWriter())
+        await sessionManager.startSession()
+        XCTAssertEqual(sessionManager.state, .recording)
+        XCTAssertNil(sessionManager.unexpectedRecordingStop)
+        await sessionManager.stopSession()
+    }
+
+    func testSecondDistinctFailurePublishesASecondDistinctEvent() async throws {
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        for _ in 0..<2 {
+            let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+            chunkWriterFactory.setWriterToReturn(writer)
+            await sessionManager.startSession()
+            writer.failStream(TestInjectedError.injected)
+            await waitForTerminalState()
+            sessionManager.resetAfterFailure()
+        }
+        XCTAssertEqual(recorder.events.count, 2)
+        XCTAssertNotEqual(recorder.events[0].id, recorder.events[1].id)
+        XCTAssertNotEqual(recorder.events[0].sessionID, recorder.events[1].sessionID)
+    }
+
+    func testFailureInitiatedShutdownStillNotifiesWhenUserStopThenJoinsIt() async throws {
+        let writer = FakeAudioChunkWriter(finishRecordingAutoTerminatesStream: false)
+        chunkWriterFactory.setWriterToReturn(writer)
+        let recorder = UnexpectedStopRecorder(sessionManager)
+        await sessionManager.startSession()
+        await failingStore.armWriteManifestGate()
+
+        // The failure begins the shutdown; a user Stop then only joins it.
+        writer.failStream(TestInjectedError.injected)
+        await waitUntil { self.sessionManager.state == .stopping }
+        let stop = Task { @MainActor in await self.sessionManager.stopSession() }
+        await waitUntil { await self.failingStore.isWriteManifestGateHeld() }
+        await failingStore.releaseWriteManifestGate()
+        await stop.value
+
+        XCTAssertEqual(recorder.events.count, 1)
+        guard case .failed = sessionManager.state else { return XCTFail("expected .failed, got \(sessionManager.state)") }
+    }
+}

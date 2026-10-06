@@ -436,15 +436,15 @@ struct SessionNotesView: View {
         case .completed:
             Label("Notes ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .readyForSynthesis:
-            if case .problem(let reason) = advisoryStateIntegrity {
-                Label("Ready to synthesize, but cannot resume automatically — \(reason)", systemImage: "exclamationmark.triangle")
+            if case .problem = advisoryStateIntegrity {
+                Label(NotesRecoveryMessage.advisoryStateProblem, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             } else {
                 Label("Ready to synthesize", systemImage: "hourglass")
             }
         case .resumable(let nextWindowIndex, let interruption):
-            if case .problem(let reason) = advisoryStateIntegrity {
-                Label("Cannot resume automatically — \(reason)", systemImage: "exclamationmark.triangle")
+            if case .problem = advisoryStateIntegrity {
+                Label(NotesRecoveryMessage.advisoryStateProblem, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             } else {
                 Label(resumableLabel(nextWindowIndex: nextWindowIndex, interruption: interruption), systemImage: "exclamationmark.arrow.triangle.2.circlepath")
@@ -558,11 +558,17 @@ struct SessionNotesView: View {
         switch presenter.displayState {
         case .loaded(_, .completed(let document), _):
             notesDocument(document)
-        case .noGeneration:
+        case .noGeneration(transcriptSourceReady: true):
             ContentUnavailableView(
                 "No Notes Yet",
                 systemImage: "doc.text",
                 description: Text("Generate structured notes for this lecture once you're ready.")
+            )
+        case .noGeneration(transcriptSourceReady: false):
+            ContentUnavailableView(
+                NotesRecoveryMessage.transcriptRequiredTitle,
+                systemImage: "text.badge.xmark",
+                description: Text(NotesRecoveryMessage.transcriptRequiredDescription)
             )
         default:
             EmptyView()

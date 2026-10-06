@@ -27,6 +27,7 @@ struct CompletedSessionsView: View {
     @State private var isChoosingImportFile = false
     @State private var isImporting = false
     @State private var importErrorMessage: String?
+    @State private var isShowingCatalogProblems = false
 
     init(
         catalog: CompletedSessionCatalog,
@@ -160,6 +161,10 @@ struct CompletedSessionsView: View {
     private var importBar: some View {
         VStack(spacing: 0) {
             Divider()
+            if !catalogProblems.isEmpty {
+                catalogProblemsRow
+                Divider()
+            }
             HStack(spacing: 8) {
                 Button {
                     isChoosingImportFile = true
@@ -182,6 +187,45 @@ struct CompletedSessionsView: View {
             .padding(.vertical, 8)
         }
         .background(.bar)
+    }
+
+    private var catalogProblems: [CompletedSessionCatalogProblem] {
+        CompletedSessionCatalogProblem.problems(from: presenter.result?.errors ?? [])
+    }
+
+    /// Read-only notice for session records the catalog skipped. Never makes
+    /// a skipped session selectable; the popover lists only a short ID and a
+    /// fixed reason, never the raw diagnostic.
+    private var catalogProblemsRow: some View {
+        HStack(spacing: 8) {
+            Button {
+                isShowingCatalogProblems = true
+            } label: {
+                Label(CompletedSessionCatalogProblem.summary(count: catalogProblems.count), systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            .buttonStyle(.borderless)
+            .popover(isPresented: $isShowingCatalogProblems, arrowEdge: .top) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(CompletedSessionCatalogProblem.summary(count: catalogProblems.count))
+                        .font(.headline)
+                    ForEach(catalogProblems, id: \.self) { problem in
+                        Text("\(problem.shortSessionID) — \(problem.reason)")
+                            .font(.callout.monospaced())
+                    }
+                    Button {
+                        Task { await sessionManager.revealSessionsFolderInFinder() }
+                    } label: {
+                        Label("Show Sessions Folder", systemImage: "folder")
+                    }
+                }
+                .padding(16)
+                .frame(minWidth: 260, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     /// Imports the chosen file, then reloads and selects the new session.
@@ -243,5 +287,51 @@ nonisolated enum SessionRecordingStatusDisplay {
         case .recording:
             return nil
         }
+    }
+}
+
+/// One session record the catalog could not show, reduced to a short ID and
+/// a fixed reason. Built only from `CompletedSessionCatalogEntryError`s that
+/// name a real session (a UUID-named directory) — a stray non-session entry
+/// under the sessions root is never counted — and never carries the raw
+/// decoder diagnostic of a corrupt manifest.
+nonisolated struct CompletedSessionCatalogProblem: Hashable, Sendable {
+    nonisolated enum Reason: String, Sendable {
+        case unreadableRecord = "unreadable record"
+        case missingRecord = "missing record"
+        case unsupportedFormat = "unsupported format"
+        case failsSafetyChecks = "fails safety checks"
+    }
+
+    let sessionID: UUID
+    let reasonKind: Reason
+
+    /// The first 8 characters of the session UUID.
+    var shortSessionID: String { String(sessionID.uuidString.prefix(8)) }
+    var reason: String { reasonKind.rawValue }
+
+    static func problem(for error: CompletedSessionCatalogEntryError) -> CompletedSessionCatalogProblem? {
+        switch error {
+        case .invalidSessionDirectoryName:
+            return nil
+        case .unsafeSessionDirectory(let id):
+            return CompletedSessionCatalogProblem(sessionID: id, reasonKind: .failsSafetyChecks)
+        case .manifestUnavailable(let id):
+            return CompletedSessionCatalogProblem(sessionID: id, reasonKind: .missingRecord)
+        case .corruptManifest(let id, _):
+            return CompletedSessionCatalogProblem(sessionID: id, reasonKind: .unreadableRecord)
+        case .ineligible(let id, .unsupportedManifestSchema):
+            return CompletedSessionCatalogProblem(sessionID: id, reasonKind: .unsupportedFormat)
+        case .ineligible(let id, _):
+            return CompletedSessionCatalogProblem(sessionID: id, reasonKind: .failsSafetyChecks)
+        }
+    }
+
+    static func problems(from errors: [CompletedSessionCatalogEntryError]) -> [CompletedSessionCatalogProblem] {
+        errors.compactMap(problem(for:))
+    }
+
+    static func summary(count: Int) -> String {
+        count == 1 ? "1 session can't be shown" : "\(count) sessions can't be shown"
     }
 }
