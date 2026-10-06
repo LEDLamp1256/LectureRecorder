@@ -1155,6 +1155,61 @@ final class LectureNotesGenerationServiceTests: XCTestCase {
         XCTAssertEqual(service.lastFailureDescription(forSessionID: sessionID), "Apple Intelligence is turned off.")
     }
 
+    /// Real MLX availability (a blocked full model verification) is awaited
+    /// without blocking the main actor: the service keeps answering
+    /// admission and accepts Cancel mid-verification, and a cancel that
+    /// lands during verification ends the run as `.cancelled` with nothing
+    /// committed.
+    func testCancelDuringMLXModelVerificationIsAcceptedOffMainAndCommitsNothing() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 1)
+        let verification = BlockingVerificationDriverFixture()
+        let generator = ControllableFakeLectureNotesGenerator()
+        let service = makeService(
+            generator: generator,
+            newGenerationAvailabilityChecker: MLXLectureNotesGenerator(sessionDriver: verification.driver),
+            windowBudget: try oneUnitPerWindowBudget()
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+        await waitUntil { verification.verificationEntered }
+        XCTAssertEqual(service.generate(sessionID: sessionID), .busy, "duplicate Notes stays .busy during verification")
+        service.cancel(sessionID: sessionID)
+        XCTAssertFalse(verification.verificationTimedOut, "the main actor must stay responsive while the model is verified")
+
+        verification.releaseVerification()
+        let finalPhase = await waitUntilFinished(service)
+        guard case .finished(.cancelled) = finalPhase else {
+            return XCTFail("expected .cancelled, got \(finalPhase)")
+        }
+        XCTAssertFalse(verification.verificationTimedOut)
+        XCTAssertEqual(try notesStore.listGenerationIDs(sessionPaths: sessionPaths), [], "a cancelled run must create no generation record")
+        let analyzeCalls = await generator.analyzeCalls
+        XCTAssertEqual(analyzeCalls, [])
+    }
+
+    /// After an awaited real MLX verification succeeds, a new generation
+    /// proceeds normally; a later Generate reuses that verification.
+    func testAvailableMLXVerificationAdmitsGenerationAndIsReusedByTheNextGenerate() async throws {
+        try await writeCompletedTranscribedSession(chunkCount: 1)
+        let verification = BlockingVerificationDriverFixture()
+        verification.releaseVerification()
+        let service = makeService(
+            generator: ControllableFakeLectureNotesGenerator(),
+            newGenerationAvailabilityChecker: MLXLectureNotesGenerator(sessionDriver: verification.driver),
+            windowBudget: try oneUnitPerWindowBudget()
+        )
+
+        for _ in 0..<2 {
+            XCTAssertEqual(service.generate(sessionID: sessionID), .admitted)
+            let finalPhase = await waitUntilFinished(service)
+            guard case .finished(.completed) = finalPhase else {
+                return XCTFail("expected .completed, got \(finalPhase)")
+            }
+        }
+        XCTAssertEqual(verification.fullVerificationCount, 1)
+        XCTAssertEqual(try notesStore.listGenerationIDs(sessionPaths: sessionPaths).count, 2)
+    }
+
     /// Continue/Retry always resume an already-persisted generation and
     /// must never consult admission-time backend availability — only
     /// `generate(sessionID:)` (a brand-new generation) does.

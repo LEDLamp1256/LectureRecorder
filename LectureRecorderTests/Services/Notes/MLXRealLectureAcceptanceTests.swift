@@ -858,7 +858,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
 
         nonisolated var nativeContextLength: Int { wrapped.nativeContextLength }
         nonisolated var operationalContextCeiling: Int { wrapped.operationalContextCeiling }
-        nonisolated func availability() -> LectureNotesGenerationAvailability { wrapped.availability() }
+        nonisolated func availability() async -> LectureNotesGenerationAvailability { await wrapped.availability() }
 
         init(wrapped: any MLXSessionDriving, recordsURL: URL? = nil) {
             self.wrapped = wrapped
@@ -1022,7 +1022,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
 
         nonisolated var nativeContextLength: Int { wrapped.nativeContextLength }
         nonisolated var operationalContextCeiling: Int { wrapped.operationalContextCeiling }
-        nonisolated func availability() -> LectureNotesGenerationAvailability { wrapped.availability() }
+        nonisolated func availability() async -> LectureNotesGenerationAvailability { await wrapped.availability() }
 
         init(wrapped: any MLXSessionDriving) {
             self.wrapped = wrapped
@@ -2318,7 +2318,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         let inputItems = source.analyses.flatMap(\.items)
 
         let realDriver = RealMLXSessionDriver(descriptor: selection.descriptor)
-        guard case .available = realDriver.availability() else {
+        guard case .available = await realDriver.availability() else {
             return XCTFail("Pinned MLX model assets are not provisioned/verified.")
         }
         let driver = SynthesisStageRecordingDriver(wrapped: realDriver)
@@ -2464,7 +2464,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         }
 
         let realDriver = RealMLXSessionDriver(descriptor: selection.descriptor)
-        guard case .available = realDriver.availability() else {
+        guard case .available = await realDriver.availability() else {
             return XCTFail("Pinned MLX model assets are not provisioned/verified.")
         }
         let provenance = MLXNotesConfiguration.generationProvenance(for: selection.descriptor)
@@ -2609,7 +2609,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         XCTAssertEqual(transcript.fingerprint, generation.transcriptFingerprint, "source transcript changed since the analyses were generated")
 
         let realDriver = RealMLXSessionDriver(descriptor: selection.descriptor)
-        guard case .available = realDriver.availability() else {
+        guard case .available = await realDriver.availability() else {
             return XCTFail("Pinned MLX model assets are not provisioned/verified.")
         }
         let runID = UUID()
@@ -2809,7 +2809,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         )
 
         let realDriver = RealMLXSessionDriver(descriptor: selection.descriptor)
-        guard case .available = realDriver.availability() else {
+        guard case .available = await realDriver.availability() else {
             return XCTFail("Pinned MLX model assets are not provisioned/verified.")
         }
         let runID = UUID()
@@ -2998,7 +2998,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         )
 
         let realDriver = RealMLXSessionDriver(descriptor: selection.descriptor)
-        guard case .available = realDriver.availability() else {
+        guard case .available = await realDriver.availability() else {
             return XCTFail("Pinned MLX model assets are not provisioned/verified.")
         }
         let runID = UUID()
@@ -3355,7 +3355,7 @@ final class MLXRealLectureAcceptanceTests: XCTestCase {
         // Exactly one real MLX session driver, never downloaded/reprovisioned
         // here — must already be verified in place.
         let realDriver = RealMLXSessionDriver(descriptor: modelDescriptor)
-        switch realDriver.availability() {
+        switch await realDriver.availability() {
         case .available:
             break
         case .unavailable(let description):

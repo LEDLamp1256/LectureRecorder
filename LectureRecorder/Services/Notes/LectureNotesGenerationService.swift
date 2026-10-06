@@ -445,7 +445,14 @@ final class LectureNotesGenerationService: ObservableObject {
             // branch above) always resume an already-persisted generation
             // and never reach here. Checked before minting an ID, before
             // touching `notesStore`, and before any generator/network call.
-            switch newGenerationAvailabilityChecker.availabilityForNewGeneration() {
+            // Awaited (never blocking this actor); a cancellation that lands
+            // meanwhile wins over whatever availability was reported.
+            let availability = await newGenerationAvailabilityChecker.availabilityForNewGeneration()
+            guard !Task.isCancelled else {
+                publish { self.phase = .finished(.cancelled) }
+                return
+            }
+            switch availability {
             case .available:
                 break
             case .unavailable(let description):

@@ -17,6 +17,10 @@ nonisolated enum MLXModelVerificationError: LocalizedError, Sendable, Equatable 
     case fileSizeMismatch(filename: String, expected: UInt64, actual: UInt64)
     case fileDigestMismatch(filename: String)
     case fileUnreadable(filename: String, detail: String)
+    /// The model files' on-disk identity changed while they were being
+    /// hashed, so the digests just computed cannot be attributed to the
+    /// files now present. Fail closed; the next check verifies again.
+    case modelFilesChangedDuringVerification
 
     var errorDescription: String? {
         switch self {
@@ -36,8 +40,41 @@ nonisolated enum MLXModelVerificationError: LocalizedError, Sendable, Equatable 
             return "MLX model file '\(filename)' failed SHA-256 verification against the authoritative manifest."
         case .fileUnreadable(let filename, let detail):
             return "MLX model file '\(filename)' could not be read: \(detail)"
+        case .modelFilesChangedDuringVerification:
+            return "The MLX model files changed while they were being verified."
         }
     }
+}
+
+/// A cheap, metadata-only identity of exactly the files `MLXModelVerifier`
+/// verifies for one descriptor — never a substitute for verification, only
+/// the key under which one successful full verification may be reused
+/// within the same process (`MLXModelVerificationCache`). Any replacement,
+/// rewrite, rename-over, or touch of a verified file changes its inode,
+/// size, modification time, or status-change time; a different model
+/// directory, descriptor revision, or pinned manifest changes the
+/// remaining fields.
+nonisolated struct MLXModelFileIdentity: Sendable, Equatable {
+    nonisolated struct FileStatus: Sendable, Equatable {
+        var device: Int64
+        var inode: UInt64
+        var byteCount: Int64
+        var modificationSeconds: Int
+        var modificationNanoseconds: Int
+        var statusChangeSeconds: Int
+        var statusChangeNanoseconds: Int
+    }
+
+    nonisolated struct VerifiedFile: Sendable, Equatable {
+        var entry: MLXModelFileEntry
+        var status: FileStatus
+    }
+
+    var modelIdentifier: String
+    var modelRevision: String
+    var canonicalDirectoryPath: String
+    var directoryStatus: FileStatus
+    var files: [VerifiedFile]
 }
 
 /// Verifies a local, pinned-revision MLX model directory before the MLX
@@ -97,6 +134,58 @@ nonisolated enum MLXModelVerifier {
         }
 
         return modelDirectory
+    }
+
+    /// The current `MLXModelFileIdentity` of the files `verify` would check
+    /// for `descriptor`, from file metadata only (no file contents are
+    /// read). `nil` whenever that identity cannot be established — missing
+    /// or unsafe directory/files, or no authoritative manifest — in which
+    /// case nothing may be reused and full verification must run (and
+    /// report the real reason).
+    static func fileIdentity(
+        descriptor: MLXModelDescriptor,
+        applicationSupportRoot: URL,
+        authoritativeManifestLookup: (MLXModelDescriptor) -> MLXModelProvisioningManifest? = MLXPinnedModelManifests.manifest(for:)
+    ) -> MLXModelFileIdentity? {
+        let modelDirectory = MLXModelCatalog.modelDirectory(
+            applicationSupportRoot: applicationSupportRoot, descriptor: descriptor
+        )
+        guard CompletedSessionPathSafety.checkExistingDirectory(modelDirectory) == .safe,
+              let authoritative = authoritativeManifestLookup(descriptor),
+              !authoritative.files.isEmpty,
+              let directoryStatus = fileStatus(atPath: modelDirectory.path, expectedType: S_IFDIR)
+        else {
+            return nil
+        }
+        var files: [MLXModelFileIdentity.VerifiedFile] = []
+        for entry in authoritative.files {
+            let fileURL = modelDirectory.appendingPathComponent(entry.filename, isDirectory: false)
+            guard let status = fileStatus(atPath: fileURL.path, expectedType: S_IFREG) else { return nil }
+            files.append(MLXModelFileIdentity.VerifiedFile(entry: entry, status: status))
+        }
+        return MLXModelFileIdentity(
+            modelIdentifier: descriptor.modelIdentifier,
+            modelRevision: descriptor.modelRevision,
+            canonicalDirectoryPath: modelDirectory.resolvingSymlinksInPath().standardizedFileURL.path,
+            directoryStatus: directoryStatus,
+            files: files
+        )
+    }
+
+    /// `lstat`, so a symbolic link is never followed and never matches
+    /// `expectedType`.
+    private static func fileStatus(atPath path: String, expectedType: mode_t) -> MLXModelFileIdentity.FileStatus? {
+        var info = stat()
+        guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == expectedType else { return nil }
+        return MLXModelFileIdentity.FileStatus(
+            device: Int64(info.st_dev),
+            inode: UInt64(info.st_ino),
+            byteCount: Int64(info.st_size),
+            modificationSeconds: info.st_mtimespec.tv_sec,
+            modificationNanoseconds: info.st_mtimespec.tv_nsec,
+            statusChangeSeconds: info.st_ctimespec.tv_sec,
+            statusChangeNanoseconds: info.st_ctimespec.tv_nsec
+        )
     }
 
     private static func verify(fileURL: URL, against entry: MLXModelFileEntry) throws {

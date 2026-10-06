@@ -453,17 +453,19 @@ final class LectureSummaryGenerationService: ObservableObject {
             // Admission-time availability precondition for a brand-new
             // generation only — Continue/Retry (the `if let generationID`
             // branch above) always resume an already-persisted generation
-            // and never reach here.
-            switch newGenerationAvailabilityChecker.availabilityForNewGeneration() {
+            // and never reach here. Awaited (never blocking this actor); a
+            // cancellation that lands meanwhile wins over whatever
+            // availability was reported.
+            let availability = await newGenerationAvailabilityChecker.availabilityForNewGeneration()
+            guard !Task.isCancelled else {
+                publish { self.phase = .finished(.cancelled) }
+                return
+            }
+            switch availability {
             case .available:
                 break
             case .unavailable(let description):
                 publish { self.phase = .finished(.backendUnavailable(description: description)) }
-                return
-            }
-
-            guard !Task.isCancelled else {
-                publish { self.phase = .finished(.cancelled) }
                 return
             }
 

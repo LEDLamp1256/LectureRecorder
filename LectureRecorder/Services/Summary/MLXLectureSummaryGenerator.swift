@@ -234,8 +234,8 @@ nonisolated struct MLXLectureSummaryGenerator: LectureSummaryGenerating, NewLect
         self.diagnosticRecorder = diagnosticRecorder
     }
 
-    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
-        sessionDriver.availability()
+    func availabilityForNewGeneration() async -> LectureNotesGenerationAvailability {
+        await sessionDriver.availability()
     }
 
     // MARK: - Plan

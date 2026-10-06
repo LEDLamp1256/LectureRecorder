@@ -331,7 +331,7 @@ final class MLXModelVerifierTests: XCTestCase {
         XCTAssertNotEqual(descriptor14B.modelIdentifier, MLXModelDescriptor.qwen3_8b_4bit.modelIdentifier)
     }
 
-    func testProductionRealSessionDriverDefaultsTo8B() throws {
+    func testProductionRealSessionDriverDefaultsTo8B() async throws {
         // Only the 8B directory exists (empty). The default driver must look
         // there (and fail on a missing file); a 14B driver on the same root
         // would instead report its own directory missing.
@@ -344,12 +344,14 @@ final class MLXModelVerifierTests: XCTestCase {
         let defaultDriver = RealMLXSessionDriver(applicationSupportRootResolver: { root })
         let driver14B = RealMLXSessionDriver(descriptor: .qwen3_14b_4bit, applicationSupportRootResolver: { root })
 
+        let defaultAvailability = await defaultDriver.availability()
+        let availability14B = await driver14B.availability()
         XCTAssertEqual(
-            defaultDriver.availability(),
+            defaultAvailability,
             .unavailable(description: "The local MLX model is not ready: \(MLXModelVerificationError.fileMissingOrUnsafe("config.json").localizedDescription)")
         )
         XCTAssertEqual(
-            driver14B.availability(),
+            availability14B,
             .unavailable(description: "The local MLX model is not ready: \(MLXModelVerificationError.modelDirectoryMissingOrUnsafe.localizedDescription)")
         )
     }

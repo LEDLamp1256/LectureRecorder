@@ -41,7 +41,7 @@ final class MLXSummaryRealAcceptanceTests: XCTestCase {
         var nativeContextLength: Int { wrapped.nativeContextLength }
         var operationalContextCeiling: Int { wrapped.operationalContextCeiling }
 
-        func availability() -> LectureNotesGenerationAvailability { wrapped.availability() }
+        func availability() async -> LectureNotesGenerationAvailability { await wrapped.availability() }
 
         func preparedInputTokenCount(instructions: String, prompt: String) async throws -> Int {
             try await wrapped.preparedInputTokenCount(instructions: instructions, prompt: prompt)
@@ -66,7 +66,7 @@ final class MLXSummaryRealAcceptanceTests: XCTestCase {
         try XCTSkipUnless(Self.isEnabled, "Set LECTURE_RECORDER_RUN_MLX_SUMMARY_ACCEPTANCE=1 to run this opt-in real-MLX acceptance test.")
 
         let realDriver = RealMLXSessionDriver()
-        switch realDriver.availability() {
+        switch await realDriver.availability() {
         case .available:
             break
         case .unavailable(let description):

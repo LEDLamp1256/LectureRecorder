@@ -10,13 +10,15 @@ nonisolated enum LectureNotesGenerationAvailability: Sendable, Equatable {
     case unavailable(description: String)
 }
 
-/// Checked once, synchronously, before `LectureNotesGenerationService`
+/// Checked once, awaited, before `LectureNotesGenerationService`
 /// creates a brand-new immutable generation record (Generate only —
 /// Continue/Retry always resume an already-persisted generation and never
 /// consult this). Conformers never perform a network request or otherwise
-/// mutate state merely by answering this question.
+/// mutate state merely by answering this question (an in-memory memo of a
+/// successful local model verification aside). Awaited so expensive
+/// verification never blocks the service's `@MainActor`.
 nonisolated protocol NewLectureNotesGenerationAvailabilityChecking: Sendable {
-    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability
+    func availabilityForNewGeneration() async -> LectureNotesGenerationAvailability
 }
 
 /// Default used wherever no real availability precondition applies (e.g.

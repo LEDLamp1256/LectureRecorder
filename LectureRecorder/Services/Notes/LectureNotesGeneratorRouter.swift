@@ -53,8 +53,8 @@ nonisolated struct LectureNotesGeneratorRouter: LectureNotesGenerating, NewLectu
     /// brand-new generation (see `MLXNotesConfiguration
     /// .generationProvenance`), so admission-time availability is always
     /// the MLX generator's own answer — never Apple's or OpenAI's.
-    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
-        mlxGenerator.availabilityForNewGeneration()
+    func availabilityForNewGeneration() async -> LectureNotesGenerationAvailability {
+        await mlxGenerator.availabilityForNewGeneration()
     }
 
     func analyzeWindow(
