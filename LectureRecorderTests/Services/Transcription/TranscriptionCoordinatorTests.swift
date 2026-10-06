@@ -376,6 +376,167 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         }
     }
 
+    // MARK: - T7-C2: explicit permanent-failure retry
+
+    /// A job durably `.failed(.permanent)` through the real processing path.
+    private func failPermanently(_ coordinator: TranscriptionCoordinator, transcriber: FakeTranscriber, sequenceNumber: Int = 0) async throws -> TranscriptionJob {
+        transcriber.setFailure(
+            FakeTranscriberFailure(category: .engineThrew, diagnosticMessage: "fatal", retryDisposition: .permanent),
+            forSequenceNumber: sequenceNumber
+        )
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+        let failed = try await coordinator.processJob(sequenceNumber: sequenceNumber, paths: artifactPaths)
+        XCTAssertEqual(failed.state, .failed)
+        XCTAssertEqual(failed.lastFailure?.retryDisposition, .permanent)
+        return failed
+    }
+
+    func testExplicitPermanentRetryRequeuesPermanentFailureWithoutReclassifyingIt() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+        // Compare against the persisted job (same JSON date precision).
+        let failed = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)!
+
+        let queued = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(queued.state, .queued)
+        XCTAssertNil(queued.currentAttemptID)
+        XCTAssertEqual(queued.lastFailure, failed.lastFailure, "the persisted failure classification is never rewritten")
+        XCTAssertEqual(queued.attemptCount, failed.attemptCount)
+        let persisted = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(persisted?.state, .queued)
+        XCTAssertNil(persisted?.currentAttemptID)
+        XCTAssertEqual(persisted?.lastFailure, failed.lastFailure)
+    }
+
+    func testAutomaticRetryStillRefusesPermanentFailureAfterManualRetryExists() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+        do {
+            _ = try await coordinator.retryJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("automatic retry must still refuse a permanent failure")
+        } catch TranscriptionCoordinatorError.retryNotEligible {
+        }
+        let afterAutomatic = try await store.loadJob(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(afterAutomatic?.state, .failed)
+    }
+
+    func testExplicitPermanentRetryRefusesRetryableQueuedRunningAndCompletedJobs() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        transcriber.setFailure(
+            FakeTranscriberFailure(category: .engineThrew, diagnosticMessage: "transient", retryDisposition: .retryable),
+            forSequenceNumber: 0
+        )
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await coordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+        _ = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths) // failed(.retryable)
+        _ = try await coordinator.processJob(sequenceNumber: 2, paths: artifactPaths) // completed
+
+        var running = try await store.loadJob(sequenceNumber: 1, paths: artifactPaths)!
+        running.state = .running
+        running.currentAttemptID = UUID()
+        try await store.replaceJob(running, paths: artifactPaths)
+
+        for sequenceNumber in [0, 2, 1] {
+            let before = try await store.loadJob(sequenceNumber: sequenceNumber, paths: artifactPaths)
+            do {
+                _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: sequenceNumber, paths: artifactPaths)
+                XCTFail("chunk \(sequenceNumber) must not be manually requeued")
+            } catch TranscriptionCoordinatorError.manualRetryNotEligible(let seq) {
+                XCTAssertEqual(seq, sequenceNumber)
+            }
+            let after = try await store.loadJob(sequenceNumber: sequenceNumber, paths: artifactPaths)
+            XCTAssertEqual(after, before)
+        }
+
+        // A freshly queued job (never failed) is refused as well.
+        let queuedStore = TranscriptionStore()
+        let freshCoordinator = makeCoordinator(store: queuedStore)
+        _ = try await freshCoordinator.enqueueEligibleChunks(manifest: manifest, sessionPaths: sessionPaths)
+        do {
+            _ = try await freshCoordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("a queued job must not be manually requeued")
+        } catch TranscriptionCoordinatorError.manualRetryNotEligible {
+        }
+    }
+
+    func testExplicitPermanentRetryRefusesFailedJobWhoseResultExistsAndLeavesBothArtifactsUntouched() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+        _ = try await store.commitResult(makeResult(sequenceNumber: 0), paths: artifactPaths)
+        let jobBytes = try Data(contentsOf: artifactPaths.jobURL(sequenceNumber: 0))
+        let resultBytes = try Data(contentsOf: artifactPaths.resultURL(sequenceNumber: 0))
+
+        do {
+            _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("a failed job with a result must never be requeued")
+        } catch TranscriptionCoordinatorError.manualRetryNotEligible {
+        }
+        XCTAssertEqual(try Data(contentsOf: artifactPaths.jobURL(sequenceNumber: 0)), jobBytes)
+        XCTAssertEqual(try Data(contentsOf: artifactPaths.resultURL(sequenceNumber: 0)), resultBytes)
+    }
+
+    func testExplicitPermanentRetryRefusesFailedJobWithCorruptResultArtifact() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+        try Data("{corrupt".utf8).write(to: artifactPaths.resultURL(sequenceNumber: 0))
+        let jobBytes = try Data(contentsOf: artifactPaths.jobURL(sequenceNumber: 0))
+
+        do {
+            _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+            XCTFail("an unreadable result must refuse the retry")
+        } catch {
+        }
+        XCTAssertEqual(try Data(contentsOf: artifactPaths.jobURL(sequenceNumber: 0)), jobBytes)
+        XCTAssertEqual(try Data(contentsOf: artifactPaths.resultURL(sequenceNumber: 0)), Data("{corrupt".utf8))
+    }
+
+    func testManualRetryThenProcessGetsFreshAttemptIDAndCompletes() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let attemptIDs = AttemptIDSequence()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber, makeAttemptID: { attemptIDs.next() })
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+        let firstAttempt = attemptIDs.issued.last!
+
+        transcriber.setOutput(FakeTranscriber.defaultFakeOutput, forSequenceNumber: 0)
+        transcriber.clearFailure(forSequenceNumber: 0)
+        _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+        let completed = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+
+        XCTAssertEqual(completed.state, .completed)
+        XCTAssertEqual(completed.attemptCount, 2)
+        let secondAttempt = attemptIDs.issued.last!
+        XCTAssertNotEqual(firstAttempt, secondAttempt)
+        let result = try await store.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertEqual(result?.attemptID, secondAttempt)
+    }
+
+    func testManualRetryDeterministicReFailurePersistsNormallyWithoutFurtherRetry() async throws {
+        let store = TranscriptionStore()
+        let transcriber = FakeTranscriber()
+        let coordinator = makeCoordinator(store: store, transcriber: transcriber)
+        _ = try await failPermanently(coordinator, transcriber: transcriber)
+
+        _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: 0, paths: artifactPaths)
+        let refailed = try await coordinator.processJob(sequenceNumber: 0, paths: artifactPaths)
+
+        XCTAssertEqual(refailed.state, .failed)
+        XCTAssertEqual(refailed.lastFailure?.retryDisposition, .permanent)
+        XCTAssertEqual(refailed.attemptCount, 2)
+        XCTAssertEqual(transcriber.recordedCalls.filter { $0.sequenceNumber == 0 }.count, 2, "exactly one extra attempt")
+        let noResult = try await store.loadResult(sequenceNumber: 0, paths: artifactPaths)
+        XCTAssertNil(noResult)
+    }
+
     // MARK: - Source revalidation before claiming
 
     func testClaimJobFailsSourceMissingIfCafDeletedAfterEnqueue() async throws {
@@ -1074,4 +1235,18 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         // Requirement 10: source audio is untouched by recovery.
         XCTAssertEqual(try Data(contentsOf: sourceAudioURL), sourceAudioBefore)
     }
+}
+
+/// Records every attempt ID the coordinator mints, in order.
+private final class AttemptIDSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ids: [UUID] = []
+
+    func next() -> UUID {
+        let id = UUID()
+        lock.withLock { ids.append(id) }
+        return id
+    }
+
+    var issued: [UUID] { lock.withLock { ids } }
 }

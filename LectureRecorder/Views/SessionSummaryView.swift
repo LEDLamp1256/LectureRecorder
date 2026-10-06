@@ -186,20 +186,26 @@ struct SessionSummaryView: View {
         }
     }
 
+    private var advisoryStateProblemMessage: String {
+        presenter.currentUsableNotesGenerationID != nil
+            ? SummaryRecoveryMessage.advisoryStateProblem
+            : SummaryRecoveryMessage.advisoryStateProblemWithoutNotes
+    }
+
     @ViewBuilder private func savedStatusText(_ classification: SummaryGenerationRecoveryClassification, advisoryStateIntegrity: SummaryAdvisoryStateIntegrity) -> some View {
         switch classification {
         case .completed:
             Label("Summary ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
         case .readyForSynthesis:
-            if case .problem(let reason) = advisoryStateIntegrity {
-                Label("Ready to synthesize, but cannot resume automatically — \(reason)", systemImage: "exclamationmark.triangle")
+            if case .problem = advisoryStateIntegrity {
+                Label(advisoryStateProblemMessage, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             } else {
                 Label("Ready to synthesize", systemImage: "hourglass")
             }
         case .resumable(let nextBatchIndex, let interruption):
-            if case .problem(let reason) = advisoryStateIntegrity {
-                Label("Cannot resume automatically — \(reason)", systemImage: "exclamationmark.triangle")
+            if case .problem = advisoryStateIntegrity {
+                Label(advisoryStateProblemMessage, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             } else {
                 Label(resumableLabel(nextBatchIndex: nextBatchIndex, interruption: interruption), systemImage: "exclamationmark.arrow.triangle.2.circlepath")

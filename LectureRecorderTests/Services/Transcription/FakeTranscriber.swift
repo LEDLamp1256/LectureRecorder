@@ -50,6 +50,11 @@ final class FakeTranscriber: Transcribing, @unchecked Sendable {
         scriptedFailures[sequenceNumber] = error
     }
 
+    func clearFailure(forSequenceNumber sequenceNumber: Int) {
+        lock.lock(); defer { lock.unlock() }
+        scriptedFailures[sequenceNumber] = nil
+    }
+
     var recordedCalls: [(sequenceNumber: Int, audioURL: URL)] {
         lock.lock(); defer { lock.unlock() }
         return calls

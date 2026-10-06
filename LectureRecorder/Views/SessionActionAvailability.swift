@@ -19,6 +19,9 @@ nonisolated struct SessionActionAvailability: Equatable {
     var canTranscribe: Bool
     var canContinueOrRetry: Bool
     var canCancel: Bool
+    /// "Try Failed Parts Again": the explicit override for parts the
+    /// automatic policy considers permanent. Independent of Continue.
+    var canRetryFailedParts: Bool = false
 }
 
 nonisolated enum SessionActionAvailabilityCalculator {
@@ -30,8 +33,14 @@ nonisolated enum SessionActionAvailabilityCalculator {
     /// `peekedStatus` is this session's own last-peeked saved status —
     /// never reinterpreted as an integrity problem merely because a
     /// *different* session currently owns the shared operation.
+    ///
+    /// `failureOverview` only ever narrows Continue: when it positively
+    /// shows no automatic work remains (every gap is a permanent failure),
+    /// Continue would be a silent no-op and is disabled. A missing overview
+    /// leaves the status-only decision unchanged.
     static func availability(
         peekedStatus: SessionTranscriptionStatus?,
+        failureOverview: TranscriptionFailureOverview? = nil,
         ownership: SessionOwnershipDisplay
     ) -> SessionActionAvailability {
         switch ownership {
@@ -47,11 +56,110 @@ nonisolated enum SessionActionAvailabilityCalculator {
             if case .notTranscribed = peekedStatus { canTranscribe = true } else { canTranscribe = false }
             let canContinueOrRetry: Bool
             switch peekedStatus {
-            case .incomplete, .interrupted, .recoveryPending: canContinueOrRetry = true
-            default: canContinueOrRetry = false
+            case .incomplete, .interrupted, .recoveryPending:
+                canContinueOrRetry = failureOverview?.hasAutomaticWork ?? true
+            default:
+                canContinueOrRetry = false
             }
-            return SessionActionAvailability(canTranscribe: canTranscribe, canContinueOrRetry: canContinueOrRetry, canCancel: false)
+            let canRetryFailedParts: Bool
+            switch peekedStatus {
+            case .incomplete, .interrupted, .recoveryPending:
+                canRetryFailedParts = failureOverview?.hasManualRetryEligibleParts ?? false
+            default:
+                canRetryFailedParts = false
+            }
+            return SessionActionAvailability(
+                canTranscribe: canTranscribe,
+                canContinueOrRetry: canContinueOrRetry,
+                canCancel: false,
+                canRetryFailedParts: canRetryFailedParts
+            )
         }
+    }
+
+    /// Why Continue is disabled for an otherwise-continuable status, or
+    /// `nil` when it is not disabled for that reason.
+    static func continueUnavailableExplanation(
+        peekedStatus: SessionTranscriptionStatus?,
+        failureOverview: TranscriptionFailureOverview?,
+        ownership: SessionOwnershipDisplay
+    ) -> String? {
+        guard ownership == .none, let failureOverview, !failureOverview.hasAutomaticWork else { return nil }
+        switch peekedStatus {
+        case .incomplete, .interrupted, .recoveryPending:
+            if failureOverview.hasManualRetryEligibleParts {
+                return TranscriptionStatusMessage.nothingToContinue + " " + TranscriptionStatusMessage.manualRetryHint
+            }
+            return TranscriptionStatusMessage.nothingToContinue
+        default:
+            return nil
+        }
+    }
+}
+
+/// Pure mapping from a `CompletedSessionTranscriptionService.AdmissionResult`
+/// to the transient message shown for it — a presentation label for the
+/// service's own authoritative result, never a second admission policy.
+/// `nil` for `.admitted` clears any stale prior message.
+nonisolated enum TranscriptionAdmissionMessage {
+    static func message(for result: CompletedSessionTranscriptionService.AdmissionResult) -> String? {
+        switch result {
+        case .admitted:
+            return nil
+        case .recordingActive:
+            return "Transcription can't start while a recording is in progress."
+        case .busy:
+            return "Another transcription is already running. Try again once it finishes."
+        case .shuttingDown:
+            return "Transcription can't start while the app is quitting."
+        }
+    }
+}
+
+/// Fixed, user-facing transcription status wording.
+nonisolated enum TranscriptionStatusMessage {
+    /// Shown for every `.blocked` status in place of its raw reasons, which
+    /// are internal diagnostics (artifact names, decoder text).
+    static let blocked = "Saved transcription data needs attention. Existing files have been preserved."
+    static let nothingToContinue = "Continue has nothing left to retry automatically — the remaining parts couldn't be transcribed."
+    static let manualRetryHint = "Choose Try Failed Parts Again to retry them anyway."
+}
+
+/// Sanitized, one-line descriptions of failed transcription parts. Built
+/// only from the closed failure category and retry disposition — never from
+/// `TranscriptionFailure.message`. Part numbers are one-based.
+nonisolated enum TranscriptionFailedPartMessage {
+    /// How many failed parts the status area lists before summarizing.
+    static let displayLimit = 5
+
+    static func message(sequenceNumber: Int, category: TranscriptionFailureCategory?, retryDisposition: RetryDisposition?) -> String {
+        let part = "Part \(sequenceNumber + 1)"
+        switch category {
+        case .sourceMissing:
+            return "\(part): audio file is missing."
+        case .cancellation, .abandonedRunningAttempt:
+            return "\(part): interrupted."
+        default:
+            if retryDisposition == .retryable {
+                return "\(part): transcription engine failed — Continue may succeed."
+            }
+            return "\(part): couldn't be transcribed."
+        }
+    }
+
+    static func message(for part: TranscriptionFailedPart) -> String {
+        message(sequenceNumber: part.sequenceNumber, category: part.category, retryDisposition: part.retryDisposition)
+    }
+
+    /// At most `displayLimit` part lines, then one "…and N more" line.
+    static func lines(for overview: TranscriptionFailureOverview) -> [String] {
+        let parts = overview.failedParts
+        var lines = parts.prefix(displayLimit).map { message(for: $0) }
+        if parts.count > displayLimit {
+            let remaining = parts.count - displayLimit
+            lines.append("…and \(remaining) more failed part\(remaining == 1 ? "" : "s").")
+        }
+        return lines
     }
 }
 

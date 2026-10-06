@@ -23,6 +23,9 @@ nonisolated enum TranscriptionCoordinatorError: LocalizedError, Sendable, Equata
     /// `ExclusiveCreateOutcome.createdDurabilityUncertain`.
     case commitDurabilityUncertain(sequenceNumber: Int)
     case retryNotEligible(sequenceNumber: Int)
+    /// The job is not a `.failed(.permanent)` job without a result artifact,
+    /// so the explicit permanent-failure retry refuses it.
+    case manualRetryNotEligible(sequenceNumber: Int)
 
     var errorDescription: String? {
         switch self {
@@ -40,6 +43,8 @@ nonisolated enum TranscriptionCoordinatorError: LocalizedError, Sendable, Equata
             return "Chunk #\(seq)'s result was committed but directory durability could not be confirmed; left running for reconciliation."
         case .retryNotEligible(let seq):
             return "Chunk #\(seq)'s job is not an eligible, retryable failure."
+        case .manualRetryNotEligible(let seq):
+            return "Chunk #\(seq)'s job is not a permanently failed job without a result."
         }
     }
 }
@@ -261,6 +266,37 @@ actor TranscriptionCoordinator {
         }
         guard job.state == .failed, job.lastFailure?.retryDisposition == .retryable else {
             throw TranscriptionCoordinatorError.retryNotEligible(sequenceNumber: sequenceNumber)
+        }
+
+        var queued = job
+        queued.state = .queued
+        queued.currentAttemptID = nil
+        queued.updatedDate = now()
+        try await store.replaceJob(queued, paths: paths)
+        return queued
+    }
+
+    /// Explicit user override of the automatic retry policy: moves a
+    /// `.failed` job whose `lastFailure` is `.permanent` back to `.queued`,
+    /// using the same failed → queued transition as `retryJob`. Refuses
+    /// (`manualRetryNotEligible`) any other state or disposition, and any
+    /// job whose canonical result artifact exists — a result is never
+    /// overwritten, deleted, or superseded here. The persisted failure
+    /// record is left as-is (no reclassification); the next claim mints a
+    /// fresh attempt ID. Never invoked by Continue, enqueue, or
+    /// reconciliation — only by the explicit "Try Failed Parts Again"
+    /// action, once per user request.
+    @discardableResult
+    func retryPermanentlyFailedJob(sequenceNumber: Int, paths: TranscriptionArtifactPaths) async throws -> TranscriptionJob {
+        guard let job = try await store.loadJob(sequenceNumber: sequenceNumber, paths: paths) else {
+            throw TranscriptionCoordinatorError.jobNotFound(sequenceNumber: sequenceNumber)
+        }
+        guard job.state == .failed, job.lastFailure?.retryDisposition == .permanent else {
+            throw TranscriptionCoordinatorError.manualRetryNotEligible(sequenceNumber: sequenceNumber)
+        }
+        // A corrupt/unreadable result throws here, which also refuses.
+        guard try await store.loadResult(sequenceNumber: sequenceNumber, paths: paths) == nil else {
+            throw TranscriptionCoordinatorError.manualRetryNotEligible(sequenceNumber: sequenceNumber)
         }
 
         var queued = job

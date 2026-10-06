@@ -93,25 +93,72 @@ final class NotesActionAvailabilityTests: XCTestCase {
     }
 
     // MARK: - Advisory operation-state problem disables Continue/Retry (correction #1)
+    //
+    // T7-C: a `.loaded` state is only reached once the current transcript
+    // source loaded, so a fresh Generate (new generation ID, old files
+    // untouched) is offered while Continue/Retry stay disabled.
 
-    func testMismatchedAdvisoryStateDisablesContinueForReadyForSynthesis() {
+    func testMismatchedAdvisoryStateDisablesContinueButAllowsFreshGenerateForReadyForSynthesis() {
         let state = SessionNotesDisplayState.loaded(
             record: makeRecord(),
             classification: .readyForSynthesis(analyses: []),
             advisoryStateIntegrity: .problem(reason: "recovery metadata does not match this generation")
         )
         let availability = NotesActionAvailabilityCalculator.availability(displayState: state, ownership: .none)
-        XCTAssertEqual(availability, NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        XCTAssertEqual(availability, NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
     }
 
-    func testMismatchedAdvisoryStateDisablesContinueForResumable() {
+    func testMismatchedAdvisoryStateDisablesContinueButAllowsFreshGenerateForResumable() {
         let state = SessionNotesDisplayState.loaded(
             record: makeRecord(),
             classification: .resumable(nextWindowIndex: 1, interruption: .recoverableFailure(description: "boom")),
             advisoryStateIntegrity: .problem(reason: "recovery metadata could not be read")
         )
         let availability = NotesActionAvailabilityCalculator.availability(displayState: state, ownership: .none)
-        XCTAssertEqual(availability, NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+        XCTAssertEqual(availability, NotesActionAvailability(canGenerate: true, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false))
+    }
+
+    func testAdvisoryProblemFreshGenerateIsStillWithheldWhileAnyOperationOwnsTheApp() {
+        let state = SessionNotesDisplayState.loaded(
+            record: makeRecord(),
+            classification: .resumable(nextWindowIndex: 1, interruption: .cancelled),
+            advisoryStateIntegrity: .problem(reason: "recovery metadata could not be read")
+        )
+        XCTAssertEqual(
+            NotesActionAvailabilityCalculator.availability(displayState: state, ownership: .busyElsewhere),
+            NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: false, continueOrRetryIsRetry: false)
+        )
+        XCTAssertEqual(
+            NotesActionAvailabilityCalculator.availability(displayState: state, ownership: .activeHere),
+            NotesActionAvailability(canGenerate: false, canContinueOrRetry: false, canCancel: true, continueOrRetryIsRetry: false)
+        )
+    }
+
+    func testNormalResumableStateIsUnchangedByAdvisoryFreshGenerateRule() {
+        let state = SessionNotesDisplayState.loaded(
+            record: makeRecord(),
+            classification: .resumable(nextWindowIndex: 1, interruption: .cancelled),
+            advisoryStateIntegrity: .normal
+        )
+        XCTAssertEqual(
+            NotesActionAvailabilityCalculator.availability(displayState: state, ownership: .none),
+            NotesActionAvailability(canGenerate: false, canContinueOrRetry: true, canCancel: false, continueOrRetryIsRetry: false)
+        )
+    }
+
+    func testAdvisoryProblemWordingIsFixedAndPointsAtGenerate() {
+        XCTAssertEqual(NotesRecoveryMessage.advisoryStateProblem, "Saved progress can't be resumed safely. Choose Generate Notes to start over.")
+    }
+
+    func testTranscriptRequiredStateWordingAndNoGenerate() {
+        XCTAssertEqual(NotesRecoveryMessage.transcriptRequiredTitle, "Transcript Required")
+        XCTAssertEqual(NotesRecoveryMessage.transcriptRequiredDescription, "Finish transcribing this lecture before generating Notes.")
+        XCTAssertFalse(
+            NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: false), ownership: .none).canGenerate
+        )
+        XCTAssertTrue(
+            NotesActionAvailabilityCalculator.availability(displayState: .noGeneration(transcriptSourceReady: true), ownership: .none).canGenerate
+        )
     }
 
     func testAdvisoryStateProblemDoesNotHideOrDisableGenerateOnACompletedDocument() {

@@ -112,6 +112,39 @@ struct ContentView: View {
         } message: {
             Text("The app will stop trying to confirm whether this session finished saving. Nothing on disk is deleted — the session's files remain in the Sessions folder exactly as they are now. Use \"Show Sessions Folder\" afterward if you want to inspect or recover them by hand.")
         }
+        // Shown by every recorder window; acknowledging in any one clears it
+        // for all. Attention (Dock/beep) is app-level, never per window.
+        .alert(
+            UnexpectedRecordingStopMessage.title,
+            isPresented: Binding(
+                get: { sessionManager.unexpectedRecordingStop != nil },
+                set: { isPresented in
+                    if !isPresented, let event = sessionManager.unexpectedRecordingStop {
+                        sessionManager.acknowledgeUnexpectedRecordingStop(id: event.id)
+                    }
+                }
+            ),
+            presenting: sessionManager.unexpectedRecordingStop
+        ) { event in
+            Button("OK") {
+                sessionManager.acknowledgeUnexpectedRecordingStop(id: event.id)
+            }
+        } message: { event in
+            Text(UnexpectedRecordingStopMessage.message(for: event))
+        }
+    }
+}
+
+/// Wording for the unexpected-stop alert. Never suggests that recording
+/// resumes on its own.
+nonisolated enum UnexpectedRecordingStopMessage {
+    static let title = "Recording Stopped Unexpectedly"
+
+    static func message(for event: UnexpectedRecordingStop) -> String {
+        let followUp = event.finalizationConfirmed
+            ? "Audio saved before the problem occurred has been kept. Press Start to begin a new recording."
+            : "Audio recorded up to this point was kept on disk, but saving the session couldn't be confirmed. See the session issue in this window."
+        return event.reason + "\n\n" + followUp
     }
 }
 

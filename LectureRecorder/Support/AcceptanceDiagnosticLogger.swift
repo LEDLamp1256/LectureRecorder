@@ -64,6 +64,7 @@ nonisolated enum AcceptanceDiagnosticEvent {
     enum Transcription {
         static let started = "transcription.started"
         static let continueOrRetryStarted = "transcription.continueOrRetry.started"
+        static let retryPermanentFailuresStarted = "transcription.retryPermanentFailures.started"
         static let chunkStarted = "transcription.chunk.started"
         static let chunkCompleted = "transcription.chunk.completed"
         static let chunkFailed = "transcription.chunk.failed"

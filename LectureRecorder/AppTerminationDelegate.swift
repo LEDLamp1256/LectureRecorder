@@ -50,6 +50,17 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
         return AbandonedRecordingRecovery()
     }
 
+    /// App-lifetime attention for recordings an operational failure stopped:
+    /// one Dock request and one beep per event, independent of which (if
+    /// any) recorder window is open.
+    private var unexpectedRecordingStopAttention: UnexpectedRecordingStopAttention?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        unexpectedRecordingStopAttention = UnexpectedRecordingStopAttention(
+            events: environment.sessionManager.$unexpectedRecordingStop
+        )
+    }
+
     /// True when this application process was launched as an XCTest host.
     nonisolated static var isHostingXCTest: Bool {
         ProcessInfo.processInfo.environment.keys.contains { $0.hasPrefix("XCTest") }

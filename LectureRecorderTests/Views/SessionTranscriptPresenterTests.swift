@@ -51,6 +51,18 @@ private final class FakeStatusLoader: CompletedSessionStatusLoading {
     func peekOrderedSegments(sessionID: UUID, manifest: SessionManifest, sessionPaths: SessionPaths) async -> [OrderedSegment]? {
         scriptedSegments[sessionID]
     }
+
+    private var scriptedOverviews: [UUID: TranscriptionFailureOverview] = [:]
+    private(set) var overviewCallCount: [UUID: Int] = [:]
+
+    func setFailureOverview(_ overview: TranscriptionFailureOverview, for sessionID: UUID) {
+        scriptedOverviews[sessionID] = overview
+    }
+
+    func peekFailureOverview(sessionID: UUID, manifest: SessionManifest, sessionPaths: SessionPaths) async -> TranscriptionFailureOverview? {
+        overviewCallCount[sessionID, default: 0] += 1
+        return scriptedOverviews[sessionID]
+    }
 }
 
 @MainActor
@@ -200,5 +212,55 @@ final class SessionTranscriptPresenterTests: XCTestCase {
 
         XCTAssertEqual(presenter.status, .completed)
         XCTAssertEqual(presenter.segments.count, 1)
+    }
+
+    // MARK: - T7-C1: failed-part overview
+
+    func testFailureOverviewIsLoadedAndPublishedForAnIncompleteSession() async {
+        let loader = FakeStatusLoader()
+        let entry = makeEntry(chunkCount: 2)
+        let overview = TranscriptionFailureOverview(
+            failedParts: [TranscriptionFailedPart(sequenceNumber: 1, category: .unknown, retryDisposition: .permanent)],
+            hasAutomaticWork: false
+        )
+        loader.setStatus(.incomplete(completed: 1, total: 2), for: entry.manifest.sessionID)
+        loader.setFailureOverview(overview, for: entry.manifest.sessionID)
+
+        let presenter = SessionTranscriptPresenter(loader: loader)
+        await presenter.refresh(for: entry)
+
+        XCTAssertEqual(presenter.status, .incomplete(completed: 1, total: 2))
+        XCTAssertEqual(presenter.failureOverview, overview)
+    }
+
+    func testFailureOverviewIsNotRequestedForCompletedOrBlockedSessions() async {
+        let loader = FakeStatusLoader()
+        let completed = makeEntry()
+        let blocked = makeEntry()
+        loader.setStatus(.completed, for: completed.manifest.sessionID)
+        loader.setStatus(.blocked(reasons: ["x"]), for: blocked.manifest.sessionID)
+        let presenter = SessionTranscriptPresenter(loader: loader)
+
+        await presenter.refresh(for: completed)
+        XCTAssertNil(presenter.failureOverview)
+        await presenter.refresh(for: blocked)
+        XCTAssertNil(presenter.failureOverview)
+        XCTAssertNil(loader.overviewCallCount[completed.manifest.sessionID])
+        XCTAssertNil(loader.overviewCallCount[blocked.manifest.sessionID])
+    }
+
+    func testSwitchingToASessionWithoutOverviewClearsThePreviousOne() async {
+        let loader = FakeStatusLoader()
+        let incomplete = makeEntry()
+        let other = makeEntry()
+        loader.setStatus(.incomplete(completed: 0, total: 1), for: incomplete.manifest.sessionID)
+        loader.setFailureOverview(TranscriptionFailureOverview(failedParts: [], hasAutomaticWork: true), for: incomplete.manifest.sessionID)
+        loader.setStatus(.notTranscribed, for: other.manifest.sessionID)
+        let presenter = SessionTranscriptPresenter(loader: loader)
+
+        await presenter.refresh(for: incomplete)
+        XCTAssertNotNil(presenter.failureOverview)
+        await presenter.refresh(for: other)
+        XCTAssertNil(presenter.failureOverview)
     }
 }

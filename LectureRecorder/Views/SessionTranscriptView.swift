@@ -92,9 +92,22 @@ struct SessionTranscriptView: View {
         presenter.displayedSessionID == sessionID ? presenter.status : nil
     }
 
-    private var availability: SessionActionAvailability {
-        SessionActionAvailabilityCalculator.availability(peekedStatus: peekedStatus, ownership: ownership)
+    private var peekedFailureOverview: TranscriptionFailureOverview? {
+        presenter.displayedSessionID == sessionID ? presenter.failureOverview : nil
     }
+
+    private var availability: SessionActionAvailability {
+        SessionActionAvailabilityCalculator.availability(
+            peekedStatus: peekedStatus,
+            failureOverview: peekedFailureOverview,
+            ownership: ownership
+        )
+    }
+
+    /// Transient explanation of the most recent refused Transcribe/Continue
+    /// tap in this view. Holds only the service's own `AdmissionResult`
+    /// label; cleared by the next admitted action.
+    @State private var admissionMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -162,7 +175,25 @@ struct SessionTranscriptView: View {
                 .foregroundStyle(.secondary)
         case .none:
             if let peekedStatus {
-                savedStatusText(peekedStatus)
+                VStack(alignment: .leading, spacing: 4) {
+                    savedStatusText(peekedStatus)
+                    if let peekedFailureOverview {
+                        ForEach(TranscriptionFailedPartMessage.lines(for: peekedFailureOverview), id: \.self) { line in
+                            Text(line)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let explanation = SessionActionAvailabilityCalculator.continueUnavailableExplanation(
+                        peekedStatus: peekedStatus,
+                        failureOverview: peekedFailureOverview,
+                        ownership: ownership
+                    ) {
+                        Text(explanation)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
             } else {
                 ProgressView().controlSize(.small)
             }
@@ -205,30 +236,53 @@ struct SessionTranscriptView: View {
             Label("Recovery pending", systemImage: "clock.arrow.circlepath")
         case .completed:
             Label("Completed", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-        case .blocked(let reasons):
-            Label("Needs attention: \(reasons.joined(separator: "; "))", systemImage: "exclamationmark.octagon.fill")
+        case .blocked:
+            // The raw reasons are internal diagnostics; they are never the
+            // user-facing text.
+            Label(TranscriptionStatusMessage.blocked, systemImage: "exclamationmark.octagon.fill")
                 .foregroundStyle(.red)
         }
     }
 
     private var actionButtons: some View {
-        HStack(spacing: 12) {
-            Button("Transcribe") {
-                service.transcribe(sessionID: sessionID)
-            }
-            .disabled(!availability.canTranscribe)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Button("Transcribe") {
+                    handle(service.transcribe(sessionID: sessionID))
+                }
+                .disabled(!availability.canTranscribe)
 
-            Button(continueOrRetryLabel) {
-                service.continueOrRetry(sessionID: sessionID)
-            }
-            .disabled(!availability.canContinueOrRetry)
+                Button(continueOrRetryLabel) {
+                    handle(service.continueOrRetry(sessionID: sessionID))
+                }
+                .disabled(!availability.canContinueOrRetry)
 
-            Button("Cancel", role: .destructive) {
-                service.cancel(sessionID: sessionID)
+                Button("Cancel", role: .destructive) {
+                    service.cancel(sessionID: sessionID)
+                }
+                .disabled(!availability.canCancel)
+
+                if availability.canRetryFailedParts {
+                    Button("Try Failed Parts Again") {
+                        handle(service.retryPermanentlyFailedParts(sessionID: sessionID))
+                    }
+                    .help("Retry parts that couldn't be transcribed. They may fail again.")
+                }
             }
-            .disabled(!availability.canCancel)
+            .buttonStyle(.bordered)
+
+            if let admissionMessage {
+                Text(admissionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
-        .buttonStyle(.bordered)
+    }
+
+    /// Labels the service's own authoritative admission result; never
+    /// decides admission itself.
+    private func handle(_ result: CompletedSessionTranscriptionService.AdmissionResult) {
+        admissionMessage = TranscriptionAdmissionMessage.message(for: result)
     }
 
     private var continueOrRetryLabel: String {
@@ -511,7 +565,11 @@ struct SessionTranscriptView: View {
                 .textSelection(.enabled)
                 .foregroundStyle(text.isEmpty ? .secondary : .primary)
         case .failed(let failure):
-            Text("Chunk #\(segment.sequenceNumber): \(failure.message)")
+            Text(TranscriptionFailedPartMessage.message(
+                sequenceNumber: segment.sequenceNumber,
+                category: failure.category,
+                retryDisposition: failure.retryDisposition
+            ))
                 .foregroundStyle(.red)
                 .font(.caption)
         case .inProgress:

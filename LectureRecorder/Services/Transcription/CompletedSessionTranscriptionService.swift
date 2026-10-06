@@ -167,7 +167,7 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     /// that only happens under `continueOrRetry`.
     @discardableResult
     func transcribe(sessionID: UUID) -> AdmissionResult {
-        beginOperation(sessionID: sessionID, retryFailedJobs: false)
+        beginOperation(sessionID: sessionID, mode: .transcribe)
     }
 
     /// Resumes a session after cancellation/interruption, or retries
@@ -178,7 +178,21 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     /// failures are moved back to `.queued` first.
     @discardableResult
     func continueOrRetry(sessionID: UUID) -> AdmissionResult {
-        beginOperation(sessionID: sessionID, retryFailedJobs: true)
+        beginOperation(sessionID: sessionID, mode: .continueOrRetry)
+    }
+
+    /// Explicit user override ("Try Failed Parts Again"): reconciles, then
+    /// requeues every `.failed` job whose failure is `.permanent` and which
+    /// has no result artifact (`TranscriptionCoordinator
+    /// .retryPermanentlyFailedJob`), enqueues any still-missing chunks, and
+    /// processes queued jobs in order — the same execution algorithm as
+    /// `transcribe`/`continueOrRetry`. Retryable failures are left to
+    /// Continue. Runs once per call: a part that fails again is persisted
+    /// as an ordinary failure and is never retried automatically. A
+    /// session that preflight blocks is never touched.
+    @discardableResult
+    func retryPermanentlyFailedParts(sessionID: UUID) -> AdmissionResult {
+        beginOperation(sessionID: sessionID, mode: .retryPermanentFailures)
     }
 
     /// Requests cooperative cancellation of the active operation, if it
@@ -373,6 +387,40 @@ final class CompletedSessionTranscriptionService: ObservableObject {
         return coordinator.assembleOrderedTranscript(chunks: validated.manifest.chunks, jobs: jobs, results: results)
     }
 
+    /// Read-only: this session's failed parts and whether Continue has any
+    /// automatic work left, from the same `SessionArtifactPreflight`
+    /// snapshot `peekStatus` uses. `nil` whenever the session fails
+    /// eligibility or preflight blocks — a blocked session is never
+    /// presented as ordinary failed parts. Never reconciles, never writes,
+    /// and never returns a failure's raw diagnostic message.
+    func peekFailureOverview(
+        sessionID: UUID,
+        manifest: SessionManifest,
+        sessionPaths: SessionPaths
+    ) async -> TranscriptionFailureOverview? {
+        guard let validated = try? SessionTranscriptionEligibility.validate(
+            expectedSessionID: sessionID,
+            manifest: manifest,
+            sessionPaths: sessionPaths
+        ) else {
+            return nil
+        }
+
+        let report = await SessionArtifactPreflight.run(
+            manifest: validated.manifest,
+            sessionPaths: validated.sessionPaths,
+            artifactPaths: validated.artifactPaths,
+            store: store
+        )
+        guard report.blockingReasons.isEmpty else { return nil }
+
+        return TranscriptionFailureOverview.make(
+            manifest: validated.manifest,
+            jobs: Array(report.jobsBySequence.values),
+            results: Array(report.resultsBySequence.values)
+        )
+    }
+
     // MARK: - Admission
 
     /// Rejects first if `shutdown()` has already begun, then if another
@@ -380,7 +428,18 @@ final class CompletedSessionTranscriptionService: ObservableObject {
     /// owns admission (checked on `SessionManager`'s own `@MainActor`,
     /// `state` outside `{.idle, .completed}`), then reserves ownership. No
     /// `await` occurs between any of these checks and reservation.
-    private func beginOperation(sessionID: UUID, retryFailedJobs: Bool) -> AdmissionResult {
+    /// Which failed jobs an admitted operation requeues after
+    /// reconciliation; everything else about the run is identical.
+    private enum OperationMode {
+        /// None.
+        case transcribe
+        /// `.retryable` failures only — the automatic policy.
+        case continueOrRetry
+        /// `.permanent` failures without a result only — explicit override.
+        case retryPermanentFailures
+    }
+
+    private func beginOperation(sessionID: UUID, mode: OperationMode) -> AdmissionResult {
         guard !isShuttingDown else { return .shuttingDown }
         guard currentTask == nil else { return .busy }
 
@@ -398,13 +457,16 @@ final class CompletedSessionTranscriptionService: ObservableObject {
         displayedSegments = []
 
         currentRunStartInstant = AcceptanceDiagnosticLogger.startInstant()
-        AcceptanceDiagnosticLogger.shared.log(
-            retryFailedJobs ? AcceptanceDiagnosticEvent.Transcription.continueOrRetryStarted : AcceptanceDiagnosticEvent.Transcription.started,
-            metadata: ["sessionID": .uuid(sessionID)]
-        )
+        let startedEvent: String
+        switch mode {
+        case .transcribe: startedEvent = AcceptanceDiagnosticEvent.Transcription.started
+        case .continueOrRetry: startedEvent = AcceptanceDiagnosticEvent.Transcription.continueOrRetryStarted
+        case .retryPermanentFailures: startedEvent = AcceptanceDiagnosticEvent.Transcription.retryPermanentFailuresStarted
+        }
+        AcceptanceDiagnosticLogger.shared.log(startedEvent, metadata: ["sessionID": .uuid(sessionID)])
 
         currentTask = Task { [weak self] in
-            await self?.run(sessionID: sessionID, generation: myGeneration, retryFailedJobs: retryFailedJobs)
+            await self?.run(sessionID: sessionID, generation: myGeneration, mode: mode)
             self?.releaseOperation(sessionID: sessionID, generation: myGeneration)
         }
         return .admitted
@@ -438,7 +500,7 @@ final class CompletedSessionTranscriptionService: ObservableObject {
 
     // MARK: - Execution
 
-    private func run(sessionID: UUID, generation: Int, retryFailedJobs: Bool) async {
+    private func run(sessionID: UUID, generation: Int, mode: OperationMode) async {
         // Defensive, not currently reachable: `beginOperation` refuses a
         // new admission whenever `currentTask != nil`, and `currentTask`
         // is held non-nil for this run's *entire* lifetime — including
@@ -558,7 +620,10 @@ final class CompletedSessionTranscriptionService: ObservableObject {
             return
         }
 
-        if retryFailedJobs {
+        switch mode {
+        case .transcribe:
+            break
+        case .continueOrRetry:
             for job in reconciliation.jobs where job.state == .failed && job.lastFailure?.retryDisposition == .retryable {
                 do {
                     _ = try await coordinator.retryJob(sequenceNumber: job.source.chunkSequenceNumber, paths: validated.artifactPaths)
@@ -567,6 +632,20 @@ final class CompletedSessionTranscriptionService: ObservableObject {
                     // an ordinary incomplete/not-transcribed state — the
                     // operation cannot establish authoritative durable
                     // truth for this chunk, so it is surfaced truthfully.
+                    publish {
+                        self.phase = .finished(.blocked(reasons: [
+                            "Unable to retry chunk #\(job.source.chunkSequenceNumber): \(error.localizedDescription)"
+                        ]))
+                    }
+                    return
+                }
+            }
+        case .retryPermanentFailures:
+            for job in reconciliation.jobs where job.state == .failed && job.lastFailure?.retryDisposition == .permanent {
+                do {
+                    _ = try await coordinator.retryPermanentlyFailedJob(sequenceNumber: job.source.chunkSequenceNumber, paths: validated.artifactPaths)
+                } catch {
+                    // Same truthful surfacing as the automatic retry above.
                     publish {
                         self.phase = .finished(.blocked(reasons: [
                             "Unable to retry chunk #\(job.source.chunkSequenceNumber): \(error.localizedDescription)"
@@ -747,6 +826,7 @@ final class CompletedSessionTranscriptionService: ObservableObject {
             case .sourceMissing: return "sourceMissing"
             case .commitDurabilityUncertain: return "commitDurabilityUncertain"
             case .retryNotEligible: return "retryNotEligible"
+            case .manualRetryNotEligible: return "manualRetryNotEligible"
             }
         }
         return String(describing: type(of: error))
