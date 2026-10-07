@@ -1,0 +1,29 @@
+{
+  "dependency": "FluidAudio",
+  "upstream": "https://github.com/FluidInference/FluidAudio",
+  "releaseTag": "v0.16.1",
+  "commit": "b811a61569aa02691c99b808d08ee989b630c133",
+  "license": "Apache-2.0",
+  "traits": [],
+  "traitsNote": "Default NemoTextProcessing trait disabled: the prebuilt text-normalization binary is not linked.",
+  "usedAPI": "OfflineDiarizerManager (offline VBx pipeline), initialized with locally loaded OfflineDiarizerModels; FluidAudio's model downloader is never called.",
+  "model": {
+    "repository": "https://huggingface.co/FluidInference/speaker-diarization-coreml",
+    "revision": "df2625ac79a7ac6b65ad868fee6d80f320da4232",
+    "files": [
+      "Segmentation.mlmodelc",
+      "FBank.mlmodelc",
+      "Embedding.mlmodelc",
+      "PldaRho.mlmodelc",
+      "plda-parameters.json"
+    ],
+    "license": "CC-BY-4.0",
+    "licenseURL": "https://creativecommons.org/licenses/by/4.0/",
+    "attribution": "Speaker diarization uses modified Core ML conversions by Fluid Inference of the pyannote speaker-diarization-community-1 pipeline (pyannote, CC-BY-4.0), WeSpeaker speaker embeddings, and PLDA parameters from Brno University of Technology / BUT Speech@FIT (CC-BY-4.0).",
+    "upstreamSources": [
+      "https://huggingface.co/pyannote/speaker-diarization-community-1",
+      "https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md"
+    ],
+    "provisioning": "Scripts/provision-fluidaudio-diarization-model.sh"
+  }
+}

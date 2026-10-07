@@ -53,6 +53,40 @@ before atomically publishing the file beneath the app's sandbox-resolved
 Application Support root. It will not overwrite a conflicting artifact.
 Normal inference performs no network access.
 
+## Preparing the speaker-diarization model
+
+Speaker diarization (FluidAudio v0.16.1) requires the pinned
+`FluidInference/speaker-diarization-coreml` model at revision
+`df2625ac79a7ac6b65ad868fee6d80f320da4232`. The app never downloads it:
+
+```sh
+./Scripts/provision-fluidaudio-diarization-model.sh download
+./Scripts/provision-fluidaudio-diarization-model.sh install <source-directory>
+```
+
+`download` is the only networked step: it fetches exactly the 21 pinned files
+into a temporary directory. `install` uses an existing local copy and never
+touches the network. Both verify every file's size and SHA-256 before
+installing into `Models/FluidAudio/` beneath the app's sandbox-resolved
+Application Support root, and neither overwrites an existing installation.
+Attribution (CC-BY-4.0) is recorded in
+`Dependencies/DiarizationRuntime/provenance.json`. Offline script checks:
+
+```sh
+./Scripts/test-provision-fluidaudio-diarization-model.sh
+```
+
+An opt-in real-model smoke test diarizes the leading chunks of an existing
+session on a temporary copy; it is skipped unless enabled:
+
+```sh
+TEST_RUNNER_LECTURE_RECORDER_RUN_DIARIZATION_SMOKE=1 \
+TEST_RUNNER_LECTURE_RECORDER_DIARIZATION_SMOKE_SESSION_ID=<session UUID> \
+xcodebuild -project LectureRecorder.xcodeproj -scheme LectureRecorder \
+  -configuration Debug -destination 'platform=macOS' test \
+  -only-testing:LectureRecorderTests/FluidAudioDiarizationSmokeTests
+```
+
 ## Preparing the normally signed T3B acceptance harness
 
 The normally signed launch harness has its own App Sandbox container identity,

@@ -24,8 +24,8 @@ nonisolated struct SpeakerDiarizationOutput: Equatable, Sendable {
 }
 
 /// The replaceable boundary for a local diarization backend: validated
-/// terminal-session audio in, raw speaker segments out. No production
-/// conformer exists yet. Diarization runs only on eligible terminal
+/// terminal-session audio in, raw speaker segments out. The production
+/// conformer is `FluidAudioSpeakerDiarizer`. Diarization runs only on eligible terminal
 /// sessions whose audio forms a validated `LecturePlaybackSource`, and
 /// nothing in the recording or transcription paths calls it.
 nonisolated protocol SpeakerDiarizing: Sendable {
