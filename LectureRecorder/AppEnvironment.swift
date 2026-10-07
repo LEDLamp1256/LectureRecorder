@@ -52,6 +52,12 @@ final class AppEnvironment: ObservableObject {
     /// second one elsewhere — keeps exactly one production source-loading
     /// configuration in play.
     let summarySourceLoader: LectureSummarySourceLoader
+    /// T6-D3: the app-wide speaker-diarization owner. Its own independent
+    /// admission slot — it never consults recording, transcription, Notes,
+    /// or Summary state. Constructing `FluidAudioSpeakerDiarizer()` is cheap
+    /// and lazy: the model is verified and loaded only inside an explicitly
+    /// admitted diarization operation, never at launch.
+    let sessionDiarizationService: SessionDiarizationService
     /// Imports a local media file's audio as an ordinary completed session.
     /// Its result enters the same catalog/transcription/Notes/Summary path
     /// as a live recording; it never starts transcription itself.
@@ -319,6 +325,8 @@ final class AppEnvironment: ObservableObject {
             newGenerationAvailabilityChecker: summaryGeneratorRouter,
             generationProvenance: MLXSummaryConfiguration.generationProvenance
         )
+
+        self.sessionDiarizationService = SessionDiarizationService(diarizer: FluidAudioSpeakerDiarizer())
     }
 
     // MARK: - Application termination
@@ -332,6 +340,7 @@ final class AppEnvironment: ObservableObject {
         completedSessionTranscriptionService.beginShutdown()
         lectureNotesGenerationService.beginShutdown()
         lectureSummaryGenerationService.beginShutdown()
+        sessionDiarizationService.beginShutdown()
     }
 
     /// Begins termination (see `beginTermination`), then waits concurrently
@@ -347,6 +356,7 @@ final class AppEnvironment: ObservableObject {
         async let transcription = completedSessionTranscriptionService.shutdown()
         async let notes = lectureNotesGenerationService.shutdown()
         async let summary = lectureSummaryGenerationService.shutdown()
-        _ = await (recording, transcription, notes, summary)
+        async let diarization = sessionDiarizationService.shutdown()
+        _ = await (recording, transcription, notes, summary, diarization)
     }
 }
