@@ -121,6 +121,19 @@ nonisolated enum AcceptanceDiagnosticEvent {
         static let failed = "summary.failed"
         static let cancelled = "summary.cancelled"
     }
+
+    /// Shared MLX model lifecycle, logged once per actual verification or
+    /// load — never per caller — so a trace shows how many full hashes and
+    /// model loads really happened (e.g. one load for a cold Notes/Summary
+    /// collision).
+    enum MLX {
+        static let modelVerificationStarted = "mlx.modelVerification.started"
+        static let modelVerificationCompleted = "mlx.modelVerification.completed"
+        static let modelVerificationFailed = "mlx.modelVerification.failed"
+        static let modelLoadStarted = "mlx.modelLoad.started"
+        static let modelLoadCompleted = "mlx.modelLoad.completed"
+        static let modelLoadFailed = "mlx.modelLoad.failed"
+    }
 }
 
 /// One append-only line of the acceptance-diagnostics trace. Every field is

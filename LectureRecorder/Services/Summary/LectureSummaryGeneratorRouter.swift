@@ -52,8 +52,8 @@ nonisolated struct LectureSummaryGeneratorRouter: LectureSummaryGenerating, NewL
     /// brand-new generation, so admission-time availability is always the
     /// MLX generator's own answer — never Apple's. Mirrors
     /// `LectureNotesGeneratorRouter.availabilityForNewGeneration`.
-    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
-        mlxGenerator.availabilityForNewGeneration()
+    func availabilityForNewGeneration() async -> LectureNotesGenerationAvailability {
+        await mlxGenerator.availabilityForNewGeneration()
     }
 
     /// Planning a brand-new generation has no `generation` record yet to

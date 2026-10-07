@@ -342,8 +342,8 @@ nonisolated struct MLXLectureNotesGenerator: LectureNotesGenerating, NewLectureN
         self.diagnosticRecorder = diagnosticRecorder
     }
 
-    func availabilityForNewGeneration() -> LectureNotesGenerationAvailability {
-        sessionDriver.availability()
+    func availabilityForNewGeneration() async -> LectureNotesGenerationAvailability {
+        await sessionDriver.availability()
     }
 
     // MARK: - Window analysis

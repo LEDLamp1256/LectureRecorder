@@ -107,11 +107,12 @@ final class MLXLectureNotesGeneratorTests: XCTestCase {
 
     // MARK: - Availability
 
-    func testAvailabilityDelegatesToDriver() {
+    func testAvailabilityDelegatesToDriver() async {
         let driver = FakeMLXSessionDriver()
         driver.setAvailability(.unavailable(description: "model not provisioned"))
         let generator = makeGenerator(driver: driver)
-        XCTAssertEqual(generator.availabilityForNewGeneration(), .unavailable(description: "model not provisioned"))
+        let availability = await generator.availabilityForNewGeneration()
+        XCTAssertEqual(availability, .unavailable(description: "model not provisioned"))
     }
 
     // MARK: - Model-specific provenance

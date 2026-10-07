@@ -165,7 +165,7 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         XCTAssertEqual(openAI.synthesizeCallCount, 0)
     }
 
-    func testAvailabilityForNewGenerationDelegatesOnlyToMLX() {
+    func testAvailabilityForNewGenerationDelegatesOnlyToMLX() async {
         let apple = RecordingLectureNotesGenerator()
         apple.availabilityResult = .available
         let openAI = RecordingLectureNotesGenerator()
@@ -174,6 +174,7 @@ final class LectureNotesGeneratorRouterTests: XCTestCase {
         mlx.availabilityResult = .unavailable(description: "model assets not ready")
         let router = makeRouter(apple: apple, openAI: openAI, mlx: mlx)
 
-        XCTAssertEqual(router.availabilityForNewGeneration(), .unavailable(description: "model assets not ready"))
+        let availability = await router.availabilityForNewGeneration()
+        XCTAssertEqual(availability, .unavailable(description: "model assets not ready"))
     }
 }

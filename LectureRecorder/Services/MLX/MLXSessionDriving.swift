@@ -43,9 +43,10 @@ nonisolated protocol MLXSessionDriving: Sendable {
     var operationalContextCeiling: Int { get }
 
     /// Whether the local model is verified and ready to serve a brand-new
-    /// request right now. Synchronous and side-effect-free: never loads
-    /// the model, never starts a generation.
-    func availability() -> LectureNotesGenerationAvailability
+    /// request right now. Never loads the model, never starts a
+    /// generation. Asynchronous because verification may hash gigabytes of
+    /// model files, which must never block the caller's actor.
+    func availability() async -> LectureNotesGenerationAvailability
 
     /// The exact number of tokens the real tokenizer produces for the
     /// actual chat-formatted request `instructions`/`prompt` would
@@ -183,14 +184,25 @@ nonisolated private struct TokenizerBiasHostValues: Sendable {
 /// `MLXGuidedGeneration`'s own documentation) and must never run on
 /// `@MainActor`. `ModelContainer` itself additionally serializes access to
 /// the underlying model/tokenizer.
+///
+/// Verification and loading are each single-flight: concurrent cold
+/// callers (Notes and Summary share this driver) await one shared full
+/// verification (`MLXModelVerificationCache`, also reused by
+/// `availability()`) and one shared model load (`modelLoad`), so they
+/// always share one `ModelContainer` and therefore its serializing mutex.
 actor RealMLXSessionDriver: MLXSessionDriving {
     private let descriptor: MLXModelDescriptor
     private let applicationSupportRootResolver: @Sendable () throws -> URL
+    private let verificationCache: MLXModelVerificationCache
+    private let diagnostics: AcceptanceDiagnosticLogger
 
     nonisolated let nativeContextLength: Int
     nonisolated let operationalContextCeiling: Int
 
-    private var loadedContainer: ModelContainer?
+    /// Keyed by model identifier/revision; this driver only ever loads its
+    /// own `descriptor`, and the loaded model stays resident for the
+    /// process once loaded.
+    private let modelLoad = MLXSingleFlight<String, ModelContainer>()
     /// Built once per loaded model (the grammar tokenizer depends only on
     /// the model's own vocabulary, never on a particular schema or
     /// generation) — safe to cache and reuse, unlike `GrammarConstraint`
@@ -212,24 +224,32 @@ actor RealMLXSessionDriver: MLXSessionDriving {
                 for: .applicationSupportDirectory, in: .userDomainMask,
                 appropriateFor: nil, create: true
             )
-        }
+        },
+        /// Injectable only for tests; production uses the default, which
+        /// performs real `MLXModelVerifier` verification of `descriptor`.
+        verificationCache: MLXModelVerificationCache? = nil,
+        diagnostics: AcceptanceDiagnosticLogger = .shared
     ) {
         self.descriptor = descriptor
         self.applicationSupportRootResolver = applicationSupportRootResolver
+        self.verificationCache = verificationCache
+            ?? MLXModelVerificationCache(descriptor: descriptor, diagnostics: diagnostics)
+        self.diagnostics = diagnostics
         self.nativeContextLength = descriptor.nativeContextLength
         self.operationalContextCeiling = descriptor.operationalContextCeiling
     }
 
-    /// Touches only `descriptor`/`applicationSupportRootResolver` (both
-    /// immutable) and does local filesystem verification only — never
-    /// loads the model or touches actor-isolated mutable state, so this
-    /// can safely be `nonisolated` and called synchronously, matching
-    /// `FoundationModelsSessionDriving.availability()`'s contract.
-    nonisolated func availability() -> LectureNotesGenerationAvailability {
+    /// Touches only immutable state and local filesystem verification —
+    /// never loads the model. Full verification runs off the caller's
+    /// actor (see `MLXModelVerificationCache`), so awaiting this from
+    /// `@MainActor` never blocks it while gigabytes are hashed.
+    nonisolated func availability() async -> LectureNotesGenerationAvailability {
         do {
             let root = try applicationSupportRootResolver()
-            _ = try MLXModelVerifier.verify(descriptor: descriptor, applicationSupportRoot: root)
+            _ = try await verificationCache.verifiedModelDirectory(applicationSupportRoot: root)
             return .available
+        } catch is CancellationError {
+            return .unavailable(description: "The local MLX model check was cancelled.")
         } catch {
             return .unavailable(description: "The local MLX model is not ready: \(error.localizedDescription)")
         }
@@ -351,15 +371,47 @@ actor RealMLXSessionDriver: MLXSessionDriving {
 
     // MARK: - Loading
 
+    /// One shared load per driver: concurrent cold callers await the same
+    /// flight rather than each loading a separate multi-gigabyte container
+    /// (this actor is reentrant across the load's suspension points). A
+    /// failed load is not cached, so a later call retries. Throws
+    /// `CancellationError` if this caller was cancelled while waiting,
+    /// without affecting other waiters.
     private func loadedModelContainer() async throws -> ModelContainer {
-        if let loadedContainer { return loadedContainer }
-        let root = try applicationSupportRootResolver()
-        let modelDirectory = try MLXModelVerifier.verify(descriptor: descriptor, applicationSupportRoot: root)
-        let container = try await loadModelContainer(
-            from: modelDirectory, using: SwiftTransformersTokenizerLoader()
-        )
-        loadedContainer = container
-        return container
+        let key = "\(descriptor.modelIdentifier)@\(descriptor.modelRevision)"
+        return try await modelLoad.value(for: key) {
+            [applicationSupportRootResolver, verificationCache, diagnostics, descriptor] in
+            let root = try applicationSupportRootResolver()
+            // Reuses a successful availability() verification of unchanged
+            // files instead of hashing them again.
+            let modelDirectory = try await verificationCache.verifiedModelDirectory(applicationSupportRoot: root)
+            diagnostics.log(
+                AcceptanceDiagnosticEvent.MLX.modelLoadStarted,
+                metadata: ["modelIdentifier": .string(descriptor.modelIdentifier)]
+            )
+            let start = AcceptanceDiagnosticLogger.startInstant()
+            do {
+                let container = try await loadModelContainer(
+                    from: modelDirectory, using: SwiftTransformersTokenizerLoader()
+                )
+                diagnostics.log(
+                    AcceptanceDiagnosticEvent.MLX.modelLoadCompleted,
+                    metadata: ["modelIdentifier": .string(descriptor.modelIdentifier)],
+                    elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: start)
+                )
+                return container
+            } catch {
+                diagnostics.log(
+                    AcceptanceDiagnosticEvent.MLX.modelLoadFailed,
+                    metadata: [
+                        "modelIdentifier": .string(descriptor.modelIdentifier),
+                        "errorType": .string(String(describing: type(of: error))),
+                    ],
+                    elapsedSeconds: AcceptanceDiagnosticLogger.elapsedSeconds(since: start)
+                )
+                throw error
+            }
+        }
     }
 
     /// The vocabulary-derived `GrammarTokenizer` is immutable per loaded

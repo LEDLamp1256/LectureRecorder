@@ -127,13 +127,14 @@ final class LectureSummaryGeneratorRouterTests: XCTestCase {
         XCTAssertEqual(apple.generateDocumentCallCount, 0)
     }
 
-    func testAvailabilityForNewGenerationDelegatesOnlyToMLX() {
+    func testAvailabilityForNewGenerationDelegatesOnlyToMLX() async {
         let (apple, mlx) = makeGenerators()
         apple.availabilityResult = .available
         mlx.availabilityResult = .unavailable(description: "model assets not ready")
         let router = makeRouter(apple: apple, mlx: mlx)
 
-        XCTAssertEqual(router.availabilityForNewGeneration(), .unavailable(description: "model assets not ready"))
+        let availability = await router.availabilityForNewGeneration()
+        XCTAssertEqual(availability, .unavailable(description: "model assets not ready"))
     }
 
     /// Planning a brand-new generation has no `generation` record yet to

@@ -187,6 +187,40 @@ final class LectureSummaryGenerationServiceTests: XCTestCase {
         XCTAssertEqual(try summaryStore.listGenerationIDs(sessionPaths: sessionPaths), [])
     }
 
+    /// Real MLX availability (a blocked full model verification) is awaited
+    /// without blocking the main actor; a cancel that lands during
+    /// verification ends the run as `.cancelled` with nothing committed.
+    func testCancelDuringMLXModelVerificationIsAcceptedOffMainAndCommitsNothing() async throws {
+        let source = try SummaryTestSupport.source()
+        let loader = FakeSummarySourceLoader(defaultResult: .success(source))
+        let generator = ControllableFakeLectureSummaryGenerator(provenance: SummaryTestSupport.provenance)
+        let verification = BlockingVerificationDriverFixture()
+        let service = makeService(
+            sourceLoader: loader,
+            generator: generator,
+            newGenerationAvailabilityChecker: MLXLectureSummaryGenerator(sessionDriver: verification.driver)
+        )
+
+        XCTAssertEqual(service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .admitted)
+        await waitUntil { verification.verificationEntered }
+        XCTAssertEqual(
+            service.generate(sessionID: sessionID, notesGenerationID: SummaryTestSupport.notesGenerationID), .busy,
+            "duplicate Summary stays .busy during verification"
+        )
+        service.cancel(sessionID: sessionID)
+        XCTAssertFalse(verification.verificationTimedOut, "the main actor must stay responsive while the model is verified")
+
+        verification.releaseVerification()
+        let finalPhase = await waitUntilFinished(service)
+        guard case .finished(.cancelled) = finalPhase else {
+            return XCTFail("expected .cancelled, got \(finalPhase)")
+        }
+        XCTAssertFalse(verification.verificationTimedOut)
+        XCTAssertEqual(try summaryStore.listGenerationIDs(sessionPaths: sessionPaths), [])
+        let makePlanCalls = await generator.makePlanCallCount
+        XCTAssertEqual(makePlanCalls, 0)
+    }
+
     // MARK: - Fresh generation
 
     func testMultiBatchGenerateCommitsBatchesSequentiallyThenDocumentWithExactNotesProvenance() async throws {
