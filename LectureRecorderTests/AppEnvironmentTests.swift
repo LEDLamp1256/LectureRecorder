@@ -1,3 +1,4 @@
+import os
 import XCTest
 @testable import LectureRecorder
 
@@ -110,10 +111,49 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertTrue(environment.completedSessionTranscriptionService.isShuttingDown)
         XCTAssertTrue(environment.lectureNotesGenerationService.isShuttingDown)
         XCTAssertTrue(environment.lectureSummaryGenerationService.isShuttingDown)
+        XCTAssertTrue(environment.sessionDiarizationService.isShuttingDown)
         XCTAssertLessThan(elapsed, .seconds(1), "an idle environment releases immediately")
         XCTAssertEqual(
             environment.completedSessionTranscriptionService.transcribe(sessionID: UUID()),
             .shuttingDown
         )
+        XCTAssertEqual(environment.sessionDiarizationService.diarize(sessionID: UUID()), .shuttingDown)
+    }
+
+    /// T6-D3: one app-wide diarization owner, composed idle — constructing
+    /// the environment admits nothing and starts no diarization work.
+    func testFreshEnvironmentComposesOneIdleDiarizationService() {
+        let environment = AppEnvironment()
+        XCTAssertTrue(environment.sessionDiarizationService === environment.sessionDiarizationService)
+        XCTAssertEqual(environment.sessionDiarizationService.phase, .idle)
+        XCTAssertEqual(environment.sessionDiarizationService.operationEpoch, 0)
+        XCTAssertNil(environment.sessionDiarizationService.activeSessionID)
+        XCTAssertNil(environment.sessionDiarizationService.lastReleasedOperation)
+        XCTAssertFalse(environment.sessionDiarizationService.isShuttingDown)
+    }
+
+    /// The production backend `AppEnvironment` composes is lazy: merely
+    /// constructing it never resolves (let alone verifies or loads) the
+    /// diarization model.
+    func testConstructingTheProductionDiarizerNeverResolvesTheModel() {
+        let resolved = OSAllocatedUnfairLock(initialState: false)
+        _ = FluidAudioSpeakerDiarizer(modelDirectory: {
+            resolved.withLock { $0 = true }
+            throw FluidAudioDiarizationModelError.modelDirectoryUnavailable
+        })
+        XCTAssertFalse(resolved.withLock { $0 })
+    }
+
+    /// The synchronous termination half closes diarization admission before
+    /// any `await`, alongside every other app-wide owner.
+    func testBeginTerminationSynchronouslyClosesDiarizationAdmission() async {
+        let environment = AppEnvironment()
+        environment.beginTermination()
+        XCTAssertTrue(environment.sessionDiarizationService.isShuttingDown)
+        XCTAssertEqual(environment.sessionDiarizationService.diarize(sessionID: UUID()), .shuttingDown)
+        XCTAssertTrue(environment.completedSessionTranscriptionService.isShuttingDown)
+        XCTAssertTrue(environment.lectureNotesGenerationService.isShuttingDown)
+        XCTAssertTrue(environment.lectureSummaryGenerationService.isShuttingDown)
+        await environment.shutdownForTermination(recordingTimeout: 1)
     }
 }
