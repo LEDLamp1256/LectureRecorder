@@ -1,8 +1,8 @@
 import Foundation
 
-/// The completed session audio a diarizer analyzes: a
+/// The validated terminal-session audio a diarizer analyzes: a
 /// `LecturePlaybackSource` already proven frame-exact and playable by
-/// `LecturePlaybackSourceLoader` (eligible completed session, canonical
+/// `LecturePlaybackSourceLoader` (eligible terminal session, canonical
 /// contiguous chunks, every chunk file present, safe, linear PCM at the
 /// session format, with exactly its persisted frame count). A backend reads
 /// `source.chunkURLs` in `source.timeline.chunks` order, starting at session
@@ -24,8 +24,9 @@ nonisolated struct SpeakerDiarizationOutput: Equatable, Sendable {
 }
 
 /// The replaceable boundary for a local diarization backend: validated
-/// completed-session audio in, raw speaker segments out. No production
-/// conformer exists yet. Diarization runs only on completed sessions, and
+/// terminal-session audio in, raw speaker segments out. No production
+/// conformer exists yet. Diarization runs only on eligible terminal
+/// sessions whose audio forms a validated `LecturePlaybackSource`, and
 /// nothing in the recording or transcription paths calls it.
 nonisolated protocol SpeakerDiarizing: Sendable {
     func diarize(_ request: SpeakerDiarizationRequest) async throws -> SpeakerDiarizationOutput
