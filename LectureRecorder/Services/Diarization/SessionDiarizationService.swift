@@ -136,6 +136,34 @@ final class SessionDiarizationService: ObservableObject {
         case sidecar(SpeakerDiarizationLoadOutcome)
     }
 
+    /// What `peekPresentationState` found on disk — the same read as
+    /// `peekState`, but a usable result is paired with the exact
+    /// `LecturePlaybackSource` it was validated against in that read, so a
+    /// presenter can align it to the transcript without re-reading the
+    /// session's audio.
+    enum PresentationState: Equatable, Sendable {
+        /// The session's current audio is not a diarization source.
+        case sourceUnavailable(SessionDiarizationSourceError)
+        /// No sidecar exists.
+        case absent
+        /// A usable sidecar and the current source it was validated
+        /// against, both from one durable read.
+        case available(result: SpeakerDiarizationResult, source: LecturePlaybackSource)
+        /// A sidecar exists but is stale, damaged, unsupported, or unsafe.
+        case unavailable(SpeakerDiarizationUnavailableReason)
+
+        /// The `DurableState` this reading reports — the single mapping
+        /// that keeps `peekState` defined by this read.
+        var durableState: DurableState {
+            switch self {
+            case .sourceUnavailable(let error): return .sourceUnavailable(error)
+            case .absent: return .sidecar(.absent)
+            case .available(let result, _): return .sidecar(.loaded(result))
+            case .unavailable(let reason): return .sidecar(.unavailable(reason))
+            }
+        }
+    }
+
     enum ShutdownOutcome: Sendable, Equatable {
         case completed
         case timedOut
@@ -225,13 +253,24 @@ final class SessionDiarizationService: ObservableObject {
     /// inference, never repairs or deletes, never writes anything, and is
     /// safe to call while any operation is active.
     func peekState(sessionID: UUID) async -> DurableState {
+        await peekPresentationState(sessionID: sessionID).durableState
+    }
+
+    /// `peekState`'s read, keeping the validated source alongside a usable
+    /// result. Equally read-only: never runs inference, repairs, deletes,
+    /// or writes, and is safe to call while any operation is active.
+    func peekPresentationState(sessionID: UUID) async -> PresentationState {
         let snapshot: SessionDiarizationSourceSnapshot
         do {
             snapshot = try await sourceLoader.loadSourceSnapshot(sessionID: sessionID)
         } catch {
             return .sourceUnavailable(Self.sourceError(error))
         }
-        return .sidecar(await Self.loadSidecar(store: store, snapshot: snapshot))
+        switch await Self.loadSidecar(store: store, snapshot: snapshot) {
+        case .absent: return .absent
+        case .loaded(let result): return .available(result: result, source: snapshot.source)
+        case .unavailable(let reason): return .unavailable(reason)
+        }
     }
 
     // MARK: - Shutdown

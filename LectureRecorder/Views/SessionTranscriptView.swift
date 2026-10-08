@@ -32,6 +32,13 @@ import SwiftUI
 /// request clears the previous reveal's highlight and message as soon as it
 /// starts resolving. Revealing never touches playback: only timestamp
 /// buttons seek.
+///
+/// Speaker labels are optional decoration from the shared
+/// `SessionDiarizationService`: a pane-local `SessionSpeakerPresenter`
+/// rebuilds them from the durable sidecar and re-reads it whenever a new
+/// operation for this session is released. Labels never change transcript
+/// rows, their IDs, or playback, and missing or unusable speaker data only
+/// leaves rows undecorated.
 struct SessionTranscriptView: View {
     /// Re-runs reveal application when a new target arrives or this
     /// session's displayed transcript changes kind (e.g. finishes loading).
@@ -65,19 +72,30 @@ struct SessionTranscriptView: View {
     /// again by a later activation.
     @State private var revealScrollRequest = 0
     @State private var revealMessage: String?
+    /// The single, shared diarization owner: observed for live phase and
+    /// ownership, and called only for the explicit Identify Speakers and
+    /// Cancel actions. This view never cancels on disappearance.
+    @ObservedObject var diarizationService: SessionDiarizationService
+    @StateObject private var speakerPresenter: SessionSpeakerPresenter
 
     init(
         entry: CompletedSessionEntry,
         service: CompletedSessionTranscriptionService,
         navigationLoader: any CompletedTranscriptNavigationLoading,
         revealPresenter: SessionTranscriptRevealPresenter,
-        playback: SessionPlaybackPresenter
+        playback: SessionPlaybackPresenter,
+        diarizationService: SessionDiarizationService
     ) {
         self.entry = entry
         self.service = service
         self.revealPresenter = revealPresenter
         self.playback = playback
+        self.diarizationService = diarizationService
         _presenter = StateObject(wrappedValue: SessionTranscriptPresenter(loader: service, navigationLoader: navigationLoader))
+        _speakerPresenter = StateObject(wrappedValue: SessionSpeakerPresenter(
+            peeker: diarizationService,
+            initialRelease: diarizationService.lastReleasedOperation
+        ))
     }
 
     private var sessionID: UUID { entry.manifest.sessionID }
@@ -116,6 +134,7 @@ struct SessionTranscriptView: View {
             actionButtons
             Divider()
             playbackBar
+            speakerSection
             transcriptSection
             Spacer()
         }
@@ -124,6 +143,21 @@ struct SessionTranscriptView: View {
         .task(id: sessionID) {
             clearReveal()
             await presenter.refresh(for: entry)
+        }
+        .task(id: sessionID) {
+            // Catches a release published before the `onChange` below was
+            // observing, without resurrecting one that predates this pane.
+            await speakerPresenter.reconcileOnAppear(for: entry, currentRelease: diarizationService.lastReleasedOperation)
+        }
+        .onChange(of: displayedNavigation, initial: true) {
+            // Recomputes speaker decoration only when the displayed
+            // navigation itself changes — never per playback poll.
+            speakerPresenter.update(navigation: displayedNavigation)
+        }
+        .onChange(of: diarizationService.lastReleasedOperation) { _, release in
+            // A release is only a cue: durable state is re-read from disk.
+            guard speakerPresenter.observeRelease(release, sessionID: sessionID) else { return }
+            Task { await speakerPresenter.refresh(for: entry) }
         }
         .task(id: RevealTrigger(target: revealPresenter.pendingTarget, transcriptKind: revealTranscriptKind)) {
             await applyPendingReveal()
@@ -408,6 +442,59 @@ struct SessionTranscriptView: View {
         }
     }
 
+    // MARK: - Speakers
+
+    private var speakerOwnership: SessionOwnershipDisplay {
+        SessionActionAvailabilityCalculator.ownershipDisplay(activeSessionID: diarizationService.activeSessionID, sessionID: sessionID)
+    }
+
+    private var speakerDisplay: SpeakerDurableDisplay {
+        speakerPresenter.displayedSessionID == sessionID ? speakerPresenter.display : .loading
+    }
+
+    /// Explicit Identify Speakers / Cancel controls and status. Rendered
+    /// state follows `diarizationService.phase` and ownership alone; there
+    /// is no local, optimistic cancellation state.
+    private var speakerSection: some View {
+        let ownership = speakerOwnership
+        let phase = diarizationService.phase
+        let availability = SpeakerIdentificationAvailabilityCalculator.availability(display: speakerDisplay, ownership: ownership, phase: phase)
+        let status = SpeakerIdentificationAvailabilityCalculator.status(display: speakerDisplay, ownership: ownership, phase: phase)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Button(availability.actionTitle) {
+                    speakerPresenter.recordAdmission(diarizationService.diarize(sessionID: sessionID))
+                }
+                .disabled(!availability.canIdentify)
+
+                if availability.showsCancel {
+                    Button("Cancel", role: .destructive) {
+                        diarizationService.cancel(sessionID: sessionID)
+                    }
+                    .disabled(!availability.canCancel)
+                    .help(phase == .saving ? "Saving can't be cancelled." : "Cancel speaker identification")
+                    .accessibilityLabel("Cancel speaker identification")
+                }
+
+                if status.showsProgress {
+                    ProgressView().controlSize(.small)
+                }
+                if let text = status.text {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(status.isProblem ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                }
+            }
+            .buttonStyle(.bordered)
+
+            if let message = speakerPresenter.admissionMessage ?? (ownership == .activeHere ? nil : speakerPresenter.releaseMessage) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
     // MARK: - Transcript
 
     /// Navigation for this session's saved transcript — never while this
@@ -535,27 +622,41 @@ struct SessionTranscriptView: View {
     }
 
     /// The timestamp button is the only navigation affordance; the passage
-    /// text stays selectable.
+    /// text stays selectable. Speaker decoration only adds an optional
+    /// group header above the unchanged passage row, looked up by the
+    /// item's existing ID.
     private func navigationRow(_ item: TranscriptPlaybackItem, in navigation: TranscriptPlaybackNavigation) -> some View {
         let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let isEnabled = playbackForThisSession && playback.canPlayOrPause
         let isRevealed = revealedItemIDs.contains(item.id)
-        return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Button(PlaybackTimeFormatting.label(forSeconds: navigation.startTime(of: item))) {
-                playback.navigate(to: item, in: navigation)
+        let decoration = speakerPresenter.displayedSessionID == sessionID ? speakerPresenter.decoration : nil
+        let speakerHeader = decoration?.headerByItemID[item.id]
+        let speakerDescription = decoration?.attributionByItemID[item.id].map { SpeakerDisplayName.accessibilityDescription(for: $0) }
+        return VStack(alignment: .leading, spacing: 2) {
+            if let speakerHeader {
+                Text(speakerHeader.title)
+                    .font(speakerHeader == .notIdentified ? .caption : .caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityAddTraits(.isHeader)
             }
-            .buttonStyle(.link)
-            .font(.caption.monospacedDigit())
-            .disabled(!isEnabled)
-            .pointerStyle(isEnabled ? .link : nil)
-            .help(item.target == .chunkStart ? "Play from the start of this chunk" : "Play from this passage")
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Button(PlaybackTimeFormatting.label(forSeconds: navigation.startTime(of: item))) {
+                    playback.navigate(to: item, in: navigation)
+                }
+                .buttonStyle(.link)
+                .font(.caption.monospacedDigit())
+                .disabled(!isEnabled)
+                .pointerStyle(isEnabled ? .link : nil)
+                .help(item.target == .chunkStart ? "Play from the start of this chunk" : "Play from this passage")
 
-            Text(text.isEmpty ? "(silence)" : text)
-                .textSelection(.enabled)
-                .foregroundStyle(text.isEmpty ? .secondary : .primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(text.isEmpty ? "(silence)" : text)
+                    .textSelection(.enabled)
+                    .foregroundStyle(text.isEmpty ? .secondary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityValue(speakerDescription ?? "")
+            }
+            .revealHighlight(isRevealed)
         }
-        .revealHighlight(isRevealed)
     }
 
     @ViewBuilder private func segmentView(_ segment: OrderedSegment) -> some View {

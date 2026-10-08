@@ -22,6 +22,7 @@ struct CompletedSessionsView: View {
     let summarySourceLoader: any LectureSummarySourceLoading
     let transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
     let lectureMediaImporter: any LectureMediaImporting
+    let diarizationService: SessionDiarizationService
     @ObservedObject var sessionManager: SessionManager
     @StateObject private var presenter: CompletedSessionsListPresenter
     @State private var isChoosingImportFile = false
@@ -42,6 +43,7 @@ struct CompletedSessionsView: View {
         summarySourceLoader: any LectureSummarySourceLoading,
         transcriptNavigationLoader: any CompletedTranscriptNavigationLoading,
         lectureMediaImporter: any LectureMediaImporting,
+        diarizationService: SessionDiarizationService,
         sessionManager: SessionManager
     ) {
         self.service = service
@@ -55,6 +57,7 @@ struct CompletedSessionsView: View {
         self.summarySourceLoader = summarySourceLoader
         self.transcriptNavigationLoader = transcriptNavigationLoader
         self.lectureMediaImporter = lectureMediaImporter
+        self.diarizationService = diarizationService
         self.sessionManager = sessionManager
         _presenter = StateObject(wrappedValue: CompletedSessionsListPresenter(catalog: catalog))
     }
@@ -121,7 +124,8 @@ struct CompletedSessionsView: View {
                     summaryStore: summaryStore,
                     summaryOperationStateStore: summaryOperationStateStore,
                     summarySourceLoader: summarySourceLoader,
-                    transcriptNavigationLoader: transcriptNavigationLoader
+                    transcriptNavigationLoader: transcriptNavigationLoader,
+                    diarizationService: diarizationService
                 )
                 .id(selectedEntry.manifest.sessionID)
             } else {
