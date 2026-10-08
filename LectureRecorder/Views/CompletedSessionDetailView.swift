@@ -90,6 +90,8 @@ struct CompletedSessionDetailView: View {
     private let summaryOperationStateStore: any LectureSummaryOperationStateStoring
     private let summarySourceLoader: any LectureSummarySourceLoading
     private let transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
+    /// The single, shared diarization owner, handed to the Transcript pane.
+    private let diarizationService: SessionDiarizationService
 
     @State private var contentSelection: ContentSelection = .transcript
     @StateObject private var revealPresenter: SessionTranscriptRevealPresenter
@@ -107,7 +109,8 @@ struct CompletedSessionDetailView: View {
         summaryStore: any LectureSummaryStoring,
         summaryOperationStateStore: any LectureSummaryOperationStateStoring,
         summarySourceLoader: any LectureSummarySourceLoading,
-        transcriptNavigationLoader: any CompletedTranscriptNavigationLoading
+        transcriptNavigationLoader: any CompletedTranscriptNavigationLoading,
+        diarizationService: SessionDiarizationService
     ) {
         self.entry = entry
         self.transcriptionService = transcriptionService
@@ -120,6 +123,7 @@ struct CompletedSessionDetailView: View {
         self.summaryOperationStateStore = summaryOperationStateStore
         self.summarySourceLoader = summarySourceLoader
         self.transcriptNavigationLoader = transcriptNavigationLoader
+        self.diarizationService = diarizationService
         _revealPresenter = StateObject(wrappedValue: SessionTranscriptRevealPresenter(sourceLoader: notesSourceLoader))
         _summaryNotesRevealPresenter = StateObject(wrappedValue: SessionSummaryNotesRevealPresenter(sourceLoader: summarySourceLoader))
     }
@@ -207,7 +211,8 @@ struct CompletedSessionDetailView: View {
             service: transcriptionService,
             navigationLoader: transcriptNavigationLoader,
             revealPresenter: revealPresenter,
-            playback: playback
+            playback: playback,
+            diarizationService: diarizationService
         )
     }
 
